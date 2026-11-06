@@ -38,3 +38,9 @@ jobs:
           bash plugins/review-anvil/skills/review-anvil/scripts/test-run-reviewer.sh
           bash plugins/review-anvil/skills/review-anvil/scripts/test-reproduction-policy.sh
           python3 plugins/review-anvil/skills/review-anvil/scripts/test-repository-rules.py
+          python3 plugins/review-anvil/skills/review-anvil/scripts/test-memory-store.py
+          python3 plugins/review-anvil/skills/review-anvil/scripts/test-memory-github.py
+          python3 plugins/review-anvil/skills/review-anvil/scripts/test-memory-integrity.py
+          python3 plugins/review-anvil/skills/review-anvil/scripts/test-memory-rules.py
+          python3 plugins/review-anvil/skills/review-anvil/scripts/test-memory-rule-cli.py
+          python3 plugins/review-anvil/skills/review-anvil/scripts/test-memory-rule-integration.py

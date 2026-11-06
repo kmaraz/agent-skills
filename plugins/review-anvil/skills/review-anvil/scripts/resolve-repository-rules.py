@@ -95,7 +95,7 @@ def worktree_rules(args: argparse.Namespace, source: dict) -> bytes | None:
 
 def github_json(host: str, endpoint: str) -> dict:
     result = json.loads(run([
-        "gh", "api", "--hostname", host, "-H", "Accept: application/vnd.github+json",
+        "gh", "api", "--hostname", host, "--method", "GET", "-H", "Accept: application/vnd.github+json",
         endpoint,
     ]))
     if not isinstance(result, dict):
