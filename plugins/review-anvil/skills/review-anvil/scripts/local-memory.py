@@ -118,6 +118,17 @@ def parser():
     rules_apply.add_argument("--output", required=True)
     rules_inspect = sub.add_parser("rules-inspect", help="Inspect saved local rules and historical migration provenance")
     rules_inspect.add_argument("repository")
+    seed_start = sub.add_parser("seed-start", help="Start or resume a compact sequential PR seed run")
+    seed_start.add_argument("repository")
+    seed_start.add_argument("--seeds", nargs="+", required=True)
+    for name in ("seed-next", "seed-advance", "seed-finish", "seed-status"):
+        command = sub.add_parser(name, help="Continue or inspect a private sequential PR seed run")
+        command.add_argument("repository")
+        command.add_argument("--run-id", required=True)
+        if name == "seed-next":
+            command.add_argument("--output", required=True)
+        elif name == "seed-advance":
+            command.add_argument("--prepared", required=True)
     return cli
 
 
@@ -179,6 +190,27 @@ def main(argv=None):
             output(store.record_run(snapshot, read_json(args.dispositions)))
         elif args.command == "verify-target":
             output(verify_target(read_json(args.prepared), read_json(args.snapshot)))
+        elif args.command.startswith("seed-"):
+            from memory_seed import SeedRuns, parse_selectors
+            repo = resolve_repository(args.repository)
+            repository = repository_key(repo)
+            if args.command == "seed-start":
+                # Validate the entire invocation before initializing any memory
+                # or collecting even its first PR.
+                parse_selectors(repository, args.seeds)
+            runs = SeedRuns(repository)
+            runs.init(repo["id"])
+            if args.command == "seed-start":
+                value = runs.start(args.seeds)
+            elif args.command == "seed-next":
+                value = runs.next(args.run_id, args.output)
+            elif args.command == "seed-advance":
+                value = runs.advance(args.run_id, read_json(args.prepared))
+            elif args.command == "seed-finish":
+                value = runs.finish(args.run_id)
+            else:
+                value = runs.status(args.run_id)
+            output(value)
         elif args.command.startswith("rules-"):
             from memory_rules import LocalRules
             if args.command == "rules-prepare":
@@ -197,7 +229,12 @@ def main(argv=None):
                 output(rules.inspect_rules())
         return 0
     except (GitHubError, MemoryError, OSError, ValueError, KeyError, TypeError) as exc:
-        print(json.dumps({"status": "unavailable", "error": str(exc)}), file=sys.stderr)
+        failure = {"status": "unavailable", "error": str(exc)}
+        if args.command.startswith("seed-") and getattr(args, "run_id", None):
+            failure.update(run_id=args.run_id, resumable=True)
+        if isinstance(exc, GitHubError) and exc.http_status is not None:
+            failure["http_status"] = exc.http_status
+        print(json.dumps(failure), file=sys.stderr)
         return 1
 
 

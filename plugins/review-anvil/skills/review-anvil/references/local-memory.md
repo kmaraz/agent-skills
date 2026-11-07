@@ -15,6 +15,10 @@ python3 <memory-helper> inspect sli-do/slido-frontend
 
 These commands use existing `gh` authentication. Full URLs support GitHub Enterprise. PR preparation also accepts `owner/repo#123` or `#123`/`123` with an unambiguous current GitHub repository. Always display the fully resolved repository and PR before proceeding. Do not assume a number refers to Slido when invoked from the anvil development checkout.
 
+For explicit init seeds (single PRs or inclusive ranges), use the durable
+[sequential seed protocol](seed-ranges.md). It invokes the extraction/apply
+steps below one PR at a time and acknowledges only persisted checkpoints.
+
 ## Prepare, extract, apply
 
 1. Create a host-owned private temporary directory (for example `mktemp -d`) outside the reviewed checkout. Use fresh absolute filenames for every preparation and snapshot. Never overwrite a prior snapshot or follow repository-provided symlinks.
@@ -130,4 +134,4 @@ correct/invalidate it. No reset/delete-all command is needed for ordinary use.
 
 ## Privacy and limits
 
-The local store and private run records contain sensitive derived claims, source references and collected feedback. They are not public evaluation fixtures and must not be committed to the reviewed repository. Do not log raw discussions or secrets. Local initialization verifies GitHub access, not company approval for the model already used by OMP. Human review remains active during the pilot. Scheduled collection, remote shared storage, broad history bootstrap, Slack and voice ingestion are separate later steps.
+The local store and private run records contain sensitive derived claims, source references and collected feedback. They are not public evaluation fixtures and must not be committed to the reviewed repository. Do not log raw discussions or secrets. Local initialization verifies GitHub access, not company approval for the model already used by OMP. Human review remains active during the pilot. Explicit seed ranges are supported; scheduled collection, automatic repository-wide history discovery, remote shared storage, Slack and voice ingestion remain separate later steps.

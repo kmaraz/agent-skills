@@ -151,6 +151,25 @@ class TransportTests(unittest.TestCase):
                     with self.assertRaises(memory_github.GitHubError):
                         memory_github.github_api("github.com", "repos/acme/widgets/pulls/7/comments", paginate=True)
 
+    def test_explicit_http_diagnostic_is_classified_without_leaking_private_stderr(self):
+        for stderr, expected in [
+            (b"gh: Not Found (HTTP 404)\nhttps://private.example/secret", 404),
+            (b"gh: rate limited (HTTP 429)", 429),
+            (b"gh: forbidden (HTTP 403)", 403),
+            (b"gh: HTTP 404: Not Found (https://private.example/secret)", 404),
+            (b"gh: Not Found (HTTP 404)\ngh: forbidden (HTTP 403)", None),
+            (b"404 bytes received; network unavailable", None),
+            (b"https://private.example/HTTP/404", None),
+        ]:
+            with self.subTest(stderr=stderr):
+                result = SimpleNamespace(returncode=1, stdout=b"", stderr=stderr)
+                with patch.object(memory_github.subprocess, "run", return_value=result):
+                    with self.assertRaises(memory_github.GitHubError) as raised:
+                        memory_github.github_api("github.com", "repos/acme/widgets/pulls/7")
+                self.assertEqual(raised.exception.http_status, expected)
+                self.assertNotIn("private", str(raised.exception))
+        self.assertIsNone(memory_github.GitHubError("Existing caller").http_status)
+
     def test_enterprise_resolution_uses_canonical_remote_identity(self):
         with patch.object(memory_github, "github_api", return_value={"id": 123, "full_name": "Acme/Widgets"}) as api:
             result = memory_github.resolve_repository("https://github.enterprise.example/acme/widgets")

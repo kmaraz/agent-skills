@@ -17,6 +17,10 @@ from urllib.parse import urlsplit
 class GitHubError(Exception):
     """A locator or GitHub response cannot produce a complete feedback packet."""
 
+    def __init__(self, message, http_status=None):
+        super().__init__(message)
+        self.http_status = http_status
+
 
 def _host(value):
     if not isinstance(value, str) or len(value) > 253:
@@ -81,7 +85,11 @@ def _run_json(command, cwd=None):
         raise GitHubError(f"GitHub CLI could not complete the request: {error}") from error
     if result.returncode:
         # CLI stderr can contain private URLs; do not echo it into review output.
-        raise GitHubError(f"GitHub CLI request failed (exit {result.returncode})")
+        diagnostic = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr
+        statuses = set(re.findall(r"(?m)^gh: [^\r\n]* \(HTTP ([1-5][0-9]{2})\)(?:[ \t]*$)", diagnostic or ""))
+        statuses.update(re.findall(r"(?m)^gh: HTTP ([1-5][0-9]{2})(?::|[ \t]|$)", diagnostic or ""))
+        status = int(next(iter(statuses))) if len(statuses) == 1 else None
+        raise GitHubError(f"GitHub CLI request failed (exit {result.returncode})", http_status=status)
     try:
         return json.loads(result.stdout)
     except (ValueError, UnicodeError) as error:

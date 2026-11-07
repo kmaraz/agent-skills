@@ -167,6 +167,8 @@ new skills. The native invocation is `/skill:<name>`:
 ```text
 /skill:review-anvil-init sli-do/slido-frontend
 /skill:review-anvil-init sli-do/slido-frontend seed: sli-do/slido-frontend#12345
+/skill:review-anvil-init sli-do/slido-frontend seed: sli-do/slido-frontend#18520-18530
+/skill:review-anvil-init sli-do/slido-frontend seed: sli-do/slido-frontend#18001-19000
 /skill:review-anvil-pr sli-do/slido-frontend#12345, post: false
 /skill:review-anvil-pr sli-do/slido-frontend#12345, memory: off, post: false
 ```
@@ -177,6 +179,18 @@ advisory observations, and freezes the selected knowledge for all review stages.
 It needs existing `gh` and reviewer authentication, not a new API service.
 An empty first run is normal. Initialization alone does not scan PR history;
 explicit seed PRs use the same learning workflow without reviewing or posting.
+
+Seed ranges are inclusive and processed sequentially: `18520-18530` selects
+11 numbers; `18001-19000` selects 1000. Each PR's semantic extraction is
+saved before advancing, using bounded per-PR worker context. Mixed singles
+and ranges deduplicate overlaps in first-occurrence order. The authenticated
+private seed journal retains progress across interruptions; repeat the same
+incomplete invocation to resume. Repeating a completed selection refreshes it.
+Confirmed issues/missing numbers are explicit skips; authentication, network
+and rate-limit failures stop at the current step without losing earlier work.
+Final local-rule assessment completes the run. Large ranges consume real GitHub
+and model quotas; no background service continues after the host stops.
+See the [sequential seed protocol](plugins/review-anvil/skills/review-anvil/references/seed-ranges.md).
 
 Durable data lives under `~/.local/share/review-anvil/<host>/<owner>/<repo>/`,
 outside the reviewed checkout. `REVIEW_ANVIL_MEMORY_HOME` selects an isolated
