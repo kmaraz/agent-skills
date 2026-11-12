@@ -4,7 +4,7 @@ import hashlib
 import re
 import unicodedata
 
-from memory_store import MemoryStore, MemoryError, _MISSING, _digest, _integer, _json, _matches, _paths, _text
+from memory_store import MemoryStore, MemoryError, _MISSING, _digest, _integer, _matches, _paths, _text
 
 MAX_POLICY_BYTES = 128 * 1024
 _METADATA = "local-rules.json"
@@ -179,8 +179,6 @@ class LocalRules(MemoryStore):
         if used != {oid for oid, item in dispositions.items() if item["disposition"] == "activate"}:
             raise MemoryError("Every activate disposition must support a local rule")
         rules = sorted(rules, key=lambda rule: rule["id"])
-        if len(_json(rules).encode("utf-8")) > MAX_POLICY_BYTES:
-            raise MemoryError("Local rules exceed 128 KiB")
         return rules, [dispositions[oid] for oid in sorted(dispositions)]
 
     def apply(self, context, assessment):
@@ -248,7 +246,11 @@ class LocalRules(MemoryStore):
             return metadata
 
     def validate_frozen(self, value):
-        _fields(value, {"rules", "observations", "sources", "inactive_rule_ids", "omitted_rule_count", "precedence"}, "frozen local rules")
+        fields = {"rules", "observations", "sources", "inactive_rule_ids", "omitted_rule_count", "precedence"}
+        if isinstance(value, dict) and "omitted_inactive_rule_count" in value:
+            fields.add("omitted_inactive_rule_count")
+            _integer(value["omitted_inactive_rule_count"], "omitted inactive rule count", 0)
+        _fields(value, fields, "frozen local rules")
         _integer(value["omitted_rule_count"], "omitted local rule count", 0)
         if value["precedence"] != "base-side-policy-first" or not isinstance(value["rules"], list):
             raise MemoryError("Invalid frozen local rule precedence")

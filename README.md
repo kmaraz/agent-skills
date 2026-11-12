@@ -215,6 +215,15 @@ assertion can justify a rule from one PR; a playful topic does not negate it.
 The model checks original sources, scope, exceptions, conflicts and current
 base-side project policy before activation.
 
+The complete private rule catalog uses the memory store's 64 MiB per-file
+safety limit, independently of review context. Snapshot selection retains its
+64 KiB canonical-JSON budget, 50-rule limit and 50 unique supporting observations.
+Path scope and valid evidence determine eligibility; rules that do not fit
+are omitted with an explicit count, never included with truncated evidence.
+The separate 128 KiB limit applies to manual policy input, not the catalog.
+Pretty-printed artifact files can be larger than their canonical JSON; the
+selection budget is measured before display formatting.
+
 ```text
 /skill:review-anvil-rules sli-do/slido-frontend
 /skill:review-anvil-rules inspect: sli-do/slido-frontend

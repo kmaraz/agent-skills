@@ -77,6 +77,19 @@ python3 <memory-helper> rules-apply --context /private/run/rules-context.json --
 
 This validates the signed context, complete assessment, repository identity, unchanged evidence and concurrent rule state, then atomically saves `local-rules.json` under the existing private repository directory. Reapplying identical input is a no-op; same-topic updates replace old wording. A stale/tampered context fails; prepare and reassess rather than editing generations/signatures. The helper validates provenance and structure; the invoking model is responsible for semantic suitability and conflict assessment.
 
+The complete catalog is persisted under the memory store's existing 64 MiB
+per-file safety limit, including assessment/history metadata. The 128 KiB
+manual-policy input bound is not a catalog bound. Review snapshots remain
+independently bounded to 64 KiB and at most 50 rules/50 unique observations;
+scope, support checks and explicit omission counts still apply.
+
+If activation fails, retain the exhaustive assessment and its original signed
+context in private storage. After resolving the cause, retry `rules-apply`
+with those artifacts only if their evidence generation and rule digest are
+still current. A stale context needs fresh preparation and semantic
+reassessment; never repair it by editing a digest or signature. Do not
+discard supported criteria merely to fit a review snapshot budget.
+
 Read the result and summarize activated/updated rules and context-only/triage dispositions. These are active **local learned criteria**, not newly merged repository policy. The completed review retains its original frozen snapshot; the next snapshot loads the new rules. Local learning happens independently of whether the review is posted. If learning fails, retain diagnostics and report the failure separately without claiming activation or discarding a completed review.
 
 ## Loading, inspection and migration

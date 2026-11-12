@@ -182,18 +182,111 @@ class LocalIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.rules.inspect_rules()["current"]["rules"]), 1)
         self.memory.verify_snapshot(snapshot)
 
-    def test_many_rules_are_bounded_with_complete_included_evidence(self):
-        from memory_store import _json, MAX_SNAPSHOT_BYTES
+    def large_catalog(self, count=240):
+        changed = packet()
+        proposals = []
+        for number in range(count):
+            source = {**changed["sources"][0], "id": f"issue_comment:{1000 + number}",
+                      "url": f"https://github.com/acme/widgets/pull/7#issuecomment-{1000 + number}",
+                      "body": f"Component {number} adapters must preserve the caller's event payload. "
+                              "Copy the payload before adding derived presentation fields so other subscribers "
+                              "continue to receive the original domain event."}
+            changed["sources"].append(source)
+            proposals.append({"claim": f"Preserve input events in component {number} adapters.",
+                              "rationale": "Subscribers share domain events; presentation enrichment must not mutate them.",
+                              "paths": [f"src/component-{number}/**"], "sources": [source["id"]],
+                              "kind": "observation"})
+        self.memory.apply(self.memory.prepare(changed), proposals)
         context = self.rules.prepare(base())
-        value = assessment(context)
-        template = value["rules"][0]
-        value["rules"] = [{**template, "key": "preference-" + str(number)} for number in range(60)]
+        value = assessment(context, activate=False)
+        for record in context["observations"]:
+            if not record["paths"]:
+                continue
+            number = int(record["paths"][0].split("component-")[1].split("/")[0])
+            next(d for d in value["dispositions"] if d["observation_id"] == record["id"]).update(
+                disposition="activate", reason="The component adapter has an explicit event immutability contract.")
+            value["rules"].append({
+                "key": f"component-{number}-event-immutability", "title": f"Preserve component {number} input events",
+                "text": f"In component {number} adapters, copy incoming domain event payloads before adding "
+                        "presentation fields. Other subscribers must continue to receive the original event.",
+                "paths": record["paths"], "exceptions": ["A newly created presentation object may be modified."],
+                "examples": {"applies": [f"src/component-{number}/adapter.ts enriches a shared event."],
+                             "does_not_apply": ["A component constructs a fresh view-only object."]},
+                "rationale": "Avoid cross-subscriber state corruption when event objects are shared.",
+                "observation_ids": [record["id"]], "type": "contract"})
+        return context, value
+
+    def test_large_catalog_survives_reload_and_selects_only_relevant_rules(self):
+        from memory_store import _json
+        context, value = self.large_catalog()
+        self.assertGreater(len(_json(value["rules"]).encode("utf-8")), 128 * 1024)
+        saved = self.rules.apply(context, value)
+        reopened = memory_rules.LocalRules(REPOSITORY, self.root).inspect_rules()
+        self.assertEqual(reopened["rules"], saved["rules"])
+        self.assertEqual({r["key"] for r in reopened["current"]["rules"]},
+                         {r["key"] for r in value["rules"]})
+        snapshot = self.memory.snapshot(["src/component-117/adapter.ts"], "c" * 40)
+        selected = snapshot["local_rules"]
+        self.assertEqual([r["key"] for r in selected["rules"]], ["component-117-event-immutability"])
+        self.assertEqual(selected["omitted_rule_count"], 0)
+        rule = selected["rules"][0]
+        self.assertEqual(rule["source_urls"], ["https://github.com/acme/widgets/pull/7#issuecomment-1117"])
+        self.assertEqual(set(rule["observation_ids"]), set(selected["observations"]))
+        self.assertEqual(set(selected["sources"]), {"issue_comment:1117"})
+        self.memory.verify_snapshot(snapshot)
+
+    def test_large_catalog_does_not_expand_snapshot_or_truncate_evidence(self):
+        from memory_store import _json, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_OBSERVATIONS
+        context, value = self.large_catalog()
         self.rules.apply(context, value)
+        snapshot = self.memory.snapshot([f"src/component-{n}/adapter.ts" for n in range(240)], "c" * 40)
+        selected = snapshot["local_rules"]
+        self.assertTrue(selected["rules"])
+        self.assertLessEqual(len(_json(snapshot).encode("utf-8")), MAX_SNAPSHOT_BYTES)
+        self.assertLessEqual(len(selected["rules"]), MAX_SNAPSHOT_OBSERVATIONS)
+        self.assertLessEqual(len(set(selected["observations"]) |
+                                 {o["id"] for o in snapshot["observations"]}), MAX_SNAPSHOT_OBSERVATIONS)
+        self.assertEqual(selected["omitted_rule_count"], len(value["rules"]) - len(selected["rules"]))
+        for rule in selected["rules"]:
+            for oid in rule["observation_ids"]:
+                observation = selected["observations"][oid]
+                self.assertEqual(rule["evidence"][oid], _digest(observation))
+                for sid in observation["sources"]:
+                    self.assertEqual(observation["source_versions"][sid], _digest(selected["sources"][sid]["source"]))
+        self.memory.verify_snapshot(snapshot)
+
+    def test_large_catalog_rejects_support_after_explicit_correction(self):
+        context, value = self.large_catalog()
+        saved = self.rules.apply(context, value)
+        affected = next(r for r in saved["rules"] if r["key"] == "component-117-event-immutability")
+        self.memory.correct(affected["observation_ids"][0], "Component 117 receives an owned event copy.",
+                            "The caller now transfers ownership; the previous sharing premise is no longer valid.")
+        snapshot = self.memory.snapshot(["src/component-117/adapter.ts"], "c" * 40)
+        self.assertEqual(snapshot["local_rules"]["rules"], [])
+        self.assertIn(affected["id"], snapshot["local_rules"]["inactive_rule_ids"])
+        current = self.rules.inspect_rules()["current"]
+        self.assertEqual(len(current["rules"]), len(saved["rules"]) - 1)
+        self.assertNotIn(affected["key"], {r["key"] for r in current["rules"]})
+        self.memory.verify_snapshot(snapshot)
+
+    def test_large_inactive_catalog_keeps_snapshot_diagnostics_bounded(self):
+        from memory_store import _json, MAX_SNAPSHOT_BYTES
+        context, value = self.large_catalog(count=2200)
+        saved = self.rules.apply(context, value)
+        changed = packet()
+        changed["sources"] = [entry["source"] for entry in context["sources"].values()]
+        for source in changed["sources"]:
+            source["body"] += " This historical guidance is withdrawn."
+        self.memory.apply(self.memory.prepare(changed), [])
         snapshot = self.memory.snapshot([], "c" * 40)
         self.assertLessEqual(len(_json(snapshot).encode("utf-8")), MAX_SNAPSHOT_BYTES)
-        self.assertEqual(len(snapshot["local_rules"]["rules"]), 50)
-        self.assertEqual(snapshot["local_rules"]["omitted_rule_count"], 10)
-        self.assertEqual(len(snapshot["local_rules"]["observations"]), 1)
+        selected = snapshot["local_rules"]
+        self.assertEqual(selected["rules"], [])
+        inactive = self.rules.inspect_rules()["current"]["inactive_rule_ids"]
+        self.assertEqual(set(inactive), {r["id"] for r in saved["rules"]})
+        self.assertEqual(set(selected["inactive_rule_ids"]) - set(inactive), set())
+        self.assertEqual(len(selected["inactive_rule_ids"]) + selected["omitted_inactive_rule_count"],
+                         len(inactive))
         self.memory.verify_snapshot(snapshot)
 
     def test_rule_only_support_requires_complete_run_dispositions(self):

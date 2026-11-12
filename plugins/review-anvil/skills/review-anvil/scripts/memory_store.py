@@ -654,6 +654,8 @@ class MemoryStore:
             from memory_rules import LocalRules
             available = LocalRules(self.repository, self.root)._selected(directory, state, files)
             learned = {**available, "rules": [], "observations": {}, "sources": {},
+                       "inactive_rule_ids": available["inactive_rule_ids"][:MAX_SNAPSHOT_OBSERVATIONS],
+                       "omitted_inactive_rule_count": max(0, len(available["inactive_rule_ids"]) - MAX_SNAPSHOT_OBSERVATIONS),
                        "omitted_rule_count": len(available["rules"])}
             result["local_rules"] = learned
             for rule in available["rules"]:

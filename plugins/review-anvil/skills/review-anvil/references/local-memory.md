@@ -72,6 +72,15 @@ steps below one PR at a time and acknowledges only persisted checkpoints.
    At most 50 learned rules load; `omitted_rule_count` reports supported rules
    excluded by limits, separately from inactive evidence. Inspect full memory
    explicitly when omitted rules may matter; never claim exhaustive coverage.
+   Catalog persistence is separate from this selection budget: complete
+   authenticated `local-rules.json` metadata uses the existing 64 MiB
+   memory-file safety boundary. The 128 KiB manual-policy input limit does
+   not limit the learned catalog. A large stored catalog must not increase
+   snapshot limits or silently truncate any included source evidence.
+   Frozen inactive-rule diagnostics include at most 50 IDs, with
+   `omitted_inactive_rule_count` reporting the remainder. Full inactive IDs
+   remain available through `rules-inspect`; they must not overflow the
+   same 64 KiB review budget when a large catalog loses its support.
 
 The snapshot also freezes the selected observations' supporting source
 records: originating PR number, URL, author, timestamp, full evidence content
