@@ -29,16 +29,42 @@ The user may provide a PR locator as the first argument, or omit it entirely:
 - **Full GitHub URL** — `https://<host>/<owner>/<repo>/pull/<N>` for github.com or GitHub Enterprise.
 - **Slug** — `<owner>/<repo>#<N>` (host defaults to github.com).
 
-**Bare integers are rejected** by the helper script to prevent wrong-repo misdirection. To target a PR you don't have checked out, pass the URL or slug; to target the PR you're currently on, just omit the locator.
+The posting helper rejects bare integers. This preset first canonicalizes
+`#123` or `123` against the actual current repository through the trusted
+memory collector, then passes a full URL to the posting helper.
+
+### Local pilot controls
+
+- `memory: on` (default): automatically initialize local repository memory,
+  process changed PR feedback, and use one frozen advisory snapshot.
+- `memory: off`: do not read or update local memory; run a normal comparison.
+- `rules: on` (default with memory enabled): assess project knowledge after a
+  successful review and automatically activate/update private local rules.
+- `rules: off`: skip rule generation while still loading supported saved local
+  rules. `memory: off` disables all local memory and learned-rule reads/writes.
+- `post: false`: keep the report local; do not post, approve or resolve threads.
+  Posting remains enabled otherwise. Local learning/activation still runs.
+  Rule learning never creates GitHub branches, commits or PRs in either mode.
+
+Parse these preset-only controls before building engine arguments; remove
+their segments from `<extra-user-args>`. Reject duplicate/conflicting controls.
+Always pin `approve: never` for this local pilot and export
+`REVIEW_ANVIL_NO_APPROVE=1` for helper calls. Do not silently restore approval
+when memory is off. Other engine and fix presets retain their own behavior.
+
+Read `../review-anvil/references/local-memory.md` before preparing a
+memory-enabled run. Resolve its helper relative to the trusted engine skill,
+not the reviewed repository. If memory is unavailable, stop before dispatch
+and report the error; do not silently run without it.
 
 ## How to invoke
 
 ### 0. Reject overrides of pinned params
 
-Pins for this preset: `commit_mode`, `target`, `report_path`, `run_ordinal`. Enforce mechanically — after resolving the helper (step 1), run:
+Pins for this preset: `commit_mode`, `target`, `report_path`, `run_ordinal`, `memory_snapshot`, `approve`. Enforce mechanically — after resolving the helper (step 1), run:
 
 ```bash
-bash <helper-path> check-pins review-anvil-pr "commit_mode,target,report_path,run_ordinal" "$ARGUMENTS"
+bash <helper-path> check-pins review-anvil-pr "commit_mode,target,report_path,run_ordinal,memory_snapshot,approve" "$ARGUMENTS"
 ```
 
 Non-zero exit means a pinned param was overridden in the args: surface the script's error verbatim and stop. (The engine's prose pin-rejection in "Parsing" remains as the description of the algorithm; the script is the binding layer.)
@@ -60,6 +86,30 @@ To find the absolute path:
 3. **Verify the file exists before running it** — if no candidate from the trusted set above resolves, abort with `error: review-anvil-pr/scripts/pr-helper.sh not found in any trusted skill root; reinstall via 'npx skills add mrshu/agent-skills --skill review-anvil-pr'`.
 
 The primary contract is "the script is `./scripts/pr-helper.sh` relative to this SKILL.md." When the host doesn't expose that path, the user-level fallback is a recovery mechanism — but it is not a substitute for the host exposing skill-file paths, and project-scoped paths must never be searched.
+
+### 1a. Prepare local feedback memory
+
+Before helper `init`, use the complete prepare → read → extract → apply →
+snapshot protocol in `../review-anvil/references/local-memory.md`. Use the
+provided locator, or detect the current PR URL with `gh pr view --json url`.
+The collector also safely resolves `#123` in the current repository. Display
+the canonical PR URL from the prepared packet and use that URL for helper
+`init`. Preserve the captured head SHA and the private snapshot path.
+
+If `memory: off`, call `python3 <memory-helper> resolve-pr <locator>` to
+canonicalize a supplied short locator without reading or changing local
+memory, then omit `memory_snapshot` from engine arguments.
+
+After helper `init`, compare `HEAD_SHA` to the prepared packet and run:
+
+```bash
+python3 <memory-helper> verify-target --prepared /private/run/prepared.json --snapshot /private/run/snapshot.json
+```
+
+This verifies helper-issued snapshot provenance and the complete current
+repository/PR/head/base/file scope. If the head or base moved, the PR was
+retargeted, or the file scope changed, re-prepare feedback and take a new
+snapshot before dispatch. Never reuse memory selected for a different diff.
 
 ### 2. Init
 
@@ -95,7 +145,7 @@ On non-zero exit, surface the script's stderr verbatim and stop. Do not dispatch
 Activate the `review-anvil` skill with this argument string (extra user args go between the pinned params and the rounds default):
 
 ```
-commit_mode: none, target: <locator>, report_path: <REPORT_PATH>, run_ordinal: <RUN_ORDINAL>, <extra-user-args>, adversarial: auto, rounds: 1
+commit_mode: none, approve: never, target: <canonical-PR-URL>, report_path: <REPORT_PATH>, run_ordinal: <RUN_ORDINAL>, memory_snapshot: <private-snapshot-path>, <extra-user-args>, adversarial: auto, rounds: 1
 ```
 
 The user may override `rounds:` or `adversarial:` in their args (they are defaults, not pins). They cannot override the observed value of `run_ordinal`, or the `commit_mode`, `target`, and `report_path` pins; the step-0 segment-rejection above blocks override attempts.
@@ -124,6 +174,39 @@ not satisfy branch protection by accident.
 Provide `$HEAD_SHA` to the engine for its `.approval.json` `head_sha` field — the posting helper uses it to downgrade a stale APPROVE (PR head moved mid-run) to a COMMENT.
 
 The engine runs the review loop, writes the final report to `<REPORT_PATH>` (on failure paths too), and prints that path on its last output line. Before posting, if `<REPORT_PATH>.followups.json` exists, read it and surface its entries to the user (the helper deletes it after a successful post; `auto_approved` entries are the only ones automation may file issues for, after a duplicate search).
+
+
+When memory is enabled, after the engine finishes write the per-observation
+dispositions and run `local-memory.py record-run` as defined by the memory
+reference, before any cleanup or posting. Account once for every ID in the
+union of top-level and local-rule supporting observations, marking unexamined
+claims `not_assessed`; do not invent evidence or influence.
+Report the actual memory change digest and applied/contradicted knowledge to
+the invoking user. With `memory: off`, skip this recording step.
+
+### 3a. Learn and activate local rules
+
+After a successful completed review (not an infrastructure/protocol failure),
+when memory and rules are enabled, follow the complete
+`../review-anvil/references/rule-promotion.md` workflow for the canonical
+repository. Assess all active observations against their original sources,
+the current default-branch policy and this review's captured base-side policy.
+Use `rules-apply` to activate/update private local rules even with `post: false`.
+An empty exhaustive assessment removes previous rules; unresolved conflicts
+remain `needs-triage`. No branches, commits, PRs or reviewed-repository writes
+are allowed for rule learning. Manual policy remains authoritative.
+
+The completed review keeps its original snapshot; the next review loads the
+new rules automatically. If activation fails, retain diagnostics and report
+the failure separately without erasing a completed review or claiming learning.
+Normal review posting remains governed by step 4. With `rules: off`, skip
+generation but retain supported saved rules already frozen at step 1a.
+With `memory: off`, skip all local rule loading, generation and recording.
+
+When `post: false`, skip step 4 completely. Retain the local report and print
+its path with the memory snapshot digest. Do not call post/resolve helpers,
+submit approval, or create GitHub comments. The run is still a complete
+review and still records memory use.
 
 ### 4. Post
 
@@ -172,7 +255,9 @@ Surface the URL (or `posted (URL unavailable)`) to the user. If the helper scrip
 
 - Requires `gh`, `uuidgen`, `jq` (a real binary — gh's `--jq` is built-in gojq and doesn't count), and `uv` (preferred; falls back to `python3`) for PR-feedback history handling. `init` preflights all of these so a missing dependency fails before the expensive review, not after.
 - Environment switches honored by the helper: `REVIEW_ANVIL_NO_APPROVE=1` (never submit an approval), `REVIEW_ANVIL_POST_INFRA_FAILURES=1` (manual-debug escape hatch that allows posting infrastructure-failure reports; default is to refuse them so watchdogs retry instead of notifying authors), `REVIEW_ANVIL_SKIP_DISMISSED=1` (legacy name: skip the full PR-history lookup for hosts without GraphQL access — degraded mode that also forces COMMENT), `REVIEW_ANVIL_DISMISSALS=<path>` (local-suppressions file, default `~/.review-anvil/dismissed-findings.json`; record entries with `pr-helper.sh dismiss <host> <owner> <repo> <n> <path> <pattern> [<reason>]`), `REVIEW_ANVIL_INLINE_MIN_SEVERITY=<critical|high|medium|low|nit>` (minimum severity posted inline; default `medium`), and `REVIEW_ANVIL_ENABLE_SUGGESTIONS=0` (disable helper-added GitHub suggestion blocks).
-- **An `APPROVE` decision submits a real GitHub approval from your authenticated `gh` account.** It counts toward branch-protection required reviews and reads to collaborators as your judgment — while the gate behind it is the engine's LLM classification. If that posture isn't acceptable for a repo or org, pass `approve: never` (or "never approve" / "comment only") and the run always posts plain `COMMENT` reviews. `REQUEST_CHANGES` is deliberately unsupported: blocking someone's merge on LLM judgment is a different risk class from commenting or approving.
+- This local pilot pins `approve: never` and sets `REVIEW_ANVIL_NO_APPROVE=1`.
+  The underlying posting helper still supports approval for other callers,
+  but this preset must never submit it. `REQUEST_CHANGES` remains unsupported.
 - What lands on the PR has passed the engine's reproduction/verification gates:
   uncertain `medium`+ findings are checked against the actual reviewed snapshot
   before posting. When a trusted `proof_runner` is configured, behavior claims
@@ -191,7 +276,8 @@ Surface the URL (or `posted (URL unavailable)`) to the user. If the helper scrip
   approval downgrades.
 - Read-only by design — the PR's branch may not be checked out locally, and pushing fix commits to a PR you don't own is rarely the intent. If you want to fix-and-commit on a PR you have checked out, activate `review-anvil` directly with `target: branch` (your checked-out PR branch) and `commit_mode=per_fix` — the local working tree becomes the source of truth and the diff against the merge base is unambiguous.
 - Supports github.com and GitHub Enterprise — the script extracts the host from the URL and sets `GH_HOST` internally for all `gh` invocations.
-- Bare-integer PR locators are rejected — pass a URL or `<owner>/<repo>#<N>` slug to be unambiguous about repo identity.
+- Short PR numbers are canonicalized against the current repository before
+  reaching the existing posting helper; always show the complete target.
 
 ## Recovery: orphaned artifacts
 
