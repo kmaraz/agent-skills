@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """A changed commit or description must not be mistaken for changed review content."""
 import copy
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -40,13 +41,14 @@ class TargetTests(unittest.TestCase):
             parts = path.split('/')
             for part in parts[:-1]:
                 node = node.setdefault(part, {})
-            oid = self.git('hash-object', '-w', '--stdin', data=content).decode().strip()
+            oid = (content.decode('ascii') if mode == '160000' else
+                   self.git('hash-object', '-w', '--stdin', data=content).decode().strip())
             node[parts[-1]] = (mode, oid)
         def tree(node):
             rows = []
             for name, value in sorted(node.items()):
                 mode, oid = ('040000', tree(value)) if isinstance(value, dict) else value
-                kind = 'tree' if mode == '040000' else 'blob'
+                kind = 'tree' if mode == '040000' else 'commit' if mode == '160000' else 'blob'
                 rows.append(f'{mode} {kind} {oid}\t{name}'.encode() + b'\0')
             return self.git('mktree', '-z', data=b''.join(rows)).decode().strip()
         args = ['commit-tree', tree(nested), '-m', message]
@@ -92,6 +94,145 @@ class TargetTests(unittest.TestCase):
         first, second = self.capture(self.target(base, head)), self.capture(self.target(base, other))
         self.assertEqual(module.compare_diff_snapshots(first, second)['relation'], 'changed')
         self.assertEqual({entry['new_path'] for entry in second['entries']}, {'binary.bin', 'script.sh'})
+
+    def test_type_changes_preserve_both_patch_sections_and_following_entry(self):
+        path = 'a "link" café'
+        for old_mode, before, new_mode, after in [
+                ('100644', b'original regular content\n', '120000', b'target/path'),
+                ('120000', b'target/path', '100644', b'original regular content\n')]:
+            with self.subTest(old_mode=old_mode, new_mode=new_mode):
+                base = self.commit({path: (old_mode, before),
+                                    'z-following.txt': ('100644', b'independent before\n')})
+                head = self.commit({path: (new_mode, after),
+                                    'z-following.txt': ('100644', b'independent after\n')}, base)
+                snapshot = self.capture(self.target(base, head))
+                self.assertEqual([(entry['status'], entry['old_path'], entry['new_path'],
+                                   entry['old_mode'], entry['new_mode'])
+                                  for entry in snapshot['entries']],
+                                 [('T', path, path, old_mode, new_mode),
+                                  ('M', 'z-following.txt', 'z-following.txt', '100644', '100644')])
+                changed, following = snapshot['entries']
+                self.assertIsNone(changed['binary'])
+                self.assertIn('deleted file mode ' + old_mode, changed['patch'])
+                self.assertIn('new file mode ' + new_mode, changed['patch'])
+                self.assertIn('-' + before.decode().rstrip('\n'), changed['patch'])
+                self.assertIn('+' + after.decode().rstrip('\n'), changed['patch'])
+                self.assertIn('\\ No newline at end of file', changed['patch'])
+                self.assertNotIn('independent', changed['patch'])
+                self.assertIn('-independent before\n+independent after', following['patch'])
+                self.assertNotIn('target/path', following['patch'])
+                expected = self.git('-c', 'core.quotePath=false', 'diff-tree',
+                                    '--no-commit-id', '-r', '--find-renames=50%',
+                                    '--find-copies=50%', '--no-ext-diff', '--no-textconv',
+                                    '--diff-algorithm=myers', '--no-indent-heuristic',
+                                    '--patch', '--binary', '--full-index', '--unified=3',
+                                    '--no-color', base, head)
+                self.assertEqual(snapshot['diff'].encode(snapshot['diff_encoding']), expected)
+                self.assertEqual(module.compare_diff_snapshots(snapshot, snapshot)['relation'], 'same')
+
+    def test_type_change_rejects_incomplete_extra_or_mismatched_patch_sections(self):
+        base = self.commit({'a-link': ('100644', b'original\n'),
+                            'z-following.txt': ('100644', b'independent before\n')})
+        head = self.commit({'a-link': ('120000', b'target/path'),
+                            'z-following.txt': ('100644', b'independent after\n')}, base)
+        real_git = module._git
+        for corruption in ['missing', 'extra', 'path', 'mode']:
+            with self.subTest(corruption=corruption):
+                def git(repo, *args, **kwargs):
+                    output = real_git(repo, *args, **kwargs)
+                    if args[0] != 'diff-tree' or '--patch' not in args:
+                        return output
+                    sections = output.split(b'diff --git ')
+                    if corruption == 'missing':
+                        return b'diff --git '.join(sections[:2] + sections[3:])
+                    if corruption == 'extra':
+                        return output + b'diff --git ' + sections[1]
+                    if corruption == 'path':
+                        return output.replace(b'a/a-link b/a-link', b'a/other b/other', 1)
+                    return output.replace(b'deleted file mode 100644', b'deleted file mode 100755', 1)
+                with patch.object(module, '_git', side_effect=git):
+                    with self.assertRaises(module.TargetError):
+                        self.capture(self.target(base, head))
+
+    def test_binary_type_changes_preserve_both_content_digests(self):
+        for old_mode, before, new_mode, after in [
+                ('100644', b'\0binary content\n', '120000', b'target/path'),
+                ('120000', b'target/path', '100644', b'\0binary content\n')]:
+            with self.subTest(old_mode=old_mode, new_mode=new_mode):
+                base = self.commit({'a-link': (old_mode, before),
+                                    'z-following.txt': ('100644', b'independent before\n')})
+                head = self.commit({'a-link': (new_mode, after),
+                                    'z-following.txt': ('100644', b'independent after\n')}, base)
+                newer = self.commit({'a-link': (new_mode, after + b'changed'),
+                                     'z-following.txt': ('100644', b'independent after\n')}, base)
+                snapshot = self.capture(self.target(base, head))
+                changed, following = snapshot['entries']
+                self.assertEqual((changed['status'], changed['old_path'], changed['new_path'],
+                                  changed['old_mode'], changed['new_mode']),
+                                 ('T', 'a-link', 'a-link', old_mode, new_mode))
+                self.assertIsNone(changed['patch'])
+                self.assertEqual(changed['binary'], {'old': hashlib.sha256(before).hexdigest(),
+                                                     'new': hashlib.sha256(after).hexdigest()})
+                self.assertEqual(following['new_path'], 'z-following.txt')
+                self.assertIn('-independent before\n+independent after', following['patch'])
+                self.assertIn('GIT binary patch', snapshot['diff'])
+                self.assertIn('target/path', snapshot['diff'])
+                self.assertEqual(module.compare_diff_snapshots(snapshot, snapshot)['relation'], 'same')
+                self.assertEqual(module.compare_diff_snapshots(
+                    snapshot, self.capture(self.target(base, newer)))['relation'], 'changed')
+
+    def test_binary_gitlink_type_changes_bind_the_gitlink_commit_identity(self):
+        link_a = self.commit({'submodule.txt': ('100644', b'first commit\n')}).encode('ascii')
+        link_b = self.commit({'submodule.txt': ('100644', b'second commit\n')}).encode('ascii')
+        binary = b'\0binary content\n'
+        for old_mode, new_mode in [('100644', '160000'), ('160000', '100644')]:
+            with self.subTest(old_mode=old_mode, new_mode=new_mode):
+                before = binary if old_mode == '100644' else link_a
+                after = binary if new_mode == '100644' else link_a
+                other_before = binary if old_mode == '100644' else link_b
+                other_after = binary if new_mode == '100644' else link_b
+                base = self.commit({'a-node': (old_mode, before)})
+                head = self.commit({'a-node': (new_mode, after)}, base)
+                other_base = self.commit({'a-node': (old_mode, other_before)})
+                other_head = self.commit({'a-node': (new_mode, other_after)}, other_base)
+                snapshot = self.capture(self.target(base, head))
+                other = self.capture(self.target(other_base, other_head))
+                entry = snapshot['entries'][0]
+                self.assertEqual((entry['status'], entry['old_mode'], entry['new_mode']),
+                                 ('T', old_mode, new_mode))
+                self.assertIsNone(entry['patch'])
+                self.assertEqual(module.compare_diff_snapshots(snapshot, other)['relation'], 'changed')
+                self.assertNotEqual(snapshot['diff_digest'], other['diff_digest'])
+                self.assertEqual(entry['binary'], {'old': hashlib.sha256(before).hexdigest(),
+                                                  'new': hashlib.sha256(after).hexdigest()})
+
+    def test_gitlink_updates_remain_textual(self):
+        link_a = self.commit({'submodule.txt': ('100644', b'first commit\n')})
+        link_b = self.commit({'submodule.txt': ('100644', b'second commit\n')})
+        base = self.commit({'submodule': ('160000', link_a.encode('ascii'))})
+        head = self.commit({'submodule': ('160000', link_b.encode('ascii'))}, base)
+        entry = self.capture(self.target(base, head))['entries'][0]
+        self.assertEqual(entry['status'], 'M')
+        self.assertIsNone(entry['binary'])
+        self.assertIn('-Subproject commit ' + link_a, entry['patch'])
+        self.assertIn('+Subproject commit ' + link_b, entry['patch'])
+
+    def test_observation_reports_regular_to_symlink_as_changed(self):
+        base = self.commit({'a-link': ('100644', b'original\n')})
+        head = self.commit({'a-link': ('100644', b'target/path')}, base)
+        symlink_head = self.commit({'a-link': ('120000', b'target/path')}, base)
+        frozen = self.capture(self.target(base, head))
+        current = self.target(base, symlink_head)
+        comparison = {'base_commit': {'sha': base}, 'merge_base_commit': {'sha': base}}
+        with patch.object(module, 'github_api', return_value=comparison), \
+             patch.object(module, 'read_pull_target', return_value=copy.deepcopy(current)):
+            observed = module.observe_pull_target(frozen, object_repo=self.repo, cache_root=self.cache)
+        self.assertEqual(observed['relation'], 'changed')
+        self.assertIsNone(observed['diagnostic'])
+        self.assertEqual(observed['snapshot']['target']['head_sha'], symlink_head)
+        self.assertEqual(observed['snapshot']['entries'][0]['status'], 'T')
+        self.assertEqual(observed['snapshot']['entries'][0]['new_mode'], '120000')
+        self.assertNotEqual(observed['snapshot']['diff_digest'], frozen['diff_digest'])
 
     def test_non_utf8_text_diff_is_losslessly_preserved_and_compared(self):
         base = self.commit({'latin1.txt': ('100644', b'caf\xe9 old\n')})

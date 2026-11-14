@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from pathlib import Path
-from memory_store import MemoryStore, MemoryError
+from memory_store import MAX_SNAPSHOT_BYTES, MemoryStore, MemoryError
 
 REPO = "github.com/acme/widgets"
 def packet(number=1, body="Intentional: snapshots are immutable", source="issue_comment:10"):
@@ -170,6 +170,43 @@ class StoreTests(unittest.TestCase):
         self.assertGreater(snap["omitted_count"], 0)
         self.assertEqual(len(snap["observations"]) + snap["omitted_count"], 70)
         self.assertTrue(all(o["rationale"] == observation()["rationale"] for o in snap["observations"]))
+    def test_snapshot_rejects_mandatory_target_larger_than_budget_without_mutating_memory(self):
+        collected = packet()
+        collected["pr"]["files"] = [f"src/{index:04d}-" + "x" * 48 + ".py" for index in range(2000)]
+        collected["sources"] = []
+        self.store.apply(self.store.prepare(collected), [])
+        target = {key: collected["pr"][key] for key in ("number", "base_sha", "files")}
+        state_path = self.store.directory / "state.json"
+        before = state_path.read_bytes()
+        with self.assertRaises(MemoryError) as raised:
+            self.store.snapshot(target["files"], "a" * 40, target=target)
+        self.assertRegex(str(raised.exception), r"(?i)(snapshot|context).*(size|budget|limit|large|exceed)")
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertEqual(self.store.inspect()["observations"], {})
+
+    def test_near_budget_target_keeps_exact_identity_and_whole_signed_observations(self):
+        collected = packet()
+        collected["pr"]["files"] = [f"src/{index:04d}-" + "x" * 48 + ".py" for index in range(1000)]
+        proposals = [{**observation(), "claim": f"Distinct contextual fact {index}: " + "é" * 100,
+                      "rationale": "r" * 300} for index in range(20)]
+        self.store.apply(self.store.prepare(collected), proposals)
+        target = {key: collected["pr"][key] for key in ("number", "base_sha", "files")}
+        snapshot = self.store.snapshot(target["files"], "a" * 40, target=target)
+        encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self.assertGreater(len(encoded), 62000)
+        self.assertLessEqual(len(encoded), MAX_SNAPSHOT_BYTES)
+        self.assertEqual(snapshot["target"], target)
+        self.assertEqual(snapshot["revision"], "a" * 40)
+        self.assertGreater(len(snapshot["observations"]), 0)
+        self.assertGreater(snapshot["omitted_count"], 0)
+        self.assertEqual(len(snapshot["observations"]) + snapshot["omitted_count"], 20)
+        expected_claims = {proposal["claim"] for proposal in proposals}
+        self.assertTrue(all(item["claim"] in expected_claims and item["rationale"] == "r" * 300
+                            for item in snapshot["observations"]))
+        self.assertEqual(snapshot["sources"]["issue_comment:10"]["source"]["body"],
+                         "Intentional: snapshots are immutable")
+        self.assertIsNone(self.store.verify_snapshot(snapshot))
+
     def test_run_records_only_dispositions_from_exact_snapshot(self):
         self.learn()
         snap = self.store.snapshot(["src/a.ts"], "c" * 40)

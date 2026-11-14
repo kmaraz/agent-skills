@@ -658,6 +658,10 @@ class MemoryStore:
                        "omitted_inactive_rule_count": max(0, len(available["inactive_rule_ids"]) - MAX_SNAPSHOT_OBSERVATIONS),
                        "omitted_rule_count": len(available["rules"])}
             result["local_rules"] = learned
+            mandatory = {**result, "omitted_count": len(state["observations"]),
+                         "signature": "0" * 64, "digest": "0" * 64}
+            if len(_json(mandatory).encode("utf-8")) > MAX_SNAPSHOT_BYTES:
+                raise MemoryError("Snapshot mandatory context exceeds the supported size budget")
             for rule in available["rules"]:
                 evidence = {oid: available["observations"][oid] for oid in rule["observation_ids"]}
                 sources = {sid: available["sources"][sid] for record in evidence.values() for sid in record["sources"]}
@@ -687,7 +691,10 @@ class MemoryStore:
                 selected.append(context)
                 selected_sources.update(copy.deepcopy(sources))
             result["omitted_count"] = omitted
-            return self._seal(directory, "snapshot", result)
+            snapshot = self._seal(directory, "snapshot", result)
+            if len(_json(snapshot).encode("utf-8")) > MAX_SNAPSHOT_BYTES:
+                raise MemoryError("Snapshot exceeds the supported size budget")
+            return snapshot
 
     def invalidate(self, id, reason):
         _text(id, "observation ID", 100)

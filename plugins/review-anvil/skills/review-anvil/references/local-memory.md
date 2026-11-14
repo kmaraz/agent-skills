@@ -81,6 +81,11 @@ steps below one PR at a time and acknowledges only persisted checkpoints.
    `omitted_inactive_rule_count` reporting the remainder. Full inactive IDs
    remain available through `rules-inspect`; they must not overflow the
    same 64 KiB review budget when a large catalog loses its support.
+   Mandatory target identity, bounded diagnostics and signature fields count
+   toward this budget before selecting evidence. If mandatory metadata alone
+   cannot fit, the helper reports knowledge unavailable without truncating the
+   target or emitting a misleading empty snapshot. Continue ordinary review
+   without augmentation under the fallback policy below.
 
 The snapshot also freezes the selected observations' supporting source
 records: originating PR number, URL, author, timestamp, full evidence content
@@ -94,6 +99,11 @@ repair an error. A private `.authentication-key` stays inside the store; do
 not read it into model context, copy it into observations, or commit it.
 Collection captures the memory generation before reading discussion; a
 concurrent writer requires fresh collection instead of restoring older input.
+
+CLI JSON inputs and outputs share the store's 64 MiB file boundary, measured as
+encoded UTF-8 bytes. Complete supported contexts remain readable by subsequent
+commands. Oversized output is rejected before its destination is created;
+retain existing evidence and report the unavailable knowledge operation.
 
 PR snapshots retain PR number, base SHA and file scope as well as head SHA.
 Immediately before dispatch, run `verify-target --prepared <prepared-file>
@@ -122,7 +132,7 @@ python3 <memory-helper> record-run --snapshot /private/run/snapshot.json --dispo
 
 Include every selected ID exactly once. Never fabricate an influence claim. Keep the snapshot digest and dispositions in the private run record; summarize additions/invalidations and genuinely used/contradicted observations to the invoking user. A PR report may include concise source-linked review context, never the raw private archive. The record is independent of the PR helper's temporary report sidecars.
 
-Unavailable or untrusted knowledge is an explicit diagnostic, not an empty valid snapshot. Do not use its rules, invent evidence, change memory settings or repeat preparation automatically. Before ordinary dispatch, continue the original review tasks once without that augmentation and state knowledge unavailability in the report. If ordinary results already exist, preserve and synthesize the usable ones without a replacement wave. Skip memory recording/learning that lacks a valid snapshot; preserve original report/target/history/no-post controls.
+Unavailable or untrusted knowledge is an explicit private diagnostic, not an empty valid snapshot. Do not use its rules, invent evidence, change memory settings or repeat preparation automatically. Before ordinary dispatch, continue the original review tasks once without that augmentation. Keep knowledge availability in private diagnostics; public limitations must describe a concrete author-relevant code risk. If ordinary results already exist, preserve and synthesize the usable ones without a replacement wave. Skip memory recording/learning that lacks a valid snapshot; preserve original report/target/history/no-post controls.
 
 ## Inspect, correct, invalidate
 

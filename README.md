@@ -141,9 +141,9 @@ What makes it useful:
 - **Local feedback memory:** PR review learns advisory observations from new
   discussion, reuses them across visited PRs, and invalidates changed evidence.
   `review-anvil-init` initializes, seeds, inspects and corrects local memory.
-- **Pilot approval control:** `review-anvil-pr` stays comment-only in this local
-  pilot. `post: false` keeps the entire review private without posting or
-  resolving threads; `memory: off` runs a comparison without memory.
+- **PR controls:** `review-anvil-pr` uses the normal approval gates;
+  `approve: never` requests comment-only feedback. `post: false` prevents
+  posting and thread resolution; `memory: off` disables the knowledge overlay.
 - **Simplicity lens:** the default focus includes a minimization ladder (need it
   at all? → stdlib → native feature → existing dependency → one line → the
   minimum that works), adapted from [ponytail](https://github.com/DietrichGebert/ponytail).
@@ -215,14 +215,17 @@ assertion can justify a rule from one PR; a playful topic does not negate it.
 The model checks original sources, scope, exceptions, conflicts and current
 base-side project policy before activation.
 
-The complete private rule catalog uses the memory store's 64 MiB per-file
-safety limit, independently of review context. Snapshot selection retains its
-64 KiB canonical-JSON budget, 50-rule limit and 50 unique supporting observations.
-Path scope and valid evidence determine eligibility; rules that do not fit
-are omitted with an explicit count, never included with truncated evidence.
-The separate 128 KiB limit applies to manual policy input, not the catalog.
-Pretty-printed artifact files can be larger than their canonical JSON; the
-selection budget is measured before display formatting.
+The private rule catalog and CLI JSON artifacts share the memory store's
+64 MiB per-file safety limit. Oversized outputs fail before creating an artifact;
+complete source evidence is never truncated to fit.
+Snapshot selection retains its 64 KiB canonical-JSON budget, 50-rule limit and
+50 unique supporting observations. Target identity, diagnostics and signatures
+count toward that budget too. If mandatory metadata alone cannot fit, knowledge
+is unavailable and ordinary review continues without that augmentation.
+Eligible rules that do not fit are omitted with an explicit count and complete
+included evidence. The separate 128 KiB limit applies to manual policy input,
+not the catalog. Pretty-printed snapshots can exceed their canonical size;
+selection is measured before display formatting.
 
 ```text
 /skill:review-anvil-rules sli-do/slido-frontend
@@ -308,10 +311,12 @@ share one enforced monotonic deadline, cancel unfinished work on expiry and
 retain ready results without retries. Synthesis reads the original complete
 review reports without an improvised optional-YAML dependency; private archive
 writes and ordinary report-file writes use their existing distinct APIs.
-Publication submits one review with line comments, then at most one request per
-file-level comment through GitHub's separate endpoint. Failed/unknown delivery
-retains actual partial outcomes without retry or weaker fallback. Original
-history, freshness, approval and no-post controls remain intact.
+Publication exclusively records an attempt before submitting one review with
+line comments, then sends at most one request per file-level comment through
+GitHub's separate endpoint. The receipt remains even for body-only reviews;
+confirmed, failed or unknown attempts cannot be resubmitted. Actual partial
+outcomes are retained without retry or weaker fallback. Original history,
+freshness, approval and no-post controls remain intact.
 Use a fresh OMP session after updating installed Python code.
 
 `post: false` independently forbids remote mutation, even with complete coverage.

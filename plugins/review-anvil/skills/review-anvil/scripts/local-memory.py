@@ -9,10 +9,8 @@ from pathlib import Path
 import stat
 import sys
 
-from memory_github import GitHubError, collect_feedback, read_policy, resolve_pull_request, resolve_repository
-from memory_store import MemoryError, MemoryStore, _repository
-
-MAX_INPUT = 32 * 1024 * 1024
+from memory_github import GitHubError, _revision, collect_feedback, github_api, read_policy, resolve_pull_request, resolve_repository
+from memory_store import MAX_FILE_BYTES, MemoryError, MemoryStore, _repository
 
 
 def read_json(path):
@@ -20,14 +18,16 @@ def read_json(path):
     with os.fdopen(fd, "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("JSON input must be a regular file")
-        data = stream.read(MAX_INPUT + 1)
-    if len(data) > MAX_INPUT:
-        raise ValueError("JSON input exceeds 32 MiB; use a smaller collection scope")
+        data = stream.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise MemoryError("JSON input exceeds the supported memory artifact size")
     return json.loads(data)
 
 
 def output(value, path=None, summary=None):
     encoded = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+    if len(encoded.encode("utf-8")) > MAX_FILE_BYTES:
+        raise MemoryError("JSON output exceeds the supported memory artifact size")
     if path:
         # Never follow symlinks or overwrite an earlier run snapshot.
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -185,9 +185,13 @@ def main(argv=None):
                     "directory": str(store.directory), "generation": state["generation"],
                     "observations": len(state["observations"]), "status": "initialized"})
         elif args.command == "resolve-pr":
-            packet = collect_feedback(args.locator)
-            output({"repository": repository_key(packet["repository"]),
-                    "locator": packet["pr"]["url"], "head_sha": packet["pr"]["head_sha"]})
+            repo, number = resolve_pull_request(args.locator)
+            pr = github_api(repo["host"], f"repos/{repo['name']}/pulls/{number}")
+            head_sha, _ = _revision(pr, number)
+            locator = pr.get("html_url")
+            if not isinstance(locator, str) or locator.lower() != f"https://{repo['host']}/{repo['name']}/pull/{number}".lower():
+                raise GitHubError("Pull request URL does not match repository identity")
+            output({"repository": repository_key(repo), "locator": locator, "head_sha": head_sha})
         elif args.command == "prepare":
             prepared = prepare_feedback(args.locator)
             output(prepared, args.output)

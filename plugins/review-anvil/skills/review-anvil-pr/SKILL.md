@@ -14,7 +14,7 @@ Use direct imperatives internally and short active declarative sentences in PR c
 
 1. `scripts/pr-helper.sh init [<locator>] [--rule-coverage scoped|all]` — locator parsing or auto-detect from the current branch, `gh` preflight (auth + PR reachability), marker UUID + report path setup
 2. The [`review-anvil`](../review-anvil/SKILL.md) engine in read-only mode (`commit_mode=none`)
-3. `scripts/pr-helper.sh post <host> <owner> <repo> <n> <marker> <report_path>` — marker injection, lossless report posting as a PR review / `gh pr comment`, race-free URL recovery
+3. `scripts/pr-helper.sh post <host> <owner> <repo> <n> <marker> <report_path>` — one review submission, anchored line/file comments and confirmed delivery receipts
 
 The engine automatically loads `.review-anvil-rules.md` from the PR's base
 repository and captured base SHA under its
@@ -356,6 +356,11 @@ The script chooses the GitHub review event from `<REPORT_PATH>.approval.json` (`
 File comments require the reviewed `head_sha` retained in `.approval.json`; a
 fresh live head cannot substitute for the commit whose code was assessed.
 
+Before every review POST, including body-only and line-only payloads, the helper
+exclusively creates `<REPORT_PATH>.file-comments-result.json`. This attempt
+receipt remains after success or an unknown response and prevents another POST.
+No-post and validation failures detected before this claim do not consume an attempt.
+
 The marker UUID is prepended before submission. The complete local source retains
 all finding tables. The outgoing main body removes duplicate routed finding rows
 and resulting empty tables while retaining general/unanchored findings and
@@ -439,7 +444,7 @@ recommend automatic or manual resubmission of an already attempted review.
 
 ## Recovery: orphaned artifacts
 
-If the orchestrator dies between the engine finishing and the post step, report artifacts remain under the artifact-local, self-ignored `.review-anvil/` directory. Re-run step 4's `post` with the captured values to publish them: the helper's head-SHA check downgrades a stale APPROVE if the PR moved in the meantime, and the marker lookup prevents duplicate posts after partial success. Successful posting removes transient report artifacts but deliberately keeps proof bundles in their separate host-created private directory. Delete retained proof bundles manually when they are no longer useful.
+If the orchestrator stops, retain the local report, selected source and publication receipts. An existing attempt receipt forbids another submission, whether delivery is confirmed, rejected or unknown. Report any confirmed URL and partial file-comment outcomes; otherwise report the unknown outcome locally. A marker or missing receipt alone does not prove that no submission occurred, especially for artifacts from older helpers. Only a report known never to have reached submission may receive its first post, after the normal target, history, report and no-post checks. Never rerun `post` to discover an earlier outcome or repeat an attempted review. Retained proof bundles remain outside the worktree until explicitly removed.
 
 ## Pairing
 

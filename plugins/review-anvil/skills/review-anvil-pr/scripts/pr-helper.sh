@@ -2703,13 +2703,6 @@ cmd_post() {
         captured_head=$(jq -r '.head_sha // empty' "$approval_json" 2>/dev/null || true)
         [[ "$captured_head" =~ ^[[:xdigit:]]{40}$ || "$captured_head" =~ ^[[:xdigit:]]{64}$ ]] \
             || die "file comments require the captured reviewed head; no review submitted"
-        jq -n --arg host "$host" --arg owner "$owner" --arg repo "$repo" --arg n "$n" \
-            --arg commit "$captured_head" --slurpfile comments "$posting_files" \
-            '{host:$host,owner:$owner,repo:$repo,pull_number:$n,commit_id:$commit,
-              review_status:"unknown",review_url:null,
-              files:[$comments[0][] | {path:.path,status:"not_attempted",
-                payload:(. + {commit_id:$commit})}]}' >"$file_comments_result" \
-            || die "cannot persist file delivery receipt; no review submitted"
     fi
 
     # Submit the policy-selected event exactly once, preserving its full inline
@@ -2721,12 +2714,22 @@ cmd_post() {
     if jq -e 'length > 0' "$posting_inline" >/dev/null; then
         submission_inline="$posting_inline"
     fi
+    # Claim this publication exclusively for every payload shape. Even an
+    # unconfirmed response is terminal: a later invocation must not resend it.
+    (umask 077; set -o noclobber
+        jq -n --arg host "$host" --arg owner "$owner" --arg repo "$repo" --arg n "$n" \
+            --arg commit "$captured_head" --slurpfile comments "$posting_files" \
+            '{host:$host,owner:$owner,repo:$repo,pull_number:$n,commit_id:$commit,
+              review_status:"unknown",review_url:null,
+              files:[$comments[0][] | {path:.path,status:"not_attempted",
+                payload:(. + {commit_id:$commit})}]}' >"$file_comments_result"
+    ) || die "cannot exclusively persist delivery receipt; no review submitted"
     if url=$(_submit_review "$review_event" "$submission_inline"); then
+        jq --arg url "$url" '.review_status = "confirmed" | .review_url = $url' \
+            "$file_comments_result" >"${file_comments_result}.tmp" \
+            && mv "${file_comments_result}.tmp" "$file_comments_result" \
+            || die "main review confirmed at $url but receipt update failed; no resubmission allowed"
         if [[ "$file_count" -gt 0 ]]; then
-            jq --arg url "$url" '.review_status = "confirmed" | .review_url = $url' \
-                "$file_comments_result" >"${file_comments_result}.tmp" \
-                && mv "${file_comments_result}.tmp" "$file_comments_result" \
-                || die "main review confirmed at $url but receipt update failed; no resubmission allowed"
             submit_file_comments || return 1
         fi
         _emit_post_result "$review_event" "$url"

@@ -742,11 +742,13 @@ class CriteriaCoordinator:
             self._phase("complete")
 
     def run(self, reviewers, resume=False):
-        """Dispatch routing then each supplied normal task once; never seal or publish.
+        """Dispatch the authenticated strategy's tasks; never finish or publish.
 
-        Exact pending transactions replay before new dispatch. Explicit resume may
-        replace interrupted/invalid work, never a completed ordinary review or an
-        actual not_assessed answer. Technical errors stop scheduling and drain peers.
+        Exact pending transactions replay before new dispatch. Single-pass never
+        redispatches an issued task. Only historical strategies may replace
+        interrupted/invalid work on explicit resume; completed ordinary reviews
+        and actual not_assessed answers remain immutable. Technical errors stop
+        scheduling and drain peers.
         """
         reviewers = self._reviewers(reviewers)
         self.reviewer_prompts = {reviewer["id"]: reviewer["prompt"] for reviewer in reviewers}

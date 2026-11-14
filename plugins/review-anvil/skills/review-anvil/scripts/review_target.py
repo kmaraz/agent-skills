@@ -230,6 +230,14 @@ def _binary(data):
     return False
 
 
+def _patch_path(path):
+    """Match Git's C-style path quoting with core.quotePath=false."""
+    raw = path.encode('utf-8')
+    if b'"' in raw or b'\x7f' in raw:
+        return b'"' + raw.replace(b'"', b'\\"').replace(b'\x7f', b'\\177') + b'"'
+    return raw
+
+
 def capture_pull_diff(target, *, object_repo=None, cache_root):
     """Capture the complete pinned comparison; no user checkout or fetch occurs."""
     repository, pr = target['repository'], target['target']
@@ -269,8 +277,11 @@ def capture_pull_diff(target, *, object_repo=None, cache_root):
                    '--no-ext-diff', '--no-textconv', '--diff-algorithm=myers', '--no-indent-heuristic']
         raw = _git(cache, 'diff-tree', *options, '--raw', '-z', old_tree, new_tree).split(b'\0')
         patch_bytes = _git(cache, 'diff-tree', *options, '--patch', '--binary', '--full-index', '--unified=3', '--no-color', old_tree, new_tree)
-        blocks = re.split(br'(?m)^diff --git ', patch_bytes)[1:]
-        entries, position = [], 0
+        sections = re.split(br'(?m)^diff --git ', patch_bytes)
+        if sections[0]:
+            raise TargetError('Unexpected data before Git patch')
+        blocks = sections[1:]
+        entries, position, patch_position = [], 0, 0
         while position < len(raw) and raw[position]:
             fields = raw[position].decode('ascii').split()
             if len(fields) != 5 or not fields[0].startswith(':'):
@@ -285,19 +296,36 @@ def capture_pull_diff(target, *, object_repo=None, cache_root):
                 second = first
             old_path = None if status[0] == 'A' else first
             new_path = None if status[0] == 'D' else second
-            index = len(entries)
-            if index >= len(blocks):
+            count = 2 if status[0] == 'T' else 1
+            if patch_position + count > len(blocks):
                 raise TargetError('Git patch is incomplete')
-            before = b'' if old_mode == '000000' or old_mode == '160000' else left.blob(old_oid)
-            after = b'' if new_mode == '000000' or new_mode == '160000' else right.blob(new_oid)
+            selected = blocks[patch_position:patch_position + count]
+            header = (_patch_path('a/' + (old_path or new_path)) + b' ' +
+                      _patch_path('b/' + (new_path or old_path)))
+            for index, block in enumerate(selected):
+                if block.split(b'\n', 1)[0] != header:
+                    raise TargetError('Git patch/inventory path mismatch')
+                if status[0] == 'T':
+                    mode = ('deleted file mode ' + old_mode if index == 0 else
+                            'new file mode ' + new_mode).encode('ascii')
+                    if not block.startswith(header + b'\n' + mode + b'\n'):
+                        raise TargetError('Git type-change patch mode mismatch')
+            patch_position += count
+            # Gitlinks are commit identities, not blobs, including in binary type changes.
+            before = (b'' if old_mode == '000000' else old_oid.encode('ascii')
+                      if old_mode == '160000' else left.blob(old_oid))
+            after = (b'' if new_mode == '000000' else new_oid.encode('ascii')
+                     if new_mode == '160000' else right.blob(new_oid))
             is_binary = _binary(before) or _binary(after)
             binary = {'old': hashlib.sha256(before).hexdigest() if old_path else None,
                       'new': hashlib.sha256(after).hexdigest() if new_path else None} if is_binary else None
-            body = None if is_binary else '\n'.join(line for line in blocks[index].decode('utf-8').split('\n')[1:]
-                                                  if not line.startswith('index ') and not line.startswith('similarity index '))
+            body = None if is_binary else ''.join(
+                '\n'.join(line for line in block.decode('utf-8').split('\n')[1:]
+                          if not line.startswith('index ') and not line.startswith('similarity index '))
+                for block in selected)
             entries.append({'status': status[0], 'old_path': old_path, 'new_path': new_path,
                             'old_mode': old_mode, 'new_mode': new_mode, 'patch': body, 'binary': binary})
-        if len(entries) != len(blocks):
+        if patch_position != len(blocks):
             raise TargetError('Git patch/inventory coverage mismatch')
         canonical = canonical_diff(entries)
         closing = read_pull_target(pr['url'])

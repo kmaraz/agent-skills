@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Run the actual CLI with isolated memory and a strict GET-only gh boundary."""
+import contextlib
+import copy
 import base64
 import importlib.util
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -13,9 +16,13 @@ import unittest
 spec = importlib.util.spec_from_file_location("local_rule_fixture", Path(__file__).with_name("test-memory-rule-integration.py"))
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
-from memory_store import MemoryStore
+from memory_store import MAX_FILE_BYTES, MemoryError, MemoryStore
+from memory_rules import LocalRules
 
 HELPER = Path(__file__).with_name("local-memory.py")
+spec = importlib.util.spec_from_file_location("local_memory_cli", HELPER)
+cli = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cli)
 
 
 class CLITests(unittest.TestCase):
@@ -33,6 +40,9 @@ if not args or args[0]!="api" or "--method" not in args or args[args.index("--me
 endpoint=args[-1]
 responses=json.loads(os.environ["GH_FIXTURES"])
 if endpoint not in responses: sys.exit("unexpected endpoint: "+endpoint)
+if isinstance(responses[endpoint],dict) and "$http_error" in responses[endpoint]:
+    sys.stderr.write("gh: forbidden (HTTP "+str(responses[endpoint]["$http_error"])+")\\n")
+    sys.exit(1)
 print(json.dumps(responses[endpoint]))
 ''')
         gh.chmod(0o700)
@@ -83,6 +93,116 @@ print(json.dumps(responses[endpoint]))
         calls=[json.loads(line) for line in (self.root/"gh-calls.jsonl").read_text().splitlines()]
         self.assertTrue(calls)
         self.assertTrue(all(call[call.index("--method")+1]=="GET" for call in calls))
+
+    def test_resolve_pr_uses_canonical_identity_without_discussion_or_memory(self):
+        responses = {
+            "repos/old/widgets": {"id": 42, "full_name": "Acme/Widgets"},
+            "repos/Acme/Widgets/pulls/7": {
+                "number": 7, "head": {"sha": "a" * 40}, "base": {"sha": "b" * 40},
+                "html_url": "https://github.com/Acme/Widgets/pull/7"},
+            "repos/Acme/Widgets/pulls/7/files?per_page=100": [[{"filename": "src/main.py"}]],
+            "repos/Acme/Widgets/issues/7/comments?per_page=100": {"$http_error": 403}}
+        untouched = self.root / "identity-only-memory"
+        self.env.update(GH_FIXTURES=json.dumps(responses), REVIEW_ANVIL_MEMORY_HOME=str(untouched))
+        result = self.run_cli("resolve-pr", "old/widgets#7")
+        self.assertEqual(json.loads(result.stdout), {
+            "repository": "github.com/acme/widgets",
+            "locator": "https://github.com/Acme/Widgets/pull/7", "head_sha": "a" * 40})
+        self.assertFalse(untouched.exists())
+        calls = [json.loads(line)[-1] for line in (self.root / "gh-calls.jsonl").read_text().splitlines()]
+        self.assertEqual(calls, ["repos/old/widgets", "repos/Acme/Widgets/pulls/7"])
+
+    def test_resolve_pr_rejects_invalid_numeric_identity_and_revision(self):
+        valid_repo = {"id": 42, "full_name": "acme/widgets"}
+        valid_pr = {"number": 7, "head": {"sha": "a" * 40}, "base": {"sha": "b" * 40},
+                    "html_url": "https://github.com/acme/widgets/pull/7"}
+        cases = []
+        for identifier in (True, 0, "42"):
+            cases.append(({**valid_repo, "id": identifier}, valid_pr))
+        for field, value in (("number", True), ("number", 8),
+                             ("head", {"sha": "not-a-revision"}), ("base", {"sha": "b" * 39}),
+                             ("html_url", None), ("html_url", "https://github.com/acme/other/pull/7"),
+                             ("html_url", "https://github.com/acme/widgets/pull/8")):
+            cases.append((valid_repo, {**valid_pr, field: value}))
+        untouched = self.root / "invalid-identity-memory"
+        self.env["REVIEW_ANVIL_MEMORY_HOME"] = str(untouched)
+        for repository, pr in cases:
+            with self.subTest(repository=repository, pr=pr):
+                self.env["GH_FIXTURES"] = json.dumps({
+                    "repos/acme/widgets": repository, "repos/acme/widgets/pulls/7": pr})
+                result = self.run_cli("resolve-pr", "acme/widgets#7", success=False)
+                self.assertEqual(json.loads(result.stderr)["status"], "unavailable")
+                self.assertFalse(untouched.exists())
+
+    def test_rules_apply_consumes_authentic_context_larger_than_32_mib(self):
+        for number in (8, 9):
+            collected = fixture.packet()
+            collected["pr"].update(number=number, url=f"https://github.com/acme/widgets/pull/{number}")
+            collected["sources"] = []
+            proposals = []
+            for index in range(18):
+                identifier = number * 100 + index
+                source = copy.deepcopy(fixture.packet()["sources"][0])
+                source.update(id=f"issue_comment:{identifier}", body=f"Evidence {identifier}: " + "é" * 480000,
+                              url=f"https://github.com/acme/widgets/pull/{number}#issuecomment-{identifier}")
+                collected["sources"].append(source)
+                proposals.append({"claim": f"Preserve documented behavior {identifier}", "rationale": "Source-backed contract",
+                                  "paths": [], "sources": [source["id"]], "kind": "observation"})
+            self.memory.apply(self.memory.prepare(collected), proposals)
+        context_path = self.root / "large-context.json"
+        assessment_path = self.root / "large-assessment.json"
+        output_path = self.root / "large-result.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--output", str(context_path))
+        self.assertGreater(context_path.stat().st_size, 32 * 1024 * 1024)
+        self.assertLessEqual(context_path.stat().st_size, MAX_FILE_BYTES)
+        context = json.loads(context_path.read_text())
+        self.assertEqual(len(context["observations"]), 37)
+        assessment_path.write_text(json.dumps(fixture.assessment(context, activate=False)))
+        state_before = (self.memory.directory / "state.json").read_bytes()
+        self.run_cli("rules-apply", "--context", str(context_path), "--assessment", str(assessment_path),
+                     "--output", str(output_path))
+        result = json.loads(output_path.read_text())
+        self.assertEqual(result["rules"], [])
+        self.assertEqual(len(result["assessment"]["dispositions"]), 37)
+        self.assertEqual((self.memory.directory / "state.json").read_bytes(), state_before)
+        for sid, saved in context["sources"].items():
+            if sid != "issue_comment:10":
+                self.assertEqual(saved["source"]["body"], f"Evidence {sid.split(':')[1]}: " + "é" * 480000)
+
+    def test_oversized_valid_input_fails_without_output_or_memory_changes(self):
+        rules = LocalRules(fixture.REPOSITORY, self.root / "memory")
+        context = rules.prepare(fixture.base())
+        context_path = self.root / "oversized-context.json"
+        content = json.dumps(context).encode()
+        with context_path.open("wb") as stream:
+            stream.write(content)
+            remaining = MAX_FILE_BYTES + 1 - len(content)
+            while remaining:
+                count = min(remaining, 1024 * 1024)
+                stream.write(b" " * count)
+                remaining -= count
+        assessment_path = self.root / "oversized-assessment.json"
+        assessment_path.write_text(json.dumps(fixture.assessment(context, activate=False)))
+        output_path = self.root / "must-not-exist.json"
+        before = {path.name: path.read_bytes() for path in self.memory.directory.iterdir() if path.is_file()}
+        result = self.run_cli("rules-apply", "--context", str(context_path), "--assessment", str(assessment_path),
+                              "--output", str(output_path), success=False)
+        failure = json.loads(result.stderr)
+        self.assertEqual(failure["status"], "unavailable")
+        self.assertRegex(failure["error"], r"(?i)(exceed|size|large|limit)")
+        self.assertFalse(output_path.exists())
+        self.assertEqual({path.name: path.read_bytes() for path in self.memory.directory.iterdir() if path.is_file()}, before)
+
+    def test_oversized_utf8_output_is_rejected_before_creating_artifact(self):
+        output_path = self.root / "oversized-output.json"
+        # Character count fits, but the actual UTF-8 artifact exceeds the supported bound.
+        value = {"evidence": "é" * (MAX_FILE_BYTES // 2)}
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self.assertRaises((MemoryError, ValueError)):
+                cli.output(value, str(output_path))
+        self.assertFalse(output_path.exists())
+        self.assertEqual(captured.getvalue(), "")
 
     def test_removed_publishing_commands_cannot_touch_remote(self):
         self.run_cli("rules-publish", "--plan", str(self.root/"unused"), success=False)

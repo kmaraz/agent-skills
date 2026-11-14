@@ -247,8 +247,9 @@ rows with blank lines, relabel sections, or edit after validation.
 
 An exact-source fallback forces the final review event to COMMENT under the
 existing publication guards; it does not rewrite the frozen bundle's decision.
-No fallback permits publication when no-post, freshness, coverage, or another
-existing guard forbids it. If the source bundle itself is invalid, preserve the
+No fallback permits publication when no-post, freshness or another ordinary
+review guard forbids it. Knowledge coverage remains a private diagnostic, never
+a publication prerequisite. If the source bundle itself is invalid, preserve the
 source and diagnostics locally, mark delivery unvalidated, and publish nothing.
 Do not claim validated success or start another model/audit pass.
 

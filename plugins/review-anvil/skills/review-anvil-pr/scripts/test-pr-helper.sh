@@ -855,6 +855,8 @@ test_post_review_success() {
     jq -e '.comments[0].body | contains("preserve it without losing the core point")' "$tmp/review-payload.json" >/dev/null
     jq -e '.comments[0].body | contains("without...") | not' "$tmp/review-payload.json" >/dev/null
     jq -e '[.comments[].path] | index("README.md") != null' "$tmp/review-payload.json" >/dev/null
+    jq -e '.review_status == "confirmed" and .review_url == "https://example.invalid/review/1"
+        and .files == []' "$report.file-comments-result.json" >/dev/null
     assert_file_missing "$report"
     assert_file_missing "$inline"
     assert_file_missing "$tmp/report.md.approval.json"
@@ -936,6 +938,14 @@ test_post_approval_rejection_preserves_report() {
         fail "rejected approval must return non-success"
     fi
     [[ "$(wc -l <"$tmp/writes.jsonl" | tr -d ' ')" == 1 ]] || fail "rejected approval was retried"
+    jq -e '(.review_status == "unknown" or .review_status == "rejected") and .files == []' \
+        "$report.file-comments-result.json" >/dev/null
+    if GH_MOCK_WRITE_LOG="$tmp/writes.jsonl" GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+       PATH="$bin:$PATH" "$HELPER" post github.com acme widgets 42 marker-123 "$report" \
+       >"$tmp/repeated-out" 2>"$tmp/repeated-err"; then
+        fail "rejected body-only review allowed resubmission"
+    fi
+    [[ "$(wc -l <"$tmp/writes.jsonl" | tr -d ' ')" == 1 ]] || fail "rejected body-only review was resent"
     jq -e '.event == "APPROVE" and (has("comments") | not)' "$tmp/review-payload.json" >/dev/null
     [[ -f "$report" && -f "$report.approval.json" && ! -e "$tmp/comment.md" ]] || fail "rejected approval artifacts were lost"
     [[ ! -s "$tmp/stdout" ]] || fail "rejected approval claimed success"
@@ -967,37 +977,66 @@ test_post_review_failure_does_not_fallback() {
     [[ ! -e "$tmp/comment.md" && ! -s "$tmp/stdout" ]] || fail "failed review posted or claimed success"
     grep -Fxq "$REPRODUCTION_LINE" "$report"
     jq -e '.comments | length == 3' "$tmp/review-payload.json" >/dev/null
+    jq -e '(.review_status == "unknown" or .review_status == "rejected") and .files == []' \
+        "$report.file-comments-result.json" >/dev/null
+    if GH_MOCK_WRITE_LOG="$tmp/writes.jsonl" GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+       PATH="$bin:$PATH" "$HELPER" post github.com acme widgets 42 marker-123 "$report" \
+       >"$tmp/repeated-out" 2>"$tmp/repeated-err"; then
+        fail "rejected line-only review allowed resubmission"
+    fi
+    [[ "$(wc -l <"$tmp/writes.jsonl" | tr -d ' ')" == 1 ]] || fail "rejected line-only review was resent"
 }
 
 test_post_unknown_submission_preserves_artifacts() {
-    local tmp bin report response
+    local tmp bin report response shape case_number=0
     tmp="$(mktemp -d)"
     trap "rm -rf '$tmp'" RETURN
     bin="$tmp/bin"
     mkdir "$bin"
     install_fake_gh "$bin"
-    report="$tmp/report.md"
-    for response in '' 'not-json' '{}' 'null' \
-        '{"id":1,"state":"PENDING","submitted_at":null,"html_url":"https://example.invalid/review/1"}' \
-        '{"id":1,"state":"APPROVED","body":"different report","submitted_at":"2026-11-13T12:00:00Z","html_url":"https://example.invalid/review/1"}'; do
-        make_report "$report"
-        make_inline "$report.inline.json"
-        printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$report.approval.json"
-        printf '%s' "$response" >"$tmp/response.json"
-        : >"$tmp/writes.jsonl"
-        if GH_MOCK_REVIEW_RESPONSE="$tmp/response.json" \
-           GH_MOCK_WRITE_LOG="$tmp/writes.jsonl" \
-           GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
-           GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
-           PATH="$bin:$PATH" \
-             "$HELPER" post github.com acme widgets 42 marker-123 "$report" >"$tmp/stdout" 2>"$tmp/stderr"; then
-            fail "unknown submission must not claim success"
-        fi
-        [[ "$(wc -l <"$tmp/writes.jsonl" | tr -d ' ')" == 1 ]] || fail "unknown submission caused another write"
-        [[ -f "$report" && -f "$report.inline.json" && -f "$report.approval.json" ]] || fail "unknown submission lost artifacts"
-        jq -e --rawfile body "$report.posting.md" --slurpfile comments "$report.inline.json" \
-            '.body == $body and .comments == $comments[0]' "$tmp/review-payload.json" >/dev/null
-        [[ ! -s "$tmp/stdout" && ! -e "$tmp/comment.md" ]] || fail "unknown submission claimed success or fell back"
+    for shape in body line; do
+        for response in '' 'not-json' '{}' 'null' \
+            '{"id":1,"state":"PENDING","submitted_at":null,"html_url":"https://example.invalid/review/1"}' \
+            '{"id":1,"state":"APPROVED","body":"different report","submitted_at":"2026-11-13T12:00:00Z","html_url":"https://example.invalid/review/1"}'; do
+            case_number=$((case_number + 1))
+            report="$tmp/$shape-$case_number.md"
+            printf '# Review\n\nNo material findings.\n' >"$report"
+            if [[ "$shape" == line ]]; then
+                make_report "$report"
+                make_inline "$report.inline.json"
+            fi
+            printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$report.approval.json"
+            printf '%s' "$response" >"$tmp/response.json"
+            : >"$tmp/writes.jsonl"
+            if GH_MOCK_REVIEW_RESPONSE="$tmp/response.json" \
+               GH_MOCK_WRITE_LOG="$tmp/writes.jsonl" \
+               GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+               GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+               PATH="$bin:$PATH" \
+                 "$HELPER" post github.com acme widgets 42 marker-123 "$report" >"$tmp/stdout" 2>"$tmp/stderr"; then
+                fail "unknown $shape submission must not claim success"
+            fi
+            [[ "$(wc -l <"$tmp/writes.jsonl" | tr -d ' ')" == 1 ]] || fail "unknown $shape submission caused another write"
+            [[ -f "$report" && -f "$report.approval.json" ]] || fail "unknown $shape submission lost artifacts"
+            if [[ "$shape" == line ]]; then
+                [[ -f "$report.inline.json" ]] || fail "unknown line submission lost inline artifacts"
+                jq -e --rawfile body "$report.posting.md" --slurpfile comments "$report.inline.json" \
+                    '.body == $body and .comments == $comments[0]' "$tmp/review-payload.json" >/dev/null
+            else
+                jq -e --rawfile body "$report.posting.md" \
+                    '.body == $body and (has("comments") | not)' "$tmp/review-payload.json" >/dev/null
+            fi
+            [[ ! -s "$tmp/stdout" && ! -e "$tmp/comment.md" ]] || fail "unknown $shape submission claimed success or fell back"
+            # A later process must not resend a review whose response was lost.
+            if GH_MOCK_WRITE_LOG="$tmp/writes.jsonl" GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
+               PATH="$bin:$PATH" "$HELPER" post github.com acme widgets 42 marker-123 "$report" \
+               >"$tmp/repeated-out" 2>"$tmp/repeated-err"; then
+                fail "unknown $shape submission allowed resubmission"
+            fi
+            [[ "$(wc -l <"$tmp/writes.jsonl" | tr -d ' ')" == 1 ]] || fail "unknown $shape submission was resent"
+            jq -e '.review_status == "unknown" and .review_url == null and .files == []' \
+                "$report.file-comments-result.json" >/dev/null
+        done
     done
 }
 
@@ -1008,8 +1047,8 @@ test_post_body_only_and_no_approve_submit_once() {
     bin="$tmp/bin"
     mkdir "$bin"
     install_fake_gh "$bin"
-    report="$tmp/report.md"
     for no_approve in 0 1; do
+        report="$tmp/report-$no_approve.md"
         make_compact_report "$report"
         printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
         : >"$tmp/writes.jsonl"
@@ -1023,7 +1062,36 @@ test_post_body_only_and_no_approve_submit_once() {
         [[ "$(wc -l <"$tmp/writes.jsonl" | tr -d ' ')" == 1 ]] || fail "body-only review submitted more than once"
         jq -e --arg event "$expected_event" '.event == $event and (has("comments") | not)' "$tmp/review-payload.json" >/dev/null
         grep -Fxq 'https://example.invalid/review/1' "$tmp/stdout"
+        jq -e '.review_status == "confirmed" and .review_url == "https://example.invalid/review/1"
+            and .files == []' "$report.file-comments-result.json" >/dev/null
         assert_file_missing "$report"
+    done
+}
+
+test_post_receipt_persistence_failure_prevents_submission() {
+    local tmp report shape
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    mkdir "$tmp/bin"
+    install_fake_gh "$tmp/bin"
+    for shape in body line file; do
+        report="$tmp/$shape.md"
+        printf '# Review\n\nNo material findings.\n' >"$report"
+        case "$shape" in
+            line) make_report "$report"; make_inline "$report.inline.json" ;;
+            file) make_author_comment_bundle "$report" ;;
+        esac
+        # A dangling receipt cannot be opened because its target parent is absent.
+        # This also exercises exclusive creation without permission/root assumptions.
+        ln -s "$tmp/missing-parent/$shape.json" "$report.file-comments-result.json"
+        if GH_MOCK_WRITE_LOG="$tmp/writes.jsonl" GH_MOCK_REVIEW_PAYLOAD="$tmp/review.json" \
+           GH_MOCK_FILE_PAYLOAD="$tmp/file.json" REVIEW_ANVIL_SKIP_DISMISSED=1 \
+           PATH="$tmp/bin:$PATH" "$HELPER" post github.com acme widgets 42 receipt "$report" \
+           >"$tmp/out" 2>"$tmp/err"; then
+            fail "$shape publication succeeded without a persisted attempt receipt"
+        fi
+        [[ ! -e "$tmp/writes.jsonl" && -f "$report" ]] || fail "$shape publication wrote before persisting its receipt"
+        [[ -L "$report.file-comments-result.json" ]] || fail "publication replaced an existing receipt path"
     done
 }
 
@@ -1926,6 +1994,7 @@ REPORT
     grep -Fq 'Refresh can accept missing state' "$report"
     grep -Fq 'id=RAV-RUN3-R2-F001' "$inline"
     [[ ! -e "$tmp/review-payload.json" ]]
+    [[ ! -e "$report.file-comments-result.json" ]] || fail "failed history prevalidation consumed a publication attempt"
 }
 
 
@@ -2904,9 +2973,9 @@ test_post_knowledge_coverage_is_advisory_and_no_post_is_binding() {
     trap "rm -rf '$tmp'" RETURN
     make_coverage_install "$tmp"
     helper="$tmp/install/review-anvil-pr/scripts/pr-helper.sh"
-    report="$tmp/report.md"
     export COVERAGE_CHECK_CALL="$tmp/check.json"
     for state in missing incomplete unreadable; do
+        report="$tmp/$state.md"
         make_compact_report "$report"
         printf 'all\n' >"${report}.rule-coverage"
         rm -f "$tmp/review.json" "$tmp/comment.md" "$tmp/writes.jsonl" "$COVERAGE_CHECK_CALL" "${report}.coverage.json"
@@ -2925,6 +2994,7 @@ test_post_knowledge_coverage_is_advisory_and_no_post_is_binding() {
         [[ ! -e "$COVERAGE_CHECK_CALL" ]] || fail "ordinary publication depends on knowledge verification"
         [[ ! -f "${report}.coverage.json" || "$state" != missing ]] || fail "coverage diagnostic was fabricated"
     done
+    report="$tmp/no-post.md"
     make_report "$report"
     printf 'all\n' >"${report}.rule-coverage"
     : >"${report}.no-post"
@@ -2933,10 +3003,12 @@ test_post_knowledge_coverage_is_advisory_and_no_post_is_binding() {
         GH_MOCK_REVIEW_PAYLOAD="$tmp/review.json" GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
         bash "$helper" post github.com acme widgets 42 marker "$report" >/dev/null
     [[ -f "$report" && ! -e "$tmp/review.json" && ! -e "$tmp/comment.md" && ! -e "$COVERAGE_CHECK_CALL" ]] || fail "persisted no-post escaped locally"
+    [[ ! -e "$report.file-comments-result.json" ]] || fail "persisted no-post consumed a publication attempt"
     rm -f "${report}.no-post"
     PATH="$tmp/bin:$PATH" REVIEW_ANVIL_NO_POST=1 GH_MOCK_REVIEW_PAYLOAD="$tmp/review.json" GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
         bash "$helper" post github.com acme widgets 42 marker "$report" >/dev/null
     [[ -f "$report" && ! -e "$tmp/review.json" && ! -e "$tmp/comment.md" && ! -e "$COVERAGE_CHECK_CALL" ]] || fail "no-post environment escaped locally"
+    [[ ! -e "$report.file-comments-result.json" ]] || fail "environment no-post consumed a publication attempt"
     unset COVERAGE_CHECK_CALL
 }
 
@@ -3094,6 +3166,7 @@ test_author_comments_no_post_vetoes_all_mutations() {
           GH_MOCK_FILE_PAYLOAD="$tmp/file.json" REVIEW_ANVIL_NO_POST="$([[ "$mode" == environment ]] && echo 1 || echo 0)" \
           PATH="$tmp/bin:$PATH" "$HELPER" post github.com acme widgets 42 author-comments "$report" >/dev/null
         [[ ! -e "$tmp/writes.jsonl" && -f "$report.inline.json" ]] || fail "no-post allowed mutation"
+        [[ ! -e "$report.file-comments-result.json" ]] || fail "no-post consumed a publication attempt"
     done
 }
 
@@ -3142,6 +3215,7 @@ test_file_comments_require_the_reviewed_head() {
         fail "unreviewed live head was substituted for the reviewed commit"
     fi
     [[ ! -e "$tmp/writes.jsonl" && -f "$report" ]] || fail "missing reviewed head allowed publication"
+    [[ ! -e "$report.file-comments-result.json" ]] || fail "prevalidation failure consumed a publication attempt"
 }
 
 test_author_projection_preserves_nonclosing_fence_content() {
@@ -3204,6 +3278,7 @@ main() {
     test_post_review_failure_does_not_fallback
     test_post_unknown_submission_preserves_artifacts
     test_post_body_only_and_no_approve_submit_once
+    test_post_receipt_persistence_failure_prevents_submission
     test_post_start_uses_short_declarative_comment
     test_post_update_success
     test_post_update_refresh_failure_omits_inline_details
