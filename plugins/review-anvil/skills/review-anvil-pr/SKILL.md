@@ -33,7 +33,7 @@ The posting helper rejects bare integers. This preset first canonicalizes
 `#123`/`123` in the actual reviewed repository using stateless `resolve-pr` or
 `gh pr view`, then passes a full URL. Knowledge availability is not required.
 
-### Local pilot controls
+### Memory and coverage controls
 
 - `memory: on` (default): automatically initialize local repository memory,
   process changed PR feedback, and use one frozen advisory snapshot.
@@ -67,13 +67,17 @@ their segments from `<extra-user-args>`. Reject invalid values and duplicate
 or conflicting controls, including repeated identical `rule_coverage` values.
 Run step 0 against the original arguments before removing any segment; the
 helper mechanically validates coverage controls and rejects forged run IDs.
-Always pin `approve: never` for this local pilot and export
-`REVIEW_ANVIL_NO_APPROVE=1` for helper calls. Export
-`REVIEW_ANVIL_RULE_COVERAGE=<scoped|all>` and, for `post: false`,
+Approval follows the engine's default `approve: allowed` and its existing
+review/adversarial/freshness gates. Memory, saved-rule coverage and rule
+generation do not disable approval. Do not inject `approve: never` or set
+`REVIEW_ANVIL_NO_APPROVE=1` by default. Honor an explicit user request to
+never approve/comment only by passing `approve: never` and exporting
+`REVIEW_ANVIL_NO_APPROVE=1` for helper calls; preserve an explicitly supplied
+no-approve environment switch as well.
+Export `REVIEW_ANVIL_RULE_COVERAGE=<scoped|all>` and, for `post: false`,
 `REVIEW_ANVIL_NO_POST=1` **before init**; unset the no-post switch for a new
 posting-enabled invocation. Init persists all-mode/no-post intent beside the
-report, independent of later environment loss. Do not silently restore
-approval when memory is off. Other presets retain their own behavior.
+report, independent of later environment loss.
 
 Read `../review-anvil/references/local-memory.md` before preparing knowledge.
 Resolve its helper from the trusted installation, not reviewed code. If it is
@@ -85,10 +89,10 @@ Do not change user memory settings, replay reviewers or expose private errors.
 
 ### 0. Reject overrides of pinned params
 
-Pins for this preset: `commit_mode`, `target`, `report_path`, `run_ordinal`, `memory_snapshot`, `coverage_run`, `approve`. Enforce mechanically — after resolving the helper (step 1), run:
+Pins for this preset: `commit_mode`, `target`, `report_path`, `run_ordinal`, `memory_snapshot`, `coverage_run`. Approval remains user-configurable. Enforce mechanically — after resolving the helper (step 1), run:
 
 ```bash
-bash <helper-path> check-pins review-anvil-pr "commit_mode,target,report_path,run_ordinal,memory_snapshot,coverage_run,approve" "$ARGUMENTS"
+bash <helper-path> check-pins review-anvil-pr "commit_mode,target,report_path,run_ordinal,memory_snapshot,coverage_run" "$ARGUMENTS"
 ```
 
 Non-zero exit means a pinned param was overridden in the args: surface the script's error verbatim and stop. (The engine's prose pin-rejection in "Parsing" remains as the description of the algorithm; the script is the binding layer.)
@@ -192,7 +196,7 @@ On non-zero exit, surface the script's stderr verbatim and stop. Do not dispatch
 Activate the `review-anvil` skill with this argument string (extra user args go between the pinned params and the rounds default):
 
 ```
-commit_mode: none, approve: never, target: <canonical-PR-URL>, report_path: <REPORT_PATH>, run_ordinal: <RUN_ORDINAL>, memory_snapshot: <private-snapshot-path>, <extra-user-args>, adversarial: auto, rounds: 1
+commit_mode: none, target: <canonical-PR-URL>, report_path: <REPORT_PATH>, run_ordinal: <RUN_ORDINAL>, memory_snapshot: <private-snapshot-path>, <extra-user-args>, adversarial: auto, rounds: 1
 ```
 
 For all mode, add the trusted `rule_coverage: all, coverage_run: <helper-run-id>`
@@ -364,7 +368,7 @@ A present but unrecognized helper severity also aborts; an absent helper field m
 
 **Finding context.** The helper validates `<REPORT_PATH>.context.json` (schema in `../review-anvil/references/report-artifacts.md`) and embeds each finding's record as one hidden `<!-- review-anvil: context={…} -->` line at the end of the top-level report, before the footer, for every finding the report still lists, including findings that also get an inline comment. It drops invalid items with a warning; a missing or malformed file, or a report block that would exceed the size budget, never blocks the post.
 
-**Prior-feedback continuity.** Before review, the engine fetches every root review thread with open/resolved/outdated state, replies from the PR author, and findings from earlier review-anvil review bodies and fallback comments. Reviewers must account for every ledger item and validate author explanations against the current code; GitHub `resolved` means only that the discussion closed, not that the code was proven fixed. Immediately before posting, the helper refreshes this paginated history. If that refresh would remove, demote, or suppress an item from a compact report, posting fails closed and leaves the artifacts for a rerun so the visible summary can be rendered from the refreshed inventory; the helper never leaves a stale summary over a changed finding set. Legacy report forms retain compatible duplicate suppression. Different canonical IDs never collapse solely because prose is similar.
+**Prior-feedback continuity.** Before review, the engine fetches every root review thread with open/resolved/outdated state, replies from the PR author, and findings from earlier review-anvil review bodies and fallback comments. Reviewers must account for every ledger item and validate author explanations against the current code; GitHub `resolved` means only that the discussion closed, not that the code was proven fixed. Immediately before posting, the helper refreshes this paginated history. Rows explicitly marked `disposition=deferred` or `disposition=outside` are historical/context dispositions, not active delivery or reintroduction candidates; preserve them without demoting them again. They still delimit finding blocks, and unresolved critical/high prior feedback still restricts approval. If that refresh would remove, demote, or suppress an active item from a compact report, posting fails closed and leaves the artifacts for a rerun so the visible summary can be rendered from the refreshed inventory; the helper never leaves a stale summary over a changed finding set. Legacy report forms retain compatible duplicate suppression. Different canonical IDs never collapse solely because prose is similar.
 
 Only the PR author resolving a GitHub review thread creates `author-resolved` status. This requires the API-confirmed `resolvedBy` identity to match the PR author; ordinary thread resolution remains `resolved` and is revalidated. After a successful review delivery, the helper also processes `<REPORT_PATH>.resolutions.json`. The artifact binds its dispositions to the `HEAD_SHA` captured by `init`; a non-empty artifact is rejected if the live PR head differs. The helper resolves only still-open roots with a live terminal review-anvil finding marker and the exact requested finding ID. Allowed dispositions are `fixed`, `stale`, and `author-explanation-accepted`; the last also requires a live PR-author reply. Human-authored/non-anvil threads are never resolved, and an `outdated` anchor alone does not qualify.
 
@@ -407,9 +411,11 @@ recommend automatic or manual resubmission of an already attempted review.
 
 - Requires `gh`, `uuidgen`, `jq` (a real binary — gh's `--jq` is built-in gojq and doesn't count), and `uv` (preferred; falls back to `python3`) for PR-feedback history handling. `init` preflights all of these so a missing dependency fails before the expensive review, not after.
 - Environment switches honored by the helper: `REVIEW_ANVIL_NO_APPROVE=1` (never approve), `REVIEW_ANVIL_POST_INFRA_FAILURES=1` (manual-debug escape hatch; ordinarily infrastructure reports stay local), `REVIEW_ANVIL_SKIP_DISMISSED=1` (legacy name: skip full PR-history lookup, forcing COMMENT), `REVIEW_ANVIL_DISMISSALS=<path>` (local suppression file), and `REVIEW_ANVIL_ENABLE_SUGGESTIONS=0` (disable helper-added executable suggestions). Comment placement follows verified anchors, not a severity threshold.
-- This local pilot pins `approve: never` and sets `REVIEW_ANVIL_NO_APPROVE=1`.
-  The underlying posting helper still supports approval for other callers,
-  but this preset must never submit it. `REQUEST_CHANGES` remains unsupported.
+- Use the engine's normal approval policy: a clean or low/nit-only review can
+  submit `APPROVE` once its existing safety gates pass. Explicit no-approve
+  requests, `post: false` and the helper's existing approval restrictions still
+  apply. Do not promise COMMENT-only delivery before assessing the review unless
+  an actual restriction requires it. `REQUEST_CHANGES` remains unsupported.
 - What lands on the PR has passed the engine's reproduction/verification gates:
   uncertain `medium`+ findings are checked against the actual reviewed snapshot
   before posting. When a trusted `proof_runner` is configured, behavior claims

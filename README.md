@@ -95,7 +95,7 @@ checked before they land.
 |---|---|---:|---:|---:|---:|---:|
 | Harden local changes with fix commits | `review-anvil` | Yes | Yes | No | No | No |
 | Review without touching files | `review-anvil-readonly` | No | No | No | No | No |
-| Review a PR with local memory | `review-anvil-pr` | No | No | No | Unless `post: false` | No (local pilot) |
+| Review a PR with local memory | `review-anvil-pr` | No | No | No | Unless `post: false` | Yes, subject to review gates and user controls |
 | Improve a checked-out PR branch | `review-anvil-improve-pr` | Yes | Yes | Yes | Yes | No |
 | Initialize or maintain local memory | `review-anvil-init` | No | No | No | No | No |
 | Learn source-backed local review rules | `review-anvil-rules` | Private memory only | No | No | No | No |

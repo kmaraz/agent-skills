@@ -1898,6 +1898,13 @@ Refresh can accept missing state and create an invalid session.
 </details>
 
 <details>
+<summary>Set aside</summary>
+
+- A separate navigation concern still needs runtime proof. <!-- review-anvil-report: id=RAV-RUN2-R1-F001 severity=medium area=navigation path=src%2Fnavigation.ts start_line=- line=7 disposition=deferred -->
+
+</details>
+
+<details>
 <summary>Review context</summary>
 
 _Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._
@@ -1916,12 +1923,70 @@ REPORT
         fail "compact post must fail when post-time history changes inventory"
     fi
 
-    grep -Fq 'rerun review-anvil' /tmp/review-anvil-compact-refresh.err
     grep -Fq 'Refresh can accept missing state' "$report"
     grep -Fq 'id=RAV-RUN3-R2-F001' "$inline"
     [[ ! -e "$tmp/review-payload.json" ]]
 }
 
+
+test_compact_post_preserves_nonactive_history_without_reraising() {
+    local tmp bin fixture report disposition severity row
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    for disposition in deferred outside; do
+        for severity in medium high; do
+            cat >"$fixture" <<JSON
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"path":"src/auth.ts","line":12,"comments":{"nodes":[{"body":"The request can restore stale bindings.\\n\\n<!-- review-anvil: id=RAV-RUN2-R1-F001 severity=$severity area=auth -->","url":"https://example.invalid/open"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+            report="$tmp/$disposition-$severity.md"
+            row="- The earlier navigation concern still needs runtime proof. <!-- review-anvil-report: id=RAV-RUN2-R1-F001 severity=$severity area=auth path=src%2Fauth.ts start_line=- line=12 disposition=$disposition -->"
+            cat >"$report" <<REPORT
+No new actionable issue was identified.
+
+<details>
+<summary>Set aside</summary>
+
+$row
+
+</details>
+
+<details>
+<summary>Review context</summary>
+
+_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._
+
+</details>
+REPORT
+            printf '[]\n' >"$report.inline.json"
+            if [[ "$severity" == high ]]; then
+                printf '{"event":"APPROVE","head_sha":"head-sha"}\n' >"$report.approval.json"
+            else
+                printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$report.approval.json"
+            fi
+            GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
+              GH_MOCK_REVIEW_PAYLOAD="$tmp/$disposition-$severity.json" \
+              GH_MOCK_WRITE_LOG="$report.writes.jsonl" \
+              GH_MOCK_COMMENT_BODY="$tmp/comment.md" \
+              PATH="$bin:$PATH" \
+                "$HELPER" post github.com acme widgets 42 marker-123 "$report" >"$tmp/post.out"
+            jq -e --arg row "$row" '
+                .event == "COMMENT" and ((.comments // []) | length == 0)
+                and (.body | contains($row))
+                and (.body | contains("<summary>Earlier feedback</summary>") | not)
+            ' "$tmp/$disposition-$severity.json" >/dev/null
+            jq -se 'length == 1 and .[0].event == "COMMENT"' "$report.writes.jsonl" >/dev/null
+            [[ ! -e "$tmp/comment.md" ]] || fail "nonactive history used a fallback comment"
+        done
+    done
+}
 
 test_history_paginates_without_refetch_duplicates() {
     local tmp bin output
@@ -3102,6 +3167,7 @@ EXAMPLE
 
 main() {
     command -v jq >/dev/null 2>&1 || fail "jq is required"
+    test_compact_post_preserves_nonactive_history_without_reraising
     test_author_comment_processing_preserves_nit_and_file_subject
     test_author_comment_rejects_malformed_file_anchors
     test_author_comment_publication_and_partial_receipts

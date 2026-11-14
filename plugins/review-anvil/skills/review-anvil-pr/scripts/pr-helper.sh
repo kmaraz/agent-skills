@@ -1294,9 +1294,11 @@ def path_from_block(block):
                 return path
     return ""
 
-def is_finding_line(line: str) -> bool:
-    return bool(FINDING_RE.search(line or "") or table_finding(line)
-                or clarity_report_finding(line))
+def is_finding_line(line: str, *, active_only: bool = False) -> bool:
+    finding = clarity_report_finding(line)
+    if active_only and finding and finding["disposition"] != "active":
+        return False
+    return bool(finding or FINDING_RE.search(line or "") or table_finding(line))
 
 def signature(body: str) -> str:
     body = body or ""
@@ -1935,7 +1937,7 @@ if report.exists():
         if stripped.startswith(("```", "~~~")):
             in_fence = not in_fence
             continue
-        if not in_fence and is_finding_line(line):
+        if not in_fence and is_finding_line(line, active_only=True):
             start_line, end_line = location_range_from_block([line])
             candidate = {
                 "path": path_from_block([line]),
@@ -2108,7 +2110,7 @@ if report.exists():
             out.append(line)
             i += 1
             continue
-        if not in_fence and is_finding_line(line):
+        if not in_fence and is_finding_line(line, active_only=True):
             j2 = block_end(i)
             block = lines[i:j2]
             start_line, end_line = location_range_from_block(block)
