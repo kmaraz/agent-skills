@@ -275,7 +275,7 @@ routing-only worker cap. Storage `batch_count` is not a worker count.
 Every supported rule receives a determinate verdict or an explicit open
 question. Violations enter normal synthesis, verification and adversarial
 review; learned prose never overrides manual policy or establishes a defect by
-itself. Only authenticated, complete coverage can pass the publication gate.
+itself. Knowledge accounting never adds a new publication prerequisite.
 See the [exhaustive coverage protocol](plugins/review-anvil/skills/review-anvil/references/rule-coverage.md).
 
 The private phase ledger binds direct signed reviewer assignments,
@@ -284,9 +284,10 @@ same frozen run. Each original reviewer task is issued at most once; malformed,
 missing, rejected or failed output never triggers replacement. Independent
 original jobs continue when trust/freshness permits. Accepted results remain
 immutable, and all returned candidate/report inventories remain available for
-adjudication. Missing evidence stays `not_assessed`; partial coverage cannot seal
-or publish. The workflow automatically delivers an honest local partial/failure
-report without a manual resume step.
+adjudication. Missing evidence stays `not_assessed` and prevents a complete
+knowledge claim, not ordinary publication. Valid ordinary reports remain usable
+even when supplemental rule data is malformed or a reviewer result is missing.
+Knowledge limitations remain in private diagnostics; public comments explain only concrete author-relevant code risks.
 
 Actual-diff checkpoints compare complete patches, paths, modes and binary
 content. A verified changed diff supersedes current work, requests cancellation
@@ -297,9 +298,20 @@ and recovery protocols remain intact.
 
 Clarity uses one renderer and one audit wave, with exact validated-source fallback
 and no repair/re-audit. Required versus optional work follows source obligation,
-independently of severity. Publication makes one review submission; failed or
-unknown delivery retains local artifacts without resending or weaker fallback.
-Fresh identity, metadata, signed coverage and no-post gates remain mandatory.
+independently of severity. Publish every useful line/file-anchored finding as its
+own review comment, including optional low/nit suggestions; keep only unanchored
+details in the main body and preserve complete local evidence. Internal knowledge
+counts, signatures and orchestration diagnostics stay local.
+Frozen approval reasons, overall status and second-check mechanics also remain
+private metadata, rather than mandatory public boilerplate. Native OMP waves
+share one enforced monotonic deadline, cancel unfinished work on expiry and
+retain ready results without retries. Synthesis reads the original complete
+review reports without an improvised optional-YAML dependency; private archive
+writes and ordinary report-file writes use their existing distinct APIs.
+Publication submits one review with line comments, then at most one request per
+file-level comment through GitHub's separate endpoint. Failed/unknown delivery
+retains actual partial outcomes without retry or weaker fallback. Original
+history, freshness, approval and no-post controls remain intact.
 Use a fresh OMP session after updating installed Python code.
 
 `post: false` independently forbids remote mutation, even with complete coverage.

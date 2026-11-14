@@ -31,7 +31,7 @@ profile in `asd-ste100-inspired.md` while preserving every frozen predicate.
 | Inline comment | Unlabeled diagnosis and labeled requested work | ID, severity, area, anchor JSON |
 | Unanchored material finding | Short self-contained problem and request | Finding marker |
 | Deferred/outside item | One plain reason in a collapsed section | Optional ID and disposition marker |
-| Review details | Collapsed exact metadata | Metadata inventory |
+| Review details | Concrete scope/checks and useful code limitations only | Complete private metadata inventory |
 
 ## Input
 
@@ -42,12 +42,11 @@ You receive one JSON object named `FROZEN_CLARITY_PACKET`:
   "report_style": "human-summary",
   "decision": "APPROVE | COMMENT",
   "report_ids": ["RAV-RUN3-R2-F001"],
-  "inline_min_severity": "medium",
-  "decision_reason": "exact final reason",
-  "result": "exact final result",
+  "decision_reason": "private frozen event/policy reason",
+  "result": "private frozen overall status",
   "scope": "exact reviewed scope",
   "checks": "exact reproduction result",
-  "second_check": "exact adversarial result",
+  "second_check": "private frozen adversarial outcome",
   "earlier_feedback": [
     {"id": "optional modern or legacy finding ID", "status": "open | still-present | fixed | stale | reported | author-resolved | author-explanation-accepted", "text": "frozen status fact", "url": "optional exact URL"}
   ],
@@ -75,7 +74,7 @@ You receive one JSON object named `FROZEN_CLARITY_PACKET`:
   ],
   "set_aside": [{"id": "optional canonical ID", "severity": "medium", "area": "runtime", "text": "frozen issue", "reason": "frozen reason"}],
   "outside_scope": [{"id": "optional canonical ID", "severity": "low", "area": "docs", "text": "frozen issue", "reason": "frozen reason"}],
-  "run_details": ["exact run-detail line"]
+  "run_details": ["author-relevant verification limitation, if any"]
 }
 ```
 
@@ -93,6 +92,11 @@ inline request. Reject invalid explicit modes; never guess a replacement.
 Only stored old canonical packets lacking the field use legacy severity
 fallback: low/nit suggested, otherwise required.
 
+Do not receive or render knowledge coverage/signature notices, reviewer counts,
+worker failures or orchestration logs. They belong in private local diagnostics.
+Keep author-relevant checks and concrete code-risk limitations in Review context;
+omit vague statements that an internal assessment or question remains incomplete.
+
 ## Output
 
 Return one JSON object and no surrounding prose or Markdown fence:
@@ -101,11 +105,11 @@ Return one JSON object and no surrounding prose or Markdown fence:
 {
   "decision": "APPROVE | COMMENT",
   "metadata_inventory": {
-    "decision_reason": "exact final reason",
-    "result": "exact final result",
+    "decision_reason": "private frozen event/policy reason",
+    "result": "private frozen overall status",
     "scope": "exact reviewed scope",
     "checks": "exact reproduction result",
-    "second_check": "exact adversarial result",
+    "second_check": "private frozen adversarial outcome",
     "earlier_feedback": [],
     "set_aside": [],
     "outside_scope": [],
@@ -139,6 +143,16 @@ Copy `decision`, every metadata/disposition field, every requested-work array,
 anchors, severity, safe exact `suggestion`, and helper-only `prior_feedback`
 unchanged. Copy every frozen metadata and disposition field byte-for-byte into
 `metadata_inventory`.
+
+`metadata_inventory` is private machine transport, not a public report template.
+Keep `decision_reason`, `result` and `second_check` there unchanged; do not copy
+them into visible `Decision reason:`, `Result:` or `Second check:` sections.
+An approval-disabled policy and a second review's mechanics are not code findings.
+Write the headline directly from useful code outcomes. Do not append generic
+sentences that earlier suggestions or deferred questions remain. Mention history
+only when a concrete changed/fixed/still-present code concern helps its author.
+Public Review context contains scope, actual checks and concrete limitations;
+it need not repeat an internal status or the headline.
 
 ## Hidden report metadata
 
@@ -199,13 +213,13 @@ forms, not templates. Do not vary wording mechanically.
 Mention severity, scope, optional suggestions, or set-aside uncertainty only
 when it helps the reader understand the detection result. Do not invent praise,
 readiness, or an `otherwise looks good` claim. When no material issue is
-detected, state that plainly and mention optional suggestions if present.
+detected, state that plainly. Mention useful suggestions only when it adds context.
 
 When every active finding has `request_mode: suggested`, lead with the absence
 of required fixes and optionally mention the suggestions' count or broad
-topic. Do not lead with the exact optional behavior; its full detail belongs
-in `Optional suggestions`. Do not treat a required low-severity fix as optional
-or a suggested medium-severity preference as mandatory. Do not claim the whole
+topic. Do not lead with the exact optional behavior; its detail belongs in
+its native review comment, or `Optional suggestions` if genuinely unanchored.
+Do not treat required low-severity work as optional or a suggested medium preference as mandatory. Do not claim the whole
 PR is correct or ready to merge.
 
 Do not narrate the review pipeline in the visible summary. Avoid internal
@@ -280,18 +294,23 @@ Use this shape:
 <details>
 <summary>Review context</summary>
 
-<exact frozen metadata>
+<exact author-relevant scope/checks and concrete verification limitations>
 
 </details>
 
 _Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._
 ```
 
-Every active finding becomes one row in `Issues and fixes` for `required` or
-`Optional suggestions` for `suggested`, regardless of severity. Keep the complete
-diagnosis, impact, and requested or suggested change in that collapsed row even
-when an inline comment exists. Inline comments carry the same obligation mode
-and anchored detail in GitHub's native review UI.
+The complete local bundle retains every active finding as one row in
+`Issues and fixes` for `required` or `Optional suggestions` for `suggested`.
+Preserve full diagnosis, impact and work predicates there for validation/audit.
+Every active finding with a verified PR anchor also gets one comment regardless
+of severity. A verified changed-file path without a diff line uses
+`subject_type: file`, no line/side/range/position, and no executable suggestion.
+Use exact existing diff anchors for line/range comments. Do not convert a
+report-only source reference into a fabricated PR anchor. The posting projection
+removes duplicate routed rows and empty finding tables from the outgoing body;
+only unanchored details remain there. Keep obligation and fact locks identical.
 
 Use exactly four columns. Keep the header, separator and all data rows contiguous,
 joined with single newlines and no blank lines inside a table. Each table row
@@ -325,7 +344,7 @@ suggestion.
 “Consider adding a summary and documenting its format” must not become
 “Consider adding a summary. Document its format.” A suggestion heading alone
 does not make a bare command optional.
-Emit inline comments only at or above the frozen threshold.
+Emit one comment for every verified line/file anchor, including low/nit.
 
 
 ## Inline recipe

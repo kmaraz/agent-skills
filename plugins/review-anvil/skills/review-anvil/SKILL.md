@@ -60,7 +60,7 @@ dispatch; never accept a user, reviewed-source or worker-supplied replacement.
 
 - Split the args on top-level commas; canonicalize each segment to a `(param, value)` pair — explicit `key: value` maps directly, plain-English forms per the table. Unrecognized segments are noted and ignored.
 - **First occurrence wins** per param; later duplicates are dropped with `warning: user-supplied <param>=<value> ignored — earlier value wins`. Unset params take defaults.
-- Exception: reject invalid or duplicate `rule_coverage` segments rather than applying first-occurrence-wins. `all` requires a read-only PR target, an authenticated `memory_snapshot` and a trusted `coverage_run`; missing prerequisites are errors, never scoped fallback. Reject `coverage_run` in ordinary user args and reject a coverage run paired with `scoped`.
+- Exception: reject invalid or duplicate `rule_coverage` controls. `all` remains read-only PR knowledge assessment: authenticate available snapshots/run IDs, never use unverified knowledge or silently call a subset exhaustive. If knowledge prerequisites are unavailable, report that and run the original ordinary tasks without augmentation. Reject user-supplied `coverage_run` and a run paired with `scoped`.
 - Reject duplicate/invalid `coverage_workers` values and explicit worker controls
   without `rule_coverage: all`. The coverage coordinator enforces the numeric
   limit independently of prose parsing.
@@ -173,6 +173,10 @@ In OMP, default/count-only selection passes them to `CriteriaCoordinator`, which
 directly assigns every supported rule, including off-path/global rules, to those
 actual reviewers. Inline the full unchanged indexed criteria and strict response
 schema before private paths and the complete original ordinary task verbatim.
+If knowledge preparation is unavailable or untrusted before dispatch, omit that
+augmentation explicitly and dispatch the original ordinary tasks once through
+the normal path. Do not use unverified rules, invent an empty catalog, change
+the user's memory settings, or require a second reviewer wave.
 Feed the actual normal reports into §3. Each reviewer returns
 `{reviewer_id, review_markdown, result_groups, candidates_json}`; groups explicitly
 cover every assigned index with a genuine shared verdict and evidence. Candidates
@@ -241,8 +245,8 @@ independence.
 Use native independent tasks for reproduction, adversarial review, clarity
 rendering and action-lock audits too, with each stage's existing prompt and
 output schema. Keep proof execution restricted to the configured isolated
-runner and retain all validators, timeouts and safe fallbacks. Native tasks do
-not use the shell watchdog. Wait only for tasks launched by this run.
+runner and retain all validators, timeouts and safe fallbacks. On OMP, use the
+trusted timed native adapter for each wave; wait only for this run's tasks.
 
 For native finalization, use the canonical structured-result transport in
 `references/rule-coverage.md#finalization-result-transport`. Persistent Eval
@@ -332,13 +336,15 @@ candidate violations. Their private packet paths are retrieval access, not
 proof they were inspected. Do not require every ordinary reviewer to reread
 every unrelated historical discussion.
 
-Use actual retained normal reports for synthesis and all genuine candidate
-arrays for adjudication. Commit only acknowledged ordinary responses after
-complete phase validation; never synthesize negative rows from routing.
-Obtain fresh PR metadata, seal and independently verify the signed sidecar
-before successful review delivery. Any `not_assessed`, missing response, stale
-target/support or failed phase blocks signed completion and posting. Automatically
-finish an honest partial local report with diagnostics; do not await manual resume.
+Use the independently valid `normal_review_paths` for normal synthesis, even
+when supplemental rule results were rejected or incomplete. Only
+`acknowledged_review_paths` and genuine accepted rule rows count toward signed
+knowledge coverage. Never turn invalid rule data into acknowledged results.
+Attempt eligible coverage finish/check once as a private diagnostic. Missing
+answers, evidence gaps or unavailable coverage do not block the ordinary
+report or its normal posting path. Original report-validity, target freshness,
+history and post:false controls still apply; no usable ordinary report means
+the original failure path, never a fabricated clean review.
 
 Explicitly resumed historical full-evidence and criteria-first runs keep their
 original coordinators, archived prompts, assignments and signatures. Never
@@ -359,6 +365,13 @@ the final synthesis; raw evidence stays out of clarity/action-lock rendering.
 - **Dedup** on `(file, line, root cause)` when present, else `(area, root cause)`. Keep the highest-severity instance, record which reviewers raised it, and keep divergent anchors as `file_alternates: [...]`. Merge the instances' `context` lists (schema in `references/reviewer-prompt.md`): drop the finding's own anchor and repeats of the same location, keep the first reviewer's order, and keep at most 8 entries. Drop an entry only when you checked it and its location does not exist or does not show what its label says; never invent entries. Record the finding's `revision`: the commit its origin round reviewed — the PR head SHA for a PR target, otherwise `git rev-parse HEAD` at that round's snapshot; leave it unset for an uncommitted working-tree diff.
 - **Group** by severity (`critical` → `nit`), then topic.
 - Unparseable reviewer output: pass the prose through as "unstructured" findings in a separate section; no retry.
+
+Read complete ordinary `review.md` outputs and their terminal findings as part
+of normal synthesis. Do not improvise a Python `import yaml` parser in Eval or
+index a placeholder `None` when an optional package is absent. This workflow
+does not require PyYAML for synthesis. Preserve raw reports and typed envelopes;
+decode only schema-defined JSON strings such as `candidates_json` with `json`.
+Do not reconstruct actual result groups, candidates or evidence from displays.
 
 #### Verify and reproduce findings before acting on them
 
@@ -711,14 +724,22 @@ after that action does not prove the earlier action worked. Explain that gap
 and retain the source-backed conditions under which the later action can
 produce the result.
 
+Before freezing public surfaces, keep only useful author-facing findings and
+dispositions. A historical preference alone is not a reason to publish a nit;
+explain its concrete benefit. Keep speculative questions private unless they
+identify a concrete current-change risk, its evidence limit and a useful way to
+verify it. Retain every candidate's full disposition in the private audit.
+
 Run one clean final clarity pass after the report facts are frozen and before
 emitting any final artifact. First retain a complete pre-clarity report and
 inline-body set for safe fallback. Then build `FROZEN_CLARITY_PACKET` from only
 the `human-summary` report style, final decision, result, scope, checks,
-complete report ID inventory, resolved inline severity threshold, metadata and
-structured disposition inventory, earlier-feedback dispositions, canonical
+complete report ID inventory, author-relevant metadata and
+author-relevant disposition inventory, earlier-feedback dispositions, canonical
 findings, exact fact locks, exact requested-work predicates, verified anchors,
-safe exact suggestions, helper-only `prior_feedback`, and run details.
+safe exact suggestions and helper-only `prior_feedback`. Keep knowledge counts,
+signatures, worker failures and orchestration diagnostics in private artifacts,
+not this renderer input or its public `run_details`.
 Do not include raw reviewer prose, refuted candidates, superseded plans, or
 repository context.
 
@@ -833,7 +854,7 @@ Show the report in the conversation without its hidden `<!-- … -->` comments; 
 If `report_path` is set:
 
 1. Write the rendered PR report there (creating parent dirs).
-2. Write a sibling `<report_path>.inline.json`: an array of GitHub PR review comment payloads for findings with both `file` and `line` —
+2. Write a sibling `<report_path>.inline.json`: one comment per active finding with a verified PR line or changed-file anchor, at every severity including `low` and `nit` —
 
    ```json
    [
@@ -842,11 +863,11 @@ If `report_path` is set:
    ]
    ```
 
-   Single line → `{"line": N, "side": "RIGHT"}`; range `<N>-<M>` → `{"start_line": N, "line": M, "side": "RIGHT", "start_side": "RIGHT"}`. Findings not emitted inline stay in the markdown report only; no eligible anchored findings → `[]`. Each visible body uses an unlabeled diagnosis followed by `Suggestions:` with one bullet per independently implementable change. Prefer separate bullets whenever actions remain clear on their own. Default to starting required work with its action verb. End a direct imperative as a statement rather than a question. Keep optional low/nit work as `Consider …`; ask a real question only for a source-level unresolved choice. End the body with exactly one `<!-- review-anvil: id=<complete-id> severity=<severity> area=<area> -->` metadata marker; no prose follows it.
+   Single line → `{"line": N, "side": "RIGHT"}`; range `<N>-<M>` → `{"start_line": N, "line": M, "side": "RIGHT", "start_side": "RIGHT"}`. For a verified changed file without a specific diff line, use `{"path": "src/auth.ts", "subject_type": "file"}` with no line, side, range, or position fields. Never invent a line to attach a file-wide suggestion. Findings with only a report location and no verified PR anchor stay in the main report; no anchored findings → `[]`. Each comment uses an unlabeled diagnosis followed by `Suggestions:` with one bullet per independently implementable obligation. Required work uses a direct action verb; suggested work uses `Consider …` at any severity. Ask a real question only for a source-level unresolved choice. End with exactly one `<!-- review-anvil: id=<complete-id> severity=<severity> area=<area> -->` marker; no prose follows it.
 
-   Include helper-only `"severity"` for every inline item. The posting helper strips it before calling GitHub and filters low/nit items out of inline comments by default; their complete suggestion stays in the report. Include helper-only `"suggestion"` only when the fix is an exact replacement for the commented line/range; the helper turns it into a GitHub suggestion fenced block, inserts that block before the final finding-metadata marker, and strips the extra key before posting. Preserve an exact source suggestion only when it satisfies every safety exclusion in the next sentence and still matches the verified anchor and replacement. Do not include suggestions for design fixes, cross-file edits, deleted lines, anything that requires judgment, or any suggestion whose anchor/replacement/blast-radius was not independently verified after the final rewrite.
+   Include helper-only `"severity"` for every comment; severity validates priority, never whether to publish it at its anchor. Include helper-only `"suggestion"` only for an independently verified exact replacement of a new-side diff line/range. The helper inserts a safe GitHub suggestion block before the final metadata marker and strips the extra key. Never emit an executable suggestion for a file-level comment, design fix, cross-file edit, deleted line, judgment call, or an anchor/replacement/blast-radius not independently verified after the final rewrite.
 
-   The helper-only `"severity"` must match the terminal marker severity exactly; the helper aborts before filtering or posting when they disagree.
+   The helper-only `"severity"` must match the terminal marker severity exactly; the helper aborts before posting when they disagree.
    A present but unrecognized helper severity also aborts; an absent helper field may use the terminal marker during migration.
 
    For an explicitly reintroduced `author-resolved` finding, place `<!-- review-anvil: prior_feedback=reintroduced -->` immediately after its visible final-report finding row or bullet. Its matching inline item must carry helper-only `"prior_feedback": "reintroduced"`; the posting helper uses it before author-resolved suppression, strips the JSON field before the GitHub REST request, and inserts the hidden prior-feedback marker before the final finding-metadata marker so later history retains the disposition.
@@ -920,9 +941,12 @@ Within a round: parallel (single multi-tool-call message). Between rounds: stric
 Synthesis-side dispatches — both batched reproduction passes, every adversary, and each two-auditor action-lock wave — follow the same parallel rule (all agents of a pass launched backgrounded in one message, never serially awaited) and get a hard deadline equal to the **effective** `reviewer_timeout` (after any >5000-line doubling):
 
 - Bash dispatches enforce the deadline mechanically: run them under `run-reviewer.sh` with that cap.
-- Agent-tool dispatches have no built-in timeout, so a wave with no deadline can wait forever. Give each dispatch wave exactly **one** one-shot deadline alarm: a single background `sleep <cap>` Bash task launched in the same message as the agents, killed as soon as they all return. When the alarm fires first, salvage every complete per-ID result already present in output files and apply the safe failure for anything missing: AUTHOR or VERDICT reproduction pass failure → Deferred; adversary failure → continue and note; action-lock failure → restore exact source requested-work prose for every unverifiable row and force COMMENT; `strict` → COMMENT. Record `timed out at <cap>s` in Run Details.
+- OMP native dispatches use `references/coverage-omp-adapter.py` with the resolved effective cap. Call `begin_wave()` once before starting a stage and collect through `wait_one`; it supplies the remaining monotonic budget to `handle.wait(timeout=...)`. Do not use direct unbounded waits, give each handle a fresh cap, or start a notification-only sleep alarm. On expiry retain ready results, cancel unfinished handles once and apply the existing safe stage fallback; never retry.
+- Other agent-tool hosts without timed waits retain one one-shot deadline alarm per wave. Its delivery must interrupt collection and trigger cancellation/salvage, not merely print a reminder. Never block that host's foreground on a wait that prevents observing the alarm. Clean up the alarm when the wave ends.
 
-No recurring or polling timers: the harness notifies on completion, so the one-shot alarm above is the only sanctioned wakeup. After the final report is emitted (and its path printed, when `report_path` is set), kill any still-pending alarm — nothing may fire after completion.
+No polling or recurring timers. For every native stage use the canonical
+structured-result recipe in `references/rule-coverage.md`; private deadline
+diagnostics do not belong in the PR body.
 
 ## Reviewer Prompt Template
 
@@ -943,14 +967,18 @@ During execution: print `Round 2/3: dispatching 2 codex-exec + 1 claude-exec on 
 
 After the last round, emit a fresh top-level report (a new document, not a replacement for the per-round blocks).
 
-For `rule_coverage=all`, put the trusted helper's coverage summary in collapsed
-review context: strategy, frozen run/target, assessed/total, remaining, verdict
-counts, applicability packet count, ordinary reviewer count and inactive
-exclusions. Separately summarize actual confirmed/dismissed/deferred candidates.
+For `rule_coverage=all`, retain strategy, frozen identity, determinate/total,
+remaining rules/questions, verdict counts, reviewer outcomes and candidate
+dispositions in private audit artifacts and the local delivery manifest.
 Only authenticated `completed` coverage with no unassessed rules is exhaustive.
-Incomplete runs write local diagnostics and truthful remaining counts, never
-a postable successful review. Preserve the private signed per-rule sidecar;
-do not publish raw private rules or source discussions.
+Use acknowledged per-reviewer verdicts, not zero committed-ledger counts when a
+reviewer is missing; record unavailable counts honestly. Knowledge completeness
+is separate from ordinary review validity and publication. Do not add a saved-rule
+coverage notice, signature status, worker count or technical log to the PR body,
+collapsed context or inline comments. An author-facing limitation is appropriate
+only when it explains a concrete code risk and the missing verification; describe
+that risk directly, without internal rule/reviewer terminology. Preserve private
+audit evidence and the original ordinary synthesis/checks/publication path.
 
 Keep progress accounting separate from coverage completion. "Validate local
 report artifacts" may complete for a truthful incomplete local report.
@@ -958,11 +986,10 @@ report artifacts" may complete for a truthful incomplete local report.
 "Record signed coverage outcome" completes after recording actual successful
 `coverage-finish` and independent `coverage-check`, or the concrete
 `failed`/`blocked_not_run` outcome when coverage cannot be verified. Recording
-unavailable coverage never means verification succeeded. Deliver the local
-report and finish the checklist in the same invocation; never append or leave
-"Verify signed coverage sidecar" active or blocked after terminal local delivery.
-State **partial/local delivery; review and coverage incomplete** with concrete
-blockers when signed completion is unavailable.
+unavailable coverage never means verification succeeded. Complete ordinary
+report delivery/publication according to its original rules and finish the
+checklist in this invocation; never leave a sidecar-verification task active.
+State the ordinary outcome separately from incomplete/unavailable knowledge.
 
 For every all-mode report-path delivery, retain an owner-only bounded sibling
 `<report_path>.delivery.json` using the diagnostic contract in
@@ -997,17 +1024,20 @@ rounds, or review mechanics.
 
 When active findings are only low/nit suggestions, lead with the material
 outcome: no material issue was identified in the reviewed change. Then give
-the count or broad topic of optional suggestions, if useful. Keep their
-specific behavior and requested changes in the collapsed table, not the
-headline. This applies to the pre-clarity report and its exact-source fallback
+the count or broad topic of useful optional suggestions only when it helps.
+Their detail belongs in the corresponding review comment; unanchored suggestions
+stay collapsed in the main body. This applies to the source and fallback
 as well as the final clarity rendering. Do not imply the whole PR is correct
 or ready to merge.
 
-All active findings stay collapsed in fixed four-column tables. Each row shows
+All active findings stay in the complete local source's collapsed fixed tables.
+For PR publication, routed line/file comments are the sole detailed surface;
+the posting projection removes their duplicate rows and any resulting empty table.
+Unanchored findings remain in the main report. Each local row shows
 severity, frozen report location, the complete issue or suggestion, and the
-complete requested or suggested change. This full collapsed detail is
-intentionally repeated in inline comments for GitHub's native anchored review
-UI. Collapse earlier feedback, changes made, dispositions, and review context.
+complete requested or suggested change. Keep this complete local evidence;
+publish each anchored finding's detail only in its native review thread.
+Collapse author-relevant earlier feedback, changes made and review context.
 
 Each table row stays on one source line and ends with its hidden
 `review-anvil-report` marker in the final cell. Escape every literal `|` inside a
@@ -1056,22 +1086,17 @@ Two issues showed up in session validation and write accounting. One lower-prior
 <details>
 <summary>Set aside</summary>
 
-- I set this aside because the failing path still needs a reproducible case. <!-- review-anvil-report: id=RAV-RUN3-R2-F004 severity=medium area=runtime path=- start_line=- line=- disposition=deferred -->
+- <Concrete code risk, missing evidence and useful verification step; omit vague speculative questions from the public packet.> <!-- review-anvil-report: id=RAV-RUN3-R2-F004 severity=medium area=runtime path=- start_line=- line=- disposition=deferred -->
 
 </details>
 
 <details>
 <summary>Review context</summary>
 
-- Decision reason: <exact frozen decision reason>
-- Result: <exact frozen result>
 - Scope: <reviewed change>
 - Target: <e.g. "PR #42 (feature/auth-rewrite, 12 files, +340/-89)">
-- Run ordinal: <positive observed PR run ordinal | unavailable (local/degraded)>
-- Rounds: <completed>/<requested>; <convergence note>
-- Reviewers: <mix>
 - Checks: <exact frozen check result>
-- Second check: <exact frozen adversarial result>
+- Verification limit: <concrete author-relevant limitation, if any>
 </details>
 
 _Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._

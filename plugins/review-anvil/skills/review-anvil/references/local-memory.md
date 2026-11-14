@@ -122,7 +122,7 @@ python3 <memory-helper> record-run --snapshot /private/run/snapshot.json --dispo
 
 Include every selected ID exactly once. Never fabricate an influence claim. Keep the snapshot digest and dispositions in the private run record; summarize additions/invalidations and genuinely used/contradicted observations to the invoking user. A PR report may include concise source-linked review context, never the raw private archive. The record is independent of the PR helper's temporary report sidecars.
 
-Memory enabled but unavailable is an explicit terminal error: stop before reviewer dispatch and automatically write the local failure report and diagnostic manifest. Do not await a resume instruction, retry, silently switch to `memory: off` or treat corrupt/missing/unreadable memory as empty. A separately requested `memory: off` run neither reads nor updates memory. Snapshot absence is distinct from a valid empty snapshot.
+Unavailable or untrusted knowledge is an explicit diagnostic, not an empty valid snapshot. Do not use its rules, invent evidence, change memory settings or repeat preparation automatically. Before ordinary dispatch, continue the original review tasks once without that augmentation and state knowledge unavailability in the report. If ordinary results already exist, preserve and synthesize the usable ones without a replacement wave. Skip memory recording/learning that lacks a valid snapshot; preserve original report/target/history/no-post controls.
 
 ## Inspect, correct, invalidate
 

@@ -150,6 +150,25 @@ class CriteriaCoordinator:
             raise CoordinatorError("Signed packet has missing or duplicate rule IDs")
         return set(ids)
 
+    @staticmethod
+    def _ordinary_markdown(response, reviewer_id):
+        if not isinstance(response, dict) or response.get("reviewer_id") != reviewer_id:
+            raise CoordinatorError("Ordinary review belongs to another reviewer")
+        markdown = response.get("review_markdown")
+        if not isinstance(markdown, str):
+            raise CoordinatorError("Actual ordinary markdown must retain its terminal fenced findings block")
+        in_findings, findings_close, last_nonblank = False, None, None
+        for index, line in enumerate(markdown.splitlines()):
+            if line.strip():
+                last_nonblank = index
+            if re.fullmatch(r"\s*```findings\s*", line):
+                in_findings = True
+            elif in_findings and re.fullmatch(r"\s*```\s*", line):
+                findings_close, in_findings = index, False
+        if in_findings or findings_close is None or findings_close != last_nonblank:
+            raise CoordinatorError("Actual ordinary markdown must retain its terminal fenced findings block")
+        return markdown
+
     def _validate(self, stage, packet, response):
         if not isinstance(response, dict):
             raise CoordinatorError("Worker must return the exact typed stage object")
@@ -181,19 +200,7 @@ class CriteriaCoordinator:
             raise CoordinatorError("Worker omitted assigned criteria")
         if routing:
             return []
-        markdown = response["review_markdown"]
-        if not isinstance(markdown, str):
-            raise CoordinatorError("Actual ordinary markdown must retain its terminal fenced findings block")
-        in_findings, findings_close, last_nonblank = False, None, None
-        for index, line in enumerate(markdown.splitlines()):
-            if line.strip():
-                last_nonblank = index
-            if re.fullmatch(r"\s*```findings\s*", line):
-                in_findings = True
-            elif in_findings and re.fullmatch(r"\s*```\s*", line):
-                findings_close, in_findings = index, False
-        if in_findings or findings_close is None or findings_close != last_nonblank:
-            raise CoordinatorError("Actual ordinary markdown must retain its terminal fenced findings block")
+        self._ordinary_markdown(response, packet["reviewer_id"])
         encoded = response["candidates_json"]
         if not isinstance(encoded, str):
             raise CoordinatorError("candidates_json must use the trusted typed JSON-string transport")
@@ -299,6 +306,19 @@ class CriteriaCoordinator:
             request["reviewer_id"] = packet["reviewer_id"]
         return request
 
+    def _task_packet(self, directory, entry):
+        packet = directory.read("packet.json")
+        if not isinstance(packet, dict) or _digest(packet) != entry["packet_digest"]:
+            raise CoordinatorError("Archived signed stage packet changed")
+        field = "batch_index" if entry["stage"] == "applicability" else "reviewer_id"
+        if str(packet.get(field)) != entry["key"]:
+            raise CoordinatorError("Archived stage key differs from signed packet identity")
+        prompt = self.reviewer_prompts.get(entry["key"], "") if entry["stage"] == "review" else ""
+        request = self._request(entry["stage"], entry["key"], packet, directory, prompt)
+        if directory.read("request.json") != request:
+            raise CoordinatorError("Frozen native task/lens/schema request changed")
+        return packet
+
     def _restore(self, *, resume):
         inventory = set(os.listdir(self.tasks.fd))
         expected = {entry["name"] for entry in self.state["tasks"]}
@@ -327,16 +347,7 @@ class CriteriaCoordinator:
                 raise CoordinatorError("Malformed archived criteria task identity")
             directory = self.tasks.child(entry["name"])
             try:
-                packet = directory.read("packet.json")
-                if _digest(packet) != entry["packet_digest"]:
-                    raise CoordinatorError("Archived signed stage packet changed")
-                identity_field = "batch_index" if entry["stage"] == "applicability" else "reviewer_id"
-                if str(packet.get(identity_field)) != entry["key"]:
-                    raise CoordinatorError("Archived stage key differs from signed packet identity")
-                prompt = self.reviewer_prompts.get(entry["key"], "") if entry["stage"] == "review" else ""
-                request = self._request(entry["stage"], entry["key"], packet, directory, prompt)
-                if directory.read("request.json") != request:
-                    raise CoordinatorError("Frozen native task/lens/schema request changed")
+                packet = self._task_packet(directory, entry)
                 response = directory.read("response.json", missing=True)
                 transaction = directory.read("transaction.json", missing=True)
                 if transaction is not None:
@@ -449,7 +460,7 @@ class CriteriaCoordinator:
             active.remove(entry)
             self.errors.append(f"Worker {entry[2]['stage']} {entry[2]['key']}: {type(exc.cause).__name__}: {exc.cause}")
             entry[1].write("worker-error.json", {"type": type(exc.cause).__name__, "error": str(exc.cause)})
-            if isinstance(exc.cause, (KeyboardInterrupt, SystemExit)):
+            if isinstance(exc.cause, (KeyboardInterrupt, SystemExit, TimeoutError)):
                 self.fatal = True
         except BaseException as exc:
             if entry is None:
@@ -513,6 +524,9 @@ class CriteriaCoordinator:
         return not self.fatal if self.strategy == "single-pass" else not self.errors
 
     def _wave(self, stage, jobs, limit):
+        begin_wave = getattr(self.adapter, "begin_wave", None)
+        if begin_wave is not None:
+            begin_wave()
         issued = {entry["key"] for entry in self.state["tasks"] if entry["stage"] == stage}
         excluded = issued if self.strategy == "single-pass" else self.completed[stage]
         active, queue = [], [job for job in jobs if job[0] not in excluded]
@@ -587,6 +601,7 @@ class CriteriaCoordinator:
 
     def _outputs(self):
         reviews, review_results, candidate_paths, candidates = {}, {}, [], []
+        ordinary_reviews = {}
         pending_reviews, pending_candidates = [], []
         rejected_reviews, rejected_candidates, inventory = [], [], []
         unvalidated_reviews, unvalidated_candidates, unvalidated_count = [], [], 0
@@ -617,6 +632,18 @@ class CriteriaCoordinator:
                 inventory.append(artifact)
                 if entry["stage"] != "review" or response is None:
                     continue
+                if (self.strategy == "single-pass" and (
+                        self.target_observation is None or self.target_observation["relation"] == "same")):
+                    try:
+                        self._task_packet(directory, entry)
+                        markdown = self._ordinary_markdown(response, entry["key"])
+                    except CoordinatorError:
+                        artifact["ordinary_review_status"] = "invalid"
+                    else:
+                        path = str(directory.path / "review.md")
+                        self._text(directory, "review.md", markdown)
+                        ordinary_reviews[entry["key"]] = path
+                        artifact["ordinary_review_status"] = "usable"
                 if validation == "unvalidated":
                     path = str(directory.path / "review.md")
                     if isinstance(response, dict) and isinstance(response.get("review_markdown"), str):
@@ -656,13 +683,16 @@ class CriteriaCoordinator:
             finally:
                 directory.close()
         calls["total"] = sum(calls.values())
-        review_paths = [reviews[rid] for rid in self.reviewer_prompts if rid in reviews]
+        acknowledged_paths = [reviews[rid] for rid in self.reviewer_prompts if rid in reviews]
+        review_paths = ([ordinary_reviews[rid] for rid in self.reviewer_prompts if rid in ordinary_reviews]
+                        if self.strategy == "single-pass" else acknowledged_paths)
         questions = [{"reviewer_id": rid, **result} for rid, results in review_results.items()
                      for result in results if result["verdict"] == "not_assessed"]
         self.archive.write("open-questions.json", {"schema_version": 1, "run_id": self.run_id, "questions": questions})
         self.archive.write("attempt-inventory.json", {"schema_version": 1, "run_id": self.run_id, "attempts": inventory})
         return {"archive_path": str(self.archive.path), "review_paths": review_paths,
                 "normal_review_paths": review_paths, "candidate_paths": candidate_paths,
+                "acknowledged_review_paths": acknowledged_paths,
                 "candidate_count": len(candidates), "open_questions_path": str(self.archive.path / "open-questions.json"),
                 "open_question_count": len(questions), "phase": self.state["phase"], "model_call_counts": calls,
                 "uncertain_dispatch_count": uncertain_dispatches,

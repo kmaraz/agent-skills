@@ -154,7 +154,7 @@ def parser():
     coverage_record = sub.add_parser("coverage-record", help="Save exact per-rule verdicts for an issued batch")
     coverage_record.add_argument("--batch", required=True)
     coverage_record.add_argument("--results", required=True)
-    coverage_check = sub.add_parser("coverage-check", help="Verify complete coverage and the current PR before publication")
+    coverage_check = sub.add_parser("coverage-check", help="Verify complete knowledge coverage against the current PR")
     coverage_check.add_argument("--report", required=True)
     coverage_check.add_argument("--repository")
     coverage_check.add_argument("--number", type=int)

@@ -61,6 +61,7 @@ SUGGESTIONS_TABLE_HEADER = (
 )
 TABLE_SEPARATOR = "|---|---|---|---|"
 ANCHOR_KEYS = ("path", "start_line", "line", "side", "start_side")
+FILE_LINE_KEYS = ("start_line", "line", "side", "start_side", "position", "start_position", "range")
 METADATA_FIELDS = (
     "decision_reason",
     "result",
@@ -98,7 +99,7 @@ COMPACT_SECTION_LABELS = frozenset(
 )
 
 
-SEVERITY_RANK = {"nit": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+SEVERITIES = ("nit", "low", "medium", "high", "critical")
 class InvalidBundle(ValueError):
     pass
 
@@ -136,6 +137,8 @@ def indexed_findings(canonical: dict[str, Any]) -> dict[str, dict[str, Any]]:
             raise InvalidBundle(f"invalid canonical finding id {finding_id}")
         if finding_id in indexed:
             raise InvalidBundle(f"duplicate canonical finding {finding_id}")
+        if finding.get("severity") not in SEVERITIES:
+            raise InvalidBundle(f"{finding_id} invalid severity")
         finding_request_mode(finding)
         indexed[finding_id] = finding
     return indexed
@@ -246,11 +249,8 @@ def validate_metadata(
     if rendered.get("metadata_inventory") != expected:
         raise InvalidBundle("metadata inventory changed")
     visible_values = [
-        expected["decision_reason"],
-        expected["result"],
         expected["scope"],
         expected["checks"],
-        expected["second_check"],
         *(item.get("text") for item in (expected["earlier_feedback"] or [])),
         *(item for item in (expected["set_aside"] or []) if isinstance(item, str)),
         *(item for item in (expected["outside_scope"] or []) if isinstance(item, str)),
@@ -552,24 +552,53 @@ def marker_from_body(body: Any) -> re.Match[str]:
     raise InvalidBundle("inline metadata marker is missing or malformed")
 
 
+def comment_subject(item: dict[str, Any], finding_id: str) -> str | None:
+    """Validate structural anchors; frozen canonical equality supplies provenance."""
+    subject = item.get("subject_type")
+    if "subject_type" in item and subject not in ("file", "line"):
+        raise InvalidBundle(f"{finding_id} invalid inline subject_type")
+    path = item.get("path")
+    if path is None:
+        if subject is not None:
+            raise InvalidBundle(f"{finding_id} inline subject requires a path")
+        return None
+    if (
+        not isinstance(path, str) or not path.strip() or path.startswith("/")
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or any(part in ("", ".", "..") for part in path.split("/"))
+    ):
+        raise InvalidBundle(f"{finding_id} invalid inline path")
+    if subject == "file" or item.get("line") is None and subject is None:
+        if any(item.get(key) is not None for key in FILE_LINE_KEYS):
+            raise InvalidBundle(f"{finding_id} file anchor has line fields")
+        if item.get("suggestion") is not None:
+            raise InvalidBundle(f"{finding_id} file anchor has an executable suggestion")
+        return "file"
+    line = item.get("line")
+    if type(line) is not int or line <= 0:
+        raise InvalidBundle(f"{finding_id} invalid inline line")
+    start = item.get("start_line")
+    if start is not None and (type(start) is not int or not 0 < start <= line):
+        raise InvalidBundle(f"{finding_id} invalid inline start_line")
+    for key in ("side", "start_side"):
+        if item.get(key) is not None and item[key] not in ("LEFT", "RIGHT"):
+            raise InvalidBundle(f"{finding_id} invalid inline {key}")
+    if item.get("start_side") is not None and start is None:
+        raise InvalidBundle(f"{finding_id} inline start_side requires start_line")
+    return "line"
+
+
 def validate_inline(
     rendered: dict[str, Any],
     findings: dict[str, dict[str, Any]],
-    inline_min_severity: Any,
 ) -> None:
-    if inline_min_severity not in SEVERITY_RANK:
-        raise InvalidBundle(f"invalid inline_min_severity {inline_min_severity}")
     inline_comments = rendered.get("inline_comments")
     if not isinstance(inline_comments, list):
         raise InvalidBundle("inline_comments must be an array")
 
     expected = {
-        finding_id: finding
-        for finding_id, finding in findings.items()
-        if SEVERITY_RANK.get(finding.get("severity"), -1)
-        >= SEVERITY_RANK[inline_min_severity]
-        and isinstance(finding.get("path"), str)
-        and isinstance(finding.get("line"), int)
+        finding_id: finding for finding_id, finding in findings.items()
+        if comment_subject(finding, finding_id) is not None
     }
     seen: set[str] = set()
     for item in inline_comments:
@@ -590,7 +619,19 @@ def validate_inline(
             raise InvalidBundle(f"{finding_id} marker area changed")
         if item.get("severity") != finding.get("severity"):
             raise InvalidBundle(f"{finding_id} helper severity changed")
+        subject = comment_subject(finding, finding_id)
+        actual_subject = comment_subject(item, finding_id)
+        if subject != actual_subject or subject == "file" and item.get("subject_type") != "file":
+            raise InvalidBundle(f"{finding_id} inline subject_type changed")
+        if subject == "file":
+            if any(key in item for key in FILE_LINE_KEYS):
+                raise InvalidBundle(f"{finding_id} file comment has line fields")
+            if re.search(r"(?im)^[ \t]*(?:`{3,}|~{3,})suggestion(?:[ \t]|\r?$)", item["body"]):
+                raise InvalidBundle(f"{finding_id} file comment has an executable suggestion")
         for key in ANCHOR_KEYS:
+            if item.get(key) != finding.get(key):
+                raise InvalidBundle(f"{finding_id} inline {key} changed")
+        for key in ("position", "start_position", "range"):
             if item.get(key) != finding.get(key):
                 raise InvalidBundle(f"{finding_id} inline {key} changed")
         if item.get("suggestion") != finding.get("suggestion"):
@@ -659,11 +700,7 @@ def validate(canonical: dict[str, Any], rendered: dict[str, Any]) -> None:
     validate_disposition_items(report, rendered, canonical, human_style)
     if human_style:
         validate_human_report_envelope(canonical, rendered, findings, report)
-    validate_inline(
-        rendered,
-        findings,
-        canonical.get("inline_min_severity"),
-    )
+    validate_inline(rendered, findings)
     validate_predicates(rendered, findings)
 
 

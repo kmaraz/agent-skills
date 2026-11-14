@@ -81,6 +81,49 @@ class NativeFixture:
         return handle, response
 
 
+class DeadlineHost:
+    """Model only the synchronous native handle API; retain real exported responses."""
+    def __init__(self, archive, *, expire=False):
+        self.archive, self.expire = archive, expire
+        self.now = 100.0
+        self.outputs = NativeFixture()
+        self.handles = []
+
+    def spawn(self, prompt, **kwargs):
+        request = next(json.loads(path.read_text()) for path in self.archive.glob("tasks/*/request.json")
+                       if json.loads(path.read_text())["label"] == kwargs["label"])
+        token = self.outputs.start(request)
+        owner = self
+        class Handle:
+            handle = f"agent://deadline-{token}"
+            def __init__(self):
+                self.waits, self.cancellations = [], 0
+            def done(self):
+                return owner.expire and token == 1 and owner.now >= 110
+            def wait(self, timeout=None):
+                self.waits.append(timeout)
+                if owner.expire and token == 0:
+                    owner.now += 10
+                    raise TimeoutError("native wave expired")
+                owner.now += 8 if request["stage"] == "applicability" else 0
+                return owner.outputs.wait_one([token])[1]
+            def cancel(self):
+                self.cancellations += 1
+                if owner.expire and token == 2:
+                    raise RuntimeError("native cancellation unavailable")
+        handle = Handle()
+        self.handles.append(handle)
+        return handle
+
+
+def deadline_adapter(host):
+    spec = importlib.util.spec_from_file_location(
+        "criteria_deadline_adapter", HERE.parent / "references" / "coverage-omp-adapter.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, module.OMPNativeAdapter(host.spawn, timeout=10)
+
+
 class CriteriaCoordinatorTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(CriteriaCoordinator, "criteria-first native coordinator is not implemented")
@@ -103,6 +146,18 @@ class CriteriaCoordinatorTests(unittest.TestCase):
 
     def coordinator(self, adapter, workers=2):
         return CriteriaCoordinator(self.backend, adapter, self.run_id, self.context, workers=workers)
+
+    def test_real_adapter_gives_routing_and_review_separate_wave_deadlines(self):
+        self.begin(1)
+        host = DeadlineHost(self.archive)
+        module, adapter = deadline_adapter(host)
+        with patch.object(module, "monotonic", side_effect=lambda: host.now, create=True):
+            summary = self.coordinator(adapter).run(self.reviewers)
+        self.assertEqual(summary["status"], "assessed", summary.get("errors"))
+        self.assertEqual(len(summary["normal_review_paths"]), 6)
+        self.assertEqual(host.handles[0].waits, [10])
+        self.assertTrue(all(handle.waits == [10] for handle in host.handles[1:]))
+        self.assertTrue(all(handle.cancellations == 0 for handle in host.handles))
 
     def test_native_normal_wave_preserves_full_tasks_and_actual_markdown(self):
         self.begin(9)
@@ -449,6 +504,24 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         finally:
             self.backend.start = original
 
+    def test_real_adapter_timeout_preserves_ready_report_and_stops_queued_dispatch(self):
+        self.begin(6)
+        host = DeadlineHost(self.archive, expire=True)
+        module, adapter = deadline_adapter(host)
+        with patch.object(module, "monotonic", side_effect=lambda: host.now, create=True):
+            summary = self.coordinator(adapter, workers=4).run(self.reviewers)
+        self.assertEqual(summary["status"], "stopped")
+        self.assertEqual(summary["model_call_counts"], {"applicability": 0, "review": 4, "total": 4})
+        self.assertEqual(len(summary["normal_review_paths"]), 1)
+        self.assertEqual(Path(summary["normal_review_paths"][0]).read_text(), MARKDOWN)
+        self.assertEqual(summary["candidate_count"], 1)
+        self.assertEqual([handle.waits for handle in host.handles], [[10], [0], [], []])
+        self.assertEqual([handle.cancellations for handle in host.handles], [1, 0, 1, 1])
+        self.assertEqual(len(list(self.archive.glob("tasks/*/worker-error.json"))), 3)
+        self.assertTrue(any("TimeoutError" in error for error in summary["errors"]))
+        candidate = json.loads(Path(summary["candidate_paths"][0]).read_text())[0]
+        self.assertEqual(candidate["custom_packet"], {"preserve": True})
+
     def test_inline_full_indexed_rules_and_one_capped_ordinary_cohort(self):
         self.begin(17)
         adapter = NativeFixture(reverse=True)
@@ -558,8 +631,10 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         summary = self.coordinator(adapter, workers=2).run(self.reviewers)
         self.assertEqual(summary["status"], "incomplete")
         self.assertEqual((len(adapter.requests), len(adapter.waited)), (6, 6))
-        self.assertEqual(len(summary["normal_review_paths"]), 5)
+        self.assertEqual(len(summary["normal_review_paths"]), 6)
+        self.assertEqual(len(summary["acknowledged_review_paths"]), 5)
         self.assertEqual(len(summary["unvalidated_review_paths"]), 1)
+        self.assertIn(summary["unvalidated_review_paths"][0], summary["normal_review_paths"])
         self.assertEqual(Path(summary["unvalidated_review_paths"][0]).read_text(), MARKDOWN)
         restored = NativeFixture()
         resumed = self.coordinator(restored).run(self.reviewers, resume=True)
@@ -580,7 +655,8 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         self.assertEqual((len(adapter.requests), len(adapter.waited), adapter.live), (6, 6, set()))
         self.assertEqual(summary["reviewed_rules"], 10)
         self.assertEqual(summary["unvalidated_candidate_count"], 2)
-        self.assertEqual(len(summary["normal_review_paths"]), 5)
+        self.assertEqual(len(summary["normal_review_paths"]), 6)
+        self.assertEqual(len(summary["acknowledged_review_paths"]), 5)
         raw_paths = sorted(self.archive.glob("tasks/*/response.json"))
         retained = {str(path): path.read_bytes() for path in raw_paths}
         collector = NativeFixture()
@@ -588,6 +664,49 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         self.assertEqual(collector.requests, [])
         self.assertEqual(later["status"], "incomplete")
         self.assertEqual(retained, {str(path): path.read_bytes() for path in raw_paths})
+
+    def test_supplemental_failure_cannot_rescue_foreign_or_unfinished_ordinary_reports(self):
+        for invalid in ({"reviewer_id": "foreign"}, {"review_markdown": "Plan only; no review."}):
+            with self.subTest(invalid=invalid):
+                self.begin(6)
+                adapter = NativeFixture()
+                original = adapter.wait_one
+                def malformed(handles):
+                    handle, response = original(handles)
+                    if len(adapter.waited) == 1:
+                        response.update(invalid)
+                    return handle, response
+                adapter.wait_one = malformed
+                summary = self.coordinator(adapter).run(self.reviewers)
+                self.assertEqual(len(summary["normal_review_paths"]), 5)
+                self.assertEqual(len(summary["acknowledged_review_paths"]), 5)
+
+
+    def test_salvage_rejects_changed_ordinary_request_or_packet_identity(self):
+        for filename in ("request.json", "packet.json"):
+            with self.subTest(filename=filename):
+                self.begin(6)
+                adapter = NativeFixture()
+                original = adapter.wait_one
+                def incomplete(handles):
+                    handle, response = original(handles)
+                    if len(adapter.waited) == 1:
+                        response["result_groups"] = []
+                    return handle, response
+                adapter.wait_one = incomplete
+                first = self.coordinator(adapter).run(self.reviewers)
+                path = Path(first["unvalidated_review_paths"][0])
+                document = path.parent / filename
+                value = json.loads(document.read_text())
+                value["prompt" if filename == "request.json" else "reviewer_id"] = "foreign ordinary task"
+                document.write_text(json.dumps(value))
+                restored = NativeFixture()
+                result = self.coordinator(restored).run(self.reviewers, resume=True)
+                self.assertEqual(result["status"], "stopped")
+                self.assertNotIn(str(path), result["normal_review_paths"])
+                self.assertEqual(len(result["normal_review_paths"]), 5)
+                self.assertEqual(restored.requests, [])
+                self.assertEqual(path.read_text(), MARKDOWN)
 
     def test_consumed_worker_failure_does_not_discard_original_queue(self):
         from coverage_coordinator import WorkerFailure
@@ -632,7 +751,7 @@ class SinglePassCoordinatorTests(unittest.TestCase):
                         self.fail_if_expired("done")
                         return True
 
-                    def wait(self):
+                    def wait(self, timeout=None):
                         self.fail_if_expired("wait")
                         return outputs.wait_one([self.token])[1]
 
@@ -688,7 +807,8 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         self.assertEqual(result["rejected_attempt_count"], 1)
         self.assertEqual(raw.read_bytes(), before)
         self.assertIn(str(raw.parent / "candidates.json"), result["rejected_candidate_paths"])
-        self.assertNotIn(str(raw.parent / "review.md"), result["normal_review_paths"])
+        self.assertIn(str(raw.parent / "review.md"), result["normal_review_paths"])
+        self.assertNotIn(str(raw.parent / "review.md"), result["acknowledged_review_paths"])
         self.assertEqual(result["candidate_count"], 10)
 
     def test_crash_after_backend_review_ack_replays_without_double_normal_wave(self):

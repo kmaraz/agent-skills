@@ -39,13 +39,14 @@ After synthesis freezes the decision, dispositions, facts, requested work,
 explicit source-based `request_mode`, anchors, and safe suggestions, render both
 external surfaces through one final clarity pass and one action-lock audit wave.
 Do not run repair passes or new audit waves.
-The top-level report is a short human summary: one or two natural detection
-sentences followed by collapsed sections. Every active finding becomes a
-four-column row inside `Issues and fixes` or `Optional suggestions`:
-`| Severity | Location | Issue | Suggested change |`. The optional table uses
-`Suggestion` for the third column. Each collapsed row keeps the full diagnosis,
-impact, and requested or suggested change; inline comments retain the same
-anchor-backed detail in GitHub's native UI.
+The complete local report is one or two natural detection sentences followed by
+collapsed sections. Every active finding retains a full four-column local row
+inside `Issues and fixes` or `Optional suggestions`:
+`| Severity | Location | Issue | Suggested change |` (`Suggestion` for optional
+work). Keep diagnosis, impact and every requested-work clause in local evidence.
+For publication, each anchored finding has one native line/file comment; remove
+its duplicate main-body row and any newly empty finding section. Unanchored
+findings and unrelated context remain in the main body without truncation.
 Every new active finding must carry `request_mode: required | suggested` from
 the accepted source, with the same obligation on report and inline surfaces.
 Use `Issues and fixes` for required work and `Optional suggestions` for suggested
@@ -53,16 +54,23 @@ work regardless of severity: a low correctness fix may be required and a medium
 preference suggested. Invalid explicit modes fail validation. Severity fallback
 is only for old canonical packets without the field.
 
-Do not narrate the review pipeline in the visible summary. Translate internal
-review outcomes into observations about the changed code. Do not require a fixed
-replacement phrase. Choose a natural statement about affected behavior,
-detected issue areas, optional suggestions, or unreproduced uncertainty.
+Keep knowledge coverage, signatures, counts and orchestration diagnostics in
+private local artifacts, including when incomplete. Do not add an internal-audit
+disclaimer to any public surface. Describe only concrete author-relevant code
+risks and limitations, including what remains unverified and how to verify it.
+Do not summarize vague internal questions or pipeline outcomes.
 
 When only suggested findings remain, the visible summary leads with the absence
 of required fixes and may mention the number or broad topic of suggestions.
-Leave the specific optional observation and proposed change inside
-`Optional suggestions`. A preference must not become a mandatory fix merely
-because its severity is medium; a required low fix must not become optional.
+Leave the specific observation and proposed change in its native review comment,
+or `Optional suggestions` if no verified PR anchor exists. A preference must not
+become mandatory because of priority; required low work must not become optional.
+
+Frozen `decision_reason`, `result` and `second_check` remain private diagnostic
+inventory, not mandatory public paragraphs. Omit approval policy, internal second
+checks and generic statements that old suggestions or questions remain. The
+public headline describes the code outcome; context keeps actual scope, checks
+and concrete verification limits without repeating the headline.
 
 Use the review history only when it changes what the author needs to understand
 about the current code. Keep a first-review summary focused on current findings.
@@ -86,7 +94,8 @@ or a success message. Extract the actual report string and inline bodies from
 the final validated bundle unchanged; do not add blank lines inside tables,
 invent section labels, or edit after validation. Force the final event to
 COMMENT independently of the frozen decision and honor all existing no-post,
-freshness, coverage, and publication guards. An invalid source is diagnostic-only:
+freshness and original publication guards; knowledge coverage is diagnostic,
+not a posting prerequisite. An invalid source remains diagnostic-only:
 preserve local artifacts and errors, publish nothing, and claim no validated
 success. Never retry the renderer or auditors.
 
@@ -131,9 +140,11 @@ in `action-lock-audit.md`; each selected rewrite needs both valid passes.
 A failed or unverifiable rewrite uses its exact already-validated source body
 and forces COMMENT without another renderer or audit wave.
 
-Write each inline comment in plain language about the code at that line. Emit
-comments at or above the configured inline threshold; lower-priority findings
-remain in the summary.
+Write each comment in plain language about the code at its verified PR anchor.
+Route all useful active findings and suggestions, including low/nit, to separate
+comments. A verified changed file without a diff line uses `subject_type: file`
+and no line/side/range/position fields or executable suggestion. Findings without
+a verified PR anchor remain in the main report. Never invent a line.
 
 Do not add a synthetic title or visible metadata.
 Keep the diagnosis as unlabeled prose. Label only the requested work:
@@ -334,7 +345,7 @@ Voice rules:
 - Keep requested work calm, direct, and conversational.
 - Do not use stock openers, review jargon, or compliment sandwiches. Use only
   the `Suggestions:` label.
-- Severity determines the inline threshold, not obligation or request grammar.
+- Severity is priority, not comment eligibility or obligation.
 - Keep the comment as short as the finding allows.
 - Use a suggestion only for a safe, exact replacement; still explain the
   problem.

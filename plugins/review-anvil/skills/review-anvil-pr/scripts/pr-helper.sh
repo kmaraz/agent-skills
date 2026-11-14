@@ -37,8 +37,8 @@
 # Environment switches:
 #   REVIEW_ANVIL_NO_APPROVE=1     never submit APPROVE (downgrade to COMMENT)
 #   REVIEW_ANVIL_RULE_COVERAGE=all
-#                                 require authenticated exhaustive coverage
-#                                 (init also persists --rule-coverage all)
+#                                 records requested knowledge audit mode
+#                                 (not a publication prerequisite)
 #   REVIEW_ANVIL_NO_POST=1        retain reports locally without remote writes
 #                                 (init persists intent for later retries)
 #   REVIEW_ANVIL_SKIP_DISMISSED=1 legacy name: skip full PR-history lookups
@@ -46,9 +46,6 @@
 #                                 also forces APPROVE -> COMMENT)
 #   REVIEW_ANVIL_DISMISSALS=path  local-suppressions state file (default
 #                                 ~/.review-anvil/dismissed-findings.json)
-#   REVIEW_ANVIL_INLINE_MIN_SEVERITY=medium
-#                                 minimum severity posted as inline comments
-#                                 (lower findings stay in the summary)
 #   REVIEW_ANVIL_ENABLE_SUGGESTIONS=0
 #                                 disable helper-added ```suggestion blocks
 #
@@ -101,7 +98,7 @@ report_is_infra_failure() {
 
 cleanup_post_artifacts() {
     local report_path="$1" resolution_policy="${2:-remove}" dir
-    rm -f "$report_path" "${report_path}.inline.json" "${report_path}.approval.json" "${report_path}.followups.json" "${report_path}.context.json" "${report_path}.full.md" "${report_path}.rule-coverage" "${report_path}.no-post"
+    rm -f "$report_path" "${report_path}.inline.json" "${report_path}.approval.json" "${report_path}.followups.json" "${report_path}.context.json" "${report_path}.rule-coverage" "${report_path}.no-post" "${report_path}.posting.md" "${report_path}.posting.inline.json" "${report_path}.posting.files.json"
     if [[ "$resolution_policy" != "keep" ]]; then
         rm -f "${report_path}.resolutions.json"
     fi
@@ -120,12 +117,12 @@ cleanup_post_artifacts() {
 # the caller retains artifacts and must not submit a fallback.
 _submit_review() {
     # jq availability is preflighted at the top of cmd_post.
-    local event="$1" inline="${2:-}" payload response
+    local event="$1" inline="${2:-}" payload response body_path="${posting_report:-$report_path}"
     if [[ -n "$inline" ]]; then
-        payload=$(jq -n --rawfile body "$report_path" --arg event "$event" --slurpfile comments "$inline" \
+        payload=$(jq -n --rawfile body "$body_path" --arg event "$event" --slurpfile comments "$inline" \
             '{event: $event, body: $body, comments: $comments[0]}') || return 1
     else
-        payload=$(jq -n --rawfile body "$report_path" --arg event "$event" \
+        payload=$(jq -n --rawfile body "$body_path" --arg event "$event" \
             '{event: $event, body: $body}') || return 1
     fi
     if ! response=$(printf '%s' "$payload" | gh api \
@@ -139,7 +136,7 @@ _submit_review() {
     # A zero gh exit without a genuine submitted review is an unknown outcome,
     # not permission to discard the local report or publish another payload.
     if ! printf '%s' "$response" | jq -e -s \
-        --rawfile body "$report_path" --arg event "$event" '
+        --rawfile body "$body_path" --arg event "$event" '
         length == 1 and (.[0] |
           type == "object" and
           (.id | type == "number" and . > 0 and . == floor) and
@@ -214,11 +211,154 @@ compact_report_for_github() {
     return 0
 }
 
+# Build only the public projection. The original report and comment inventory
+# remain local evidence; matching is by stable identity, never similar prose.
+prepare_comment_projection() {
+    _py - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+report, inline, output, line_output, file_output = map(Path, sys.argv[1:])
+items = json.loads(inline.read_text()) if inline.exists() and inline.read_text().strip() else []
+lines = [item for item in items if item.get("subject_type") != "file"]
+files = [item for item in items if item.get("subject_type") == "file"]
+line_output.write_text(json.dumps(lines, indent=2) + "\n")
+file_output.write_text(json.dumps(files, indent=2) + "\n")
+ordinal = r"(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2,})"
+finding_id = rf"(?:RAV-(?:RUN[1-9][0-9]*-)?R[1-9][0-9]*-F{ordinal}|RAVF[0-9]{{3,}}|F-[0-9]{{3,}})"
+terminal = re.compile(
+    rf"<!--\s*review-anvil:\s*id=(?P<id>{finding_id})\s+severity=(?:critical|high|medium|low|nit)\s+area=[A-Za-z0-9][A-Za-z0-9._/-]*\s*-->\s*$", re.I)
+legacy = re.compile(rf"\*\*(?P<id>{finding_id})\s+\[(?:critical|high|medium|low|nit)\]", re.I)
+marker = re.compile(rf"<!--\s*review-anvil-report:\s*id=(?P<id>{finding_id})\s+[^>]*\bdisposition=active\s*-->", re.I)
+clarity = re.compile(rf"\(`(?P<id>{finding_id})`\)\s+<!--\s*review-anvil-report:", re.I)
+routed = set()
+for item in items:
+    body = item["body"].rstrip()
+    match = terminal.search(body.splitlines()[-1]) if body else None
+    match = match or legacy.search(body)
+    if match:
+        routed.add(match.group("id").upper())
+
+source = report.read_text().splitlines(keepends=True)
+out = []
+i = 0
+fence = None
+section_start = None
+section_routed = False
+headers = {"| Severity | Location | Issue | Suggested change |",
+           "| Severity | Location | Suggestion | Suggested change |", "|---|---|---|---|"}
+while i < len(source):
+    row = source[i]
+    fence_match = re.match(r"^\s*(`{3,}|~{3,})", row)
+    if fence_match:
+        token = fence_match.group(1)
+        if fence is None:
+            fence = token
+        elif token[0] == fence[0] and len(token) >= len(fence) and not row[fence_match.end():].strip():
+            fence = None
+        out.append(row)
+        i += 1
+        continue
+    if fence is None and row.strip() == "<details>" and i + 1 < len(source) and source[i + 1].strip() in {
+        "<summary>Issues and fixes</summary>", "<summary>Optional suggestions</summary>"
+    }:
+        section_start, section_routed = len(out), False
+    elif fence is None and row.strip() == "</details>" and section_start is not None:
+        if section_routed and not any(line.strip() and line.strip() not in headers
+                                      for line in out[section_start + 2:]):
+            del out[section_start:]
+            section_start = None
+            i += 1
+            continue
+        section_start = None
+    is_row = re.match(r"^\s*(?:[-*]\s+|\|)", row)
+    protected = re.search(r"\bdisposition=(?:deferred|outside)\b", row)
+    match = (marker.search(row) or clarity.search(row) or legacy.search(row)) if is_row and fence is None and not protected else None
+    if match and match.group("id").upper() in routed:
+        if section_start is not None:
+            section_routed = True
+        i += 1
+        if i < len(source) and source[i].strip() == "<!-- review-anvil: prior_feedback=reintroduced -->":
+            i += 1
+        # Table/modern marker rows are complete records. Legacy bullet rows
+        # may carry indented continuation paragraphs; do not eat other text.
+        if row.lstrip().startswith("|") or marker.search(row) or clarity.search(row):
+            continue
+        while i < len(source):
+            if source[i].startswith(("  ", "\t")) and source[i].strip():
+                i += 1
+            elif not source[i].strip() and i + 1 < len(source) and source[i + 1].startswith(("  ", "\t")):
+                i += 1
+            else:
+                break
+        continue
+    out.append(row)
+    i += 1
+output.write_text("".join(out))
+PY
+}
+
+# The reviews batch API has no subject_type field. File comments use its
+# documented standalone endpoint, once each, after the one confirmed review.
+submit_file_comments() {
+    _py - "$owner" "$repo" "$n" "$file_comments_result" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+owner, repo, number, receipt_path = sys.argv[1:]
+path = Path(receipt_path)
+receipt = json.loads(path.read_text())
+
+def save():
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(receipt, indent=2) + "\n")
+    temp.replace(path)
+
+failed = False
+for item in receipt["files"]:
+    payload = item["payload"]
+    item["status"] = "unknown"
+    save()  # A lost response never grants permission to resend this request.
+    try:
+        response = subprocess.run(
+            ["gh", "api", f"repos/{owner}/{repo}/pulls/{number}/comments", "-X", "POST", "--input", "-"],
+            input=json.dumps(payload), text=True, capture_output=True, check=False)
+        item["exit_code"] = response.returncode
+        item["stderr"] = response.stderr
+        try:
+            actual = json.loads(response.stdout)
+        except ValueError:
+            actual = response.stdout
+        item["response"] = actual
+        if response.returncode:
+            item["status"] = "failed"
+        elif (
+            isinstance(actual, dict)
+            and type(actual.get("id")) is int and actual["id"] > 0
+            and all(actual.get(key) == payload[key] for key in ("path", "body", "subject_type", "commit_id"))
+            and isinstance(actual.get("html_url"), str) and actual["html_url"].strip()
+        ):
+            item["status"] = "confirmed"
+            item["url"] = actual["html_url"]
+    except OSError as error:
+        item["error"] = str(error)
+    failed |= item["status"] != "confirmed"
+    save()
+if failed:
+    print(f"pr-helper: file comment delivery incomplete; confirmed main review: {receipt['review_url']}; retained receipt: {path}; no resubmission attempted", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 process_inline_comments_for_github() {
-    local inline_json="${1:-}" min_severity="${REVIEW_ANVIL_INLINE_MIN_SEVERITY:-medium}"
+    local inline_json="${1:-}"
     [[ -n "$inline_json" && -f "$inline_json" ]] || return 0
 
-    _py - "$inline_json" "$min_severity" <<'PY'
+    _py - "$inline_json" <<'PY'
 import json
 import os
 import re
@@ -226,15 +366,9 @@ import sys
 from pathlib import Path
 
 inline = Path(sys.argv[1])
-min_severity = sys.argv[2].lower()
 enable_suggestions = os.environ.get("REVIEW_ANVIL_ENABLE_SUGGESTIONS", "1") != "0"
 
 rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "nit": 4}
-if min_severity not in rank:
-    raise SystemExit(
-        "pr-helper: REVIEW_ANVIL_INLINE_MIN_SEVERITY must be one of "
-        "critical|high|medium|low|nit"
-    )
 
 raw = inline.read_text().strip()
 if not raw or raw == "[]":
@@ -330,18 +464,36 @@ def append_suggestion(body, item):
     return append_before_finding_metadata(body, block)
 
 kept = []
-filtered = 0
 suggested = 0
 
 for item in items:
     if not isinstance(item, dict):
-        kept.append(item)
-        continue
-    severity = infer_severity(item)
-    if rank[severity] > rank[min_severity]:
-        filtered += 1
-        continue
-    original_body = item.get("body") or ""
+        raise SystemExit("pr-helper: inline comment must be an object")
+    infer_severity(item)
+    if not isinstance(item.get("path"), str) or not item["path"].strip():
+        raise SystemExit("pr-helper: inline comment requires a nonblank path")
+    if not isinstance(item.get("body"), str) or not item["body"].strip():
+        raise SystemExit("pr-helper: inline comment requires a nonblank body")
+    subject = item.get("subject_type")
+    if subject is not None and subject not in {"file", "line"}:
+        raise SystemExit("pr-helper: subject_type must be file|line")
+    anchors = {"line", "side", "start_line", "start_side", "position", "start_position", "range"}
+    file_comment = subject == "file" or (subject is None and not anchors.intersection(item))
+    if file_comment:
+        if anchors.intersection(item):
+            raise SystemExit("pr-helper: file comment must not have line, side, range or position anchors")
+        if any(item.get(key) is not None for key in ("suggestion", "suggested_change", "suggestedChange")):
+            raise SystemExit("pr-helper: file comment cannot have an executable replacement")
+        if re.search(r"(?m)^\s*(`{3,}|~{3,})suggestion\b", item["body"]):
+            raise SystemExit("pr-helper: file comment cannot contain an executable suggestion block")
+        item = {**item, "subject_type": "file"}
+    else:
+        for key in ("line", "start_line", "position"):
+            if key in item and (type(item[key]) is not int or item[key] <= 0):
+                raise SystemExit(f"pr-helper: {key} must be a positive integer")
+        if "line" not in item and "position" not in item:
+            raise SystemExit("pr-helper: line comment requires a line or position")
+    original_body = item["body"]
     body = append_suggestion(original_body, item)
     if "```suggestion" in body and "```suggestion" not in original_body:
         suggested += 1
@@ -349,15 +501,13 @@ for item in items:
         body = append_before_finding_metadata(body, reintroduced_marker)
     clean = {key: item[key] for key in allowed if key in item}
     clean["body"] = body
+    if file_comment:
+        clean["subject_type"] = "file"
     kept.append(clean)
 
 inline.write_text(json.dumps(kept, indent=2) + "\n")
-if filtered or suggested:
-    print(
-        "pr-helper: inline comments processed "
-        f"({filtered} summary-only, {suggested} suggestion block(s) added)",
-        file=sys.stderr,
-    )
+if suggested:
+    print(f"pr-helper: inline comments processed ({suggested} suggestion block(s) added)", file=sys.stderr)
 PY
 }
 # Embed finding context from the engine's <report_path>.context.json (schema
@@ -2405,8 +2555,8 @@ cmd_init() {
     # reads from the same file regardless of CWD changes between
     # invocations.
     report_path="$anchor/.review-anvil/final-report-${marker}.md"
-    # Persist mode separately from process environment so retries cannot
-    # accidentally bypass the exhaustive-coverage gate.
+    # Retain the requested audit mode as diagnostics; it does not authorize
+    # or block ordinary publication. The no-post marker remains independent.
     if [[ "$rule_coverage" == all ]]; then
         (umask 077; printf 'all\n' >"${report_path}.rule-coverage")
     fi
@@ -2426,33 +2576,6 @@ cmd_init() {
     printf 'TITLE=%s\n' "$title"
 }
 
-# Resolve only the sibling engine in this trusted installation. Never accept
-# a helper path supplied by the report, reviewed checkout, or environment.
-check_rule_coverage_for_post() {
-    local host="$1" owner="$2" repo="$3" n="$4" report_path="$5"
-    local mode="${REVIEW_ANVIL_RULE_COVERAGE:-scoped}" persisted="" helper current_sha script_dir
-    if [[ -e "${report_path}.rule-coverage" ]]; then
-        persisted=$(cat "${report_path}.rule-coverage") || die "cannot read persisted rule coverage mode"
-        [[ "$persisted" == all || "$persisted" == scoped ]] || die "invalid persisted rule coverage mode"
-    fi
-    [[ "$mode" == all || "$mode" == scoped || -z "$mode" ]] || die "invalid rule coverage mode"
-    # A report sidecar also opts into verification; a missing mode marker
-    # must not allow an existing exhaustive report to bypass authentication.
-    if [[ "$mode" != all && "$persisted" != all && ! -e "${report_path}.coverage.json" ]]; then
-        return 0
-    fi
-    [[ -f "${report_path}.coverage.json" ]] \
-        || die "all-mode coverage report missing; report remains local: $report_path"
-    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-    helper="$script_dir/../../review-anvil/scripts/local-memory.py"
-    [[ -f "$helper" ]] || die "trusted local-memory.py not found; report remains local"
-    current_sha=$(gh pr view "$n" -R "$owner/$repo" --json headRefOid --jq '.headRefOid') \
-        || die "cannot verify current PR head for all-mode coverage"
-    [[ -n "$current_sha" ]] || die "empty current PR head for all-mode coverage"
-    _py "$helper" coverage-check --report "${report_path}.coverage.json" \
-        --repository "$host/$owner/$repo" --number "$n" --head-sha "$current_sha" >&2 \
-        || die "all-mode coverage is incomplete, stale, or unauthenticated; report remains local: $report_path"
-}
 
 cmd_post() {
     local host="${1:-}" owner="${2:-}" repo="${3:-}" n="${4:-}" marker="${5:-}" report_path="${6:-}"
@@ -2474,7 +2597,15 @@ cmd_post() {
     # NOT provide a jq binary on PATH.
     command -v jq >/dev/null 2>&1 \
         || die "jq not found — required to post reviews (gh's --jq is built-in gojq, not a jq binary; install jq)"
-    check_rule_coverage_for_post "$host" "$owner" "$repo" "$n" "$report_path"
+    local file_comments_result="${report_path}.file-comments-result.json"
+    if [[ -e "$file_comments_result" ]]; then
+        die "publication already attempted; refusing to resend the review or file comments; retained receipt: $file_comments_result"
+    fi
+    # Keep selected source bytes before marker/history/publication projection.
+    [[ -f "${report_path}.full.md" ]] || cp "$report_path" "${report_path}.full.md"
+    if [[ -f "${report_path}.inline.json" && ! -e "${report_path}.inline.source.json" ]]; then
+        cp "${report_path}.inline.json" "${report_path}.inline.source.json"
+    fi
 
     # Prepend the marker atomically, exactly once (post is retryable after a
     # suppression failure — a retry must not stack marker lines).
@@ -2559,13 +2690,24 @@ cmd_post() {
         || printf 'warning: finding context could not be embedded; posting without it\n' >&2
     compact_report_for_github "$report_path" "$inline_json"
 
-    # Compute inline presence after suppression (which may have emptied the
-    # array). Empty array / whitespace-only / missing file = no inline.
-    local has_inline=0
-    if [[ -f "$inline_json" ]] \
-       && [[ -n "$(tr -d '[:space:]' <"$inline_json")" ]] \
-       && [[ "$(tr -d '[:space:]' <"$inline_json")" != "[]" ]]; then
-        has_inline=1
+    local posting_report="${report_path}.posting.md"
+    local posting_inline="${report_path}.posting.inline.json"
+    local posting_files="${report_path}.posting.files.json"
+    prepare_comment_projection "$report_path" "$inline_json" "$posting_report" "$posting_inline" "$posting_files" \
+        || die "cannot prepare lossless comment publication projection; report remains local: $report_path"
+    local file_count captured_head=""
+    file_count=$(jq 'length' "$posting_files") || return 1
+    if [[ "$file_count" -gt 0 ]]; then
+        captured_head=$(jq -r '.head_sha // empty' "$approval_json" 2>/dev/null || true)
+        [[ "$captured_head" =~ ^[[:xdigit:]]{40}$ || "$captured_head" =~ ^[[:xdigit:]]{64}$ ]] \
+            || die "file comments require the captured reviewed head; no review submitted"
+        jq -n --arg host "$host" --arg owner "$owner" --arg repo "$repo" --arg n "$n" \
+            --arg commit "$captured_head" --slurpfile comments "$posting_files" \
+            '{host:$host,owner:$owner,repo:$repo,pull_number:$n,commit_id:$commit,
+              review_status:"unknown",review_url:null,
+              files:[$comments[0][] | {path:.path,status:"not_attempted",
+                payload:(. + {commit_id:$commit})}]}' >"$file_comments_result" \
+            || die "cannot persist file delivery receipt; no review submitted"
     fi
 
     # Submit the policy-selected event exactly once, preserving its full inline
@@ -2574,8 +2716,17 @@ cmd_post() {
     # delivery cannot be confirmed; even marker-only history is not proof that
     # this exact review was delivered.
     local url submission_inline=""
-    [[ "$has_inline" -eq 0 ]] || submission_inline="$inline_json"
+    if jq -e 'length > 0' "$posting_inline" >/dev/null; then
+        submission_inline="$posting_inline"
+    fi
     if url=$(_submit_review "$review_event" "$submission_inline"); then
+        if [[ "$file_count" -gt 0 ]]; then
+            jq --arg url "$url" '.review_status = "confirmed" | .review_url = $url' \
+                "$file_comments_result" >"${file_comments_result}.tmp" \
+                && mv "${file_comments_result}.tmp" "$file_comments_result" \
+                || die "main review confirmed at $url but receipt update failed; no resubmission allowed"
+            submit_file_comments || return 1
+        fi
         _emit_post_result "$review_event" "$url"
         return 0
     fi

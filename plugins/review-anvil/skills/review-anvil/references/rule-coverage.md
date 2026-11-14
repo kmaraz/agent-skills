@@ -2,6 +2,12 @@
 
 `rule_coverage: all` accounts for every supported saved rule during **one ordinary reviewer cohort**. New runs assign all rules directly; there is no applicability-model wave or second review cohort. Keep the host-selected model, requested reviewer count/lenses, complete ordinary tasks, original evidence access and existing completion/publication gates. `rules: off` disables generation only; it does not waive saved-rule coverage.
 
+Knowledge is additive. The existing ordinary review, synthesis and publication
+remain usable without complete knowledge accounting. If augmentation cannot be
+prepared safely before dispatch, explicitly omit unverified knowledge and run
+the original ordinary tasks once; do not spawn a replacement cohort or alter
+memory settings. Keep the requested audit's unavailability visible and truthful.
+
 ## Contents
 
 - [Freeze strategy and context](#freeze-strategy-and-context)
@@ -95,7 +101,7 @@ native = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(native)
 summary = CriteriaCoordinator(
     CriteriaCoverage(context["repository"]),
-    native.OMPNativeAdapter(agent),
+    native.OMPNativeAdapter(agent, timeout=effective_reviewer_timeout),
     run_id=trusted_coverage_run,
     common_context=context,
     workers=validated_coverage_workers,
@@ -107,6 +113,12 @@ print({key: summary.get(key) for key in ("status", "reviewed_rules", "total_rule
 
 `ordinary_reviewers` is the complete nonempty ordered list of normal `{id, prompt}` tasks/lenses. The coordinator dispatches that cohort itself: **do not launch another ordinary wave**. `coverage_workers` is an integer 1–4, default 4. For single-pass it caps simultaneous ordinary reviewers, not their total count. Use the current host's actual `agent`, no model override/proxy/daemon. Start/wait stay on the Eval thread. A consumed worker/result failure does not cancel independent original jobs; trust/storage/freshness failures stop new scheduling. Harvest each started handle at most once, except changed-diff cancellation as above.
 
+`effective_reviewer_timeout` is the already resolved normal cap (default 600s,
+including the existing large-diff adjustment), not a new public setting.
+The adapter enforces one monotonic budget per stage; the coordinator resets it
+at real stage boundaries, never per handle. Expiry cancels unfinished work,
+retains completed output and does not authorize replacement jobs.
+
 Use a fresh OMP session after installed engine changes; do not mix cached old Python classes with new helpers.
 
 ### Finalization result transport
@@ -116,43 +128,85 @@ two-auditor wave, in persistent Eval cells with **`timeout: 0`**.
 Do not retry a failed renderer/auditor, repair, or dispatch a second audit wave.
 Prepare `finalization_requests` from the stage's trusted prompt/schema, with
 unique private artifact basenames: one renderer or two independent auditors.
-Use an existing owner-only (`0700`), exclusively owned private finalization
-directory, not a reviewed-code path. Keep the existing stage deadline and safe
-failure policy.
+Create the finalization root with `tempfile.mkdtemp(prefix="anvil-finalization-")`
+or use an existing exclusively owned `0700` root. `_Directory` is for this
+private archive only, not the checkout's `.review-anvil` report directory.
+Do not chmod a shared directory or use `_Directory` as a context manager.
 
 ```python
-from coverage_coordinator import _Directory  # trusted engine scripts on sys.path
+import tempfile
+from coverage_coordinator import _Directory, WorkerFailure
 
+private_finalization_directory = tempfile.mkdtemp(prefix="anvil-finalization-")
 archive = _Directory.open(private_finalization_directory)
-handles, failures, saved = [], [], []
-returned_values = {}  # retain complete values even if a durable write fails
+wave = native.OMPNativeAdapter(agent, timeout=effective_reviewer_timeout)
+wave.begin_wave()
+pending, failures, saved = [], [], []
+returned_values = {}  # complete values survive a failed durable write
+def retain(name, value):
+    returned_values[name] = value
+    try:
+        archive.write(name + ".raw.json", value)
+        saved.append(name)
+    except BaseException as exc:
+        failures.append((name, str(exc)))
+
 try:
     for request in finalization_requests:
         try:
-            handle = agent(request["prompt"], label=request["name"],
-                           schema=request["schema"], schema_mode="strict")
-            handles.append((request["name"], handle))
+            handle = wave.start({"prompt": request["prompt"], "label": request["name"],
+                                 "schema": request["schema"]})
+            pending.append((request["name"], handle))
         except BaseException as exc:
             failures.append((request["name"], str(exc)))
-            break  # stop scheduling, then drain every started handle once
-    for name, handle in handles:
+            break
+    while pending:
         try:
-            returned_values[name] = handle.wait()
-            archive.write(name + ".raw.json", returned_values[name])
-            saved.append(name)
-        except BaseException as exc:
-            failures.append((name, str(exc)))
+            handle, value = wave.wait_one([handle for _, handle in pending])
+        except (KeyboardInterrupt, SystemExit) as exc:
+            failures.append(("collection", type(exc).__name__ + ": " + str(exc)))
+            # No handle was consumed: inspect each pending task once, then
+            # salvage ready output or cancel without an unbounded drain.
+            for name, item in pending:
+                try:
+                    ready = item.done()
+                except BaseException as error:
+                    failures.append((name, str(error)))
+                    ready = False
+                if not ready:
+                    try:
+                        wave.cancel(item)
+                    except BaseException as error:
+                        failures.append((name, str(error)))
+                    failures.append((name, "cancelled after collection interrupt"))
+                    continue
+                try:
+                    _, value = wave.wait_one([item])
+                except BaseException as error:
+                    failures.append((name, str(error)))
+                else:
+                    retain(name, value)
+            pending.clear()
+            break
+        except WorkerFailure as exc:
+            handle = exc.handle
+            name = next(name for name, item in pending if item is handle)
+            failures.append((name, str(exc.cause)))
+        else:
+            name = next(name for name, item in pending if item is handle)
+            retain(name, value)
+        pending = [(name, item) for name, item in pending if item is not handle]
 finally:
     archive.close()
 print({"saved": len(saved), "failed": len(failures)})
 ```
 
-Starts and waits run on the Eval thread; no executor threads, `asyncio.run`,
-polling, guessed model/provider APIs or adapter changes. `.wait()` returns the
-**complete schema-parsed value**. Python `write`, `Path.write_text` and
-`_Directory.write` are synchronous: never `await` them. The existing
-`_Directory` atomically writes owner-only JSON and fsyncs before progress is
-displayed. Counts are display only; validators consume the saved complete value.
+Starts and waits stay on the Eval thread. Use the same timed adapter for ordinary,
+reproduction, adversarial, rendering and audit stages; no fresh timeout per handle,
+sleep-only alarm, threads or polling. The adapter returns the complete parsed
+value. Python `write`, `Path.write_text` and `_Directory.write` are synchronous:
+never await them. Private writes are atomic, owner-only and fsynced before progress.
+Counts are display only; validators consume the saved complete value.
 Any failure follows the existing stage fallback/COMMENT policy, not success
 inferred from saved counts.
 
@@ -165,6 +219,24 @@ unmodified returned value. For recovery, load durable raw JSON with
 re-wait an expired/consumed handle, rerender or redispatch completed work.
 Missing durable and retained output is a technical blocker, never permission
 to reconstruct it from display text.
+
+Public report/sidecar emission is separate from private archive storage:
+
+```python
+import json
+from pathlib import Path
+
+public_report = Path(report_path)
+public_report.parent.mkdir(parents=True, exist_ok=True)
+public_report.write_text(selected_bundle["report_markdown"], encoding="utf-8")
+Path(str(public_report) + ".inline.json").write_text(
+    json.dumps(selected_bundle["inline_comments"], ensure_ascii=False),
+    encoding="utf-8")
+```
+
+Use only the already validated selected bundle. Keep existing approval/target
+guards and diagnostics separate. Do not open the public report parent through
+`_Directory` or invent context-manager methods on private storage objects.
 
 
 ## Record grouped ordinary responses
@@ -181,11 +253,11 @@ Each listed member receives the **actual shared assertion** after all its condit
 
 `candidates_json` is a JSON-string array with exactly one genuine candidate per violated canonical `rule_id`, a supported original `source_url`, current-code evidence and change attribution. Preserve arbitrary nested fields, uncertainty and scope caveats. Never use an ordinal as `rule_id`, an unconstrained object transport or synthetic candidates derived from counts. Preserve candidates even if later synthesis dismisses them.
 
-Persist/fsync actual raw response, actual markdown, decoded candidate array and pending transaction **before backend acknowledgement**. Feed acknowledged reports directly into normal synthesis. Deterministic malformed responses fail before acknowledgement; technical/trust/freshness errors remain distinct from missing evidence.
+Persist actual raw responses and available ordinary markdown/candidates before acknowledgement. `normal_review_paths` independently validate ordinary reviewer identity and terminal findings; feed them into normal synthesis even when supplemental accounting fails. `acknowledged_review_paths` alone count toward authenticated rule coverage. Preserve separate pending/rejected/unvalidated inventories; never certify invalid rule rows.
 
 ## Audit, seal and publish
 
-Completion requires every configured reviewer response and a genuine determinate verdict for every supported ID. Single-pass status reports `applicability_required: false`, zero applicability work and actual reviewed/pending IDs. All dispatched or attempted does not mean all assessed. Missing responses and `not_assessed` block signed completion and publication.
+Signed knowledge completion requires every configured reviewer response and a genuine determinate verdict for every supported ID. Missing responses and `not_assessed` block only that completion claim, not original publication of independently valid ordinary results. Single-pass accounting remains exact; all attempted never means all assessed.
 
 After actual acknowledged results are committed and determinate:
 
@@ -194,12 +266,12 @@ python3 <memory-helper> coverage-finish <canonical-repository> --run-id <run_id>
 python3 <memory-helper> coverage-check --report <REPORT_PATH>.coverage.json --repository <canonical-repository> --number <PR-number> --head-sha <captured-head-SHA>
 ```
 
-The backend verifies authenticated strategy/phase gates, assignments, raw responses, candidate conservation, current catalog/support/checkpoint, fresh numeric GitHub repository identity and full PR metadata. Legacy recording/sealing cannot bypass phase-managed completion. Independently check the signed sidecar; preserve historical report shapes/signatures.
+These commands authenticate complete knowledge accounting against the actual frozen strategy/phase, source/catalog/checkpoint and fresh target. They are private diagnostics, not publication prerequisites. Preserve historical report shapes/signatures and never fabricate successful completion.
 
 Keep existing root-cause deduplication, scope/confidence checks, exhaustive synthesis, selective reproduction, adversarial review, clarity, freshness, rendering and action-lock validation. Adjudicate every candidate as confirmed/dismissed/deferred; a rule verdict alone is not an actionable defect. Do not expose private rule/discussion text to isolated rendering or GitHub.
 
 Report helper-produced strategy, run/target, determinate/total/remaining, actual
-verdict/phase counts and inactive exclusions in collapsed context. Inspect the
+verdict/phase counts and inactive exclusions only in private local diagnostics. Inspect the
 complete attempt inventory and all normal/pending/rejected/unvalidated output
 paths; unvalidated candidates are evidence to adjudicate, never certified rule
 verdicts. Retain every concrete evidence question and technical blocker.
@@ -211,8 +283,12 @@ Run eligible finish/check calls once; do not call them just to obtain an expecte
 error. Track "Record signed coverage outcome" separately from local validation:
 complete that recording task with actual `verified`, `failed` or
 `blocked_not_run` diagnostics. This does not mark unavailable coverage verified.
-Incomplete runs remain local and cannot publish, approve, resolve threads or
-perform success-only learning. Never claim all-success from local validation.
+Knowledge gaps do not block the normal report/posting path or replace its original
+approval/learning conditions. No usable ordinary result remains an ordinary
+review failure. Retain internal gaps, counts, signature states and technical
+blockers in private artifacts and the delivery manifest. Do not put an audit
+notice or vague unresolved-question summary in the PR. Only a concrete code-risk
+limitation useful to its author belongs in public review context.
 
 Before every report-path delivery, write a bounded owner-only sibling
 `<REPORT_PATH>.delivery.json`, preserving the existing diagnostic pattern
@@ -242,7 +318,7 @@ The delivery JSON is **diagnostic only**, never signature, approval or publicati
 `verified` only after actual finish/check success against the frozen identity;
 never infer it from a file's existence or the report's local validation.
 
-Initialize reports with `pr-helper.sh init <locator> --rule-coverage all`; preserve `.rule-coverage` and `<REPORT_PATH>.coverage.json`. Posting uses only the sibling trusted installed `coverage-check`. `post: false` exports `REVIEW_ANVIL_NO_POST=1` before init, persists `.no-post` and forbids all remote mutation independently of completion. Generation remains deferred until successful publication or successful final local report plus signed no-post sidecar; `rules: off` disables it entirely. Scoped mode is unchanged.
+Initialize with `pr-helper.sh init <locator> --rule-coverage all`; `.rule-coverage` records requested diagnostic mode only. Retain available private signed audit artifacts; no sidecar is required to post an otherwise valid ordinary report. The helper does not interpret knowledge receipts. `post: false` independently persists `.no-post` and forbids remote mutation. Preserve original learning eligibility and `rules: off`; do not invent evidence for unavailable assessments.
 
 ## Recovery and historical runs
 
@@ -275,8 +351,23 @@ Preserve requested `codex-exec`/`claude-exec` backends; native workers must not 
 3. Build the same overlay: static trusted instructions, complete inline indexed rules/schema, private paths, then the complete original ordinary prompt verbatim. Dispatch each reviewer exactly once with the actual requested backend, existing model/sandbox/watchdog/timeout/no-post controls, and the single-pass schema. Cap ordinary concurrency with `coverage_workers`; never substitute a native proxy or duplicate ordinary wave.
 4. Leave `REVIEW_ANVIL_REQUIRE_FINDINGS` **unset for outer JSON**. `coverage-review-record` validates the real terminal findings fence in inner `review_markdown`.
 5. For Codex, never put the large inline prompt in argv. Write the identical complete prompt to an owner-only file; preserve existing model, sandbox and watchdog flags, replace only the prompt argv with literal `-`, and supply that finite file on stdin instead of `/dev/null`. Verify the selected installation supports forced-stdin `-` before dispatch; otherwise fail that requested backend clearly without substitution. Keep Claude's existing stdin-file recipe and EOF/timeout controls.
-6. Persist/fsync actual response, markdown, decoded candidates and pending transaction before `coverage-review-record`. Export unchanged acknowledged markdown for normal synthesis. Never reconstruct an envelope from prose or candidates from counts. On explicit resume replay pending exact data and restore acknowledged work without redispatch or changed prompts/backends.
-7. After every response is acknowledged, commit and retain all candidate inventories for adjudication; use the same fresh finish/check/publication gates. Rejected attempts are not assessed rules. Historical external continuations use their authenticated archived protocol, not this new overlay.
+6. Persist actual raw output first. Independently verify each expected ordinary reviewer identity and terminal findings before synthesizing its unchanged markdown, regardless of `coverage-review-record` success. Validate the frozen task/request/source identity as well; supplemental failure cannot excuse a mismatched ordinary task. Do not reconstruct an envelope from prose or candidates from counts. Preserve genuine candidate inventories with their unacknowledged state.
+7. Commit/finish/check only when the authenticated knowledge prerequisites hold, as private diagnostics. Missing/rejected supplemental accounting does not block normal synthesis/publication of usable ordinary output. Preserve no-post, original target/history/report checks and no-retry behavior. Historical external continuations retain their authenticated archived accounting protocol, not a new invented certificate.
+
+For external envelopes, use the same trusted engine validator as native collection
+before writing ordinary output, without needing a coverage acknowledgement:
+
+```python
+from criteria_coordinator import CriteriaCoordinator  # trusted engine scripts on sys.path
+
+markdown = CriteriaCoordinator._ordinary_markdown(actual_response, expected_reviewer_id)
+ordinary_output.write_bytes(markdown.encode("utf-8"))
+```
+
+`actual_response` is the complete parsed return, `expected_reviewer_id` comes from
+the original frozen ordinary task, and `ordinary_output` is its owner-only archived
+output path. Verify archived request/packet identity against that frozen task
+first. An invalid envelope/identity or incomplete ordinary report is not usable.
 
 ## Correctness and measurement
 

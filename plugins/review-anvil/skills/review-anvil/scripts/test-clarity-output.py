@@ -16,7 +16,6 @@ VALIDATOR = ROOT / "scripts" / "validate-clarity-output.py"
 CANONICAL = {
     "decision": "COMMENT",
     "report_ids": ["RAV-RUN2-R1-F003", "RAV-RUN2-R1-F005"],
-    "inline_min_severity": "medium",
     "decision_reason": "Two conversion problems remain.",
     "result": "Publication is unsafe until both are fixed.",
     "scope": "CLI and metric conversion.",
@@ -245,7 +244,6 @@ class ClarityOutputValidatorTests(unittest.TestCase):
     def test_audit_preparation_preserves_optional_requests_without_promoting_boundaries(self) -> None:
         canonical, source = self.audit_fixture()
         canonical["findings"][0]["severity"] = "nit"
-        canonical["inline_min_severity"] = "nit"
         canonical["findings"][0]["requested_work"] = [
             "Consider using Container while keeping the wrapper class and key unchanged."
         ]
@@ -269,7 +267,6 @@ class ClarityOutputValidatorTests(unittest.TestCase):
 
     def test_explicit_request_mode_overrides_severity_on_both_surfaces(self) -> None:
         canonical, source = self.human_source_bundle()
-        canonical["inline_min_severity"] = "low"
         for finding, mode in zip(canonical["findings"], ("required", "suggested"), strict=True):
             finding.update(request_mode=mode, source_context="Accepted source evidence.",
                            fact_lock=["The accepted diagnosis remains unchanged."])
@@ -415,7 +412,6 @@ class ClarityOutputValidatorTests(unittest.TestCase):
             "decision": "COMMENT",
             "report_ids": ["RAV-RUN2-R1-F003", deferred["id"]],
             "report_style": "human-summary",
-            "inline_min_severity": "medium",
             "decision_reason": "One issue needs attention.",
             "result": "The CLI entry point fails before conversion.",
             "scope": "CLI conversion.",
@@ -645,7 +641,6 @@ class ClarityOutputValidatorTests(unittest.TestCase):
             "decision": "APPROVE",
             "report_ids": [],
             "report_style": "human-summary",
-            "inline_min_severity": "medium",
             "decision_reason": "No material issues remain.",
             "result": "No material issues surfaced.",
             "scope": "The reviewed change.",
@@ -725,6 +720,160 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         )
         return canonical, rendered
 
+    def test_private_metadata_need_not_appear_in_source_or_rendered_report(self) -> None:
+        canonical, source = self.human_source_bundle()
+        for field in ("decision_reason", "result", "second_check"):
+            source["report_markdown"] = source["report_markdown"].replace(canonical[field] + "\n", "")
+        rendered = copy.deepcopy(source)
+        rendered["report_markdown"] = rendered["report_markdown"].replace(
+            "The parser and numeric conversion still need changes.",
+            "Fix the entry point and invalid metric handling before merging.",
+        )
+        for bundle in (source, rendered):
+            with self.subTest(surface="source" if bundle is source else "rendered"):
+                self.assertEqual(bundle["metadata_inventory"], {
+                    field: canonical[field] for field in RENDERED["metadata_inventory"]
+                })
+                result = self.validate(bundle, canonical)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_private_metadata_inventory_remains_exact(self) -> None:
+        for field in ("decision_reason", "result", "second_check"):
+            for mutation in ("changed", "missing"):
+                with self.subTest(field=field, mutation=mutation):
+                    canonical, rendered = self.human_source_bundle()
+                    if mutation == "missing":
+                        rendered["metadata_inventory"].pop(field)
+                    else:
+                        rendered["metadata_inventory"][field] = "Altered private value."
+                    self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+
+    def test_author_relevant_context_remains_required(self) -> None:
+        for field in ("scope", "checks", "run_details", "outside_scope", "set_aside"):
+            with self.subTest(field=field):
+                canonical = copy.deepcopy(CANONICAL)
+                rendered = copy.deepcopy(RENDERED)
+                if isinstance(canonical[field], list):
+                    canonical[field] = ["Runtime behavior was not exercised."]
+                    rendered["metadata_inventory"][field] = copy.deepcopy(canonical[field])
+                else:
+                    rendered["report_markdown"] = rendered["report_markdown"].replace(canonical[field], "")
+                self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+
+    def test_ordinary_report_does_not_require_an_internal_diagnostic_prefix(self) -> None:
+        canonical, source = self.human_source_bundle()
+        canonical["knowledge_notice"] = "Legacy private diagnostic metadata."
+        result = self.validate(source, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def file_comment_bundle(self, explicit: bool = False) -> tuple[dict, dict]:
+        canonical, rendered = self.human_source_bundle()
+        finding = canonical["findings"][0]
+        comment = rendered["inline_comments"][0]
+        for item in (finding, comment):
+            item.pop("line")
+            item.pop("side")
+        if explicit:
+            finding["subject_type"] = "file"
+        comment["subject_type"] = "file"
+        return canonical, rendered
+
+    def test_path_only_findings_require_explicit_file_comments(self) -> None:
+        for explicit in (False, True):
+            with self.subTest(explicit_canonical_subject=explicit):
+                canonical, rendered = self.file_comment_bundle(explicit)
+                result = self.validate(rendered, canonical)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rendered["inline_comments"][0].pop("subject_type")
+                self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+
+    def test_file_and_line_comment_inventories_are_exact(self) -> None:
+        canonical, original = self.file_comment_bundle()
+        for index in (0, 1):
+            for mutation in ("missing", "duplicate", "wrong_subject", "wrong_path"):
+                with self.subTest(index=index, mutation=mutation):
+                    rendered = copy.deepcopy(original)
+                    comment = rendered["inline_comments"][index]
+                    if mutation == "missing":
+                        rendered["inline_comments"].pop(index)
+                    elif mutation == "duplicate":
+                        rendered["inline_comments"].append(copy.deepcopy(comment))
+                    elif mutation == "wrong_subject":
+                        comment["subject_type"] = "line" if index == 0 else "file"
+                    else:
+                        comment["path"] = "invented.py"
+                    self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+
+    def test_file_comments_cannot_gain_line_fields_or_executable_suggestions(self) -> None:
+        mutations = [
+            {"line": 1}, {"line": None}, {"side": "RIGHT"}, {"start_line": 1},
+            {"start_side": "RIGHT"}, {"position": 1}, {"start_position": 1},
+            {"range": {"start": 1, "end": 2}}, {"suggestion": "replace_file()"},
+        ]
+        for extra in mutations:
+            with self.subTest(extra=extra):
+                canonical, rendered = self.file_comment_bundle()
+                rendered["inline_comments"][0].update(extra)
+                self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+        canonical, rendered = self.file_comment_bundle()
+        body = rendered["inline_comments"][0]["body"]
+        rendered["inline_comments"][0]["body"] = "```suggestion\nreplace_file()\n```\n\n" + body
+        self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+        for extra in ({"line": 1}, {"suggestion": "replace_file()"}):
+            with self.subTest(canonical_extra=extra):
+                canonical, rendered = self.file_comment_bundle(explicit=True)
+                canonical["findings"][0].update(extra)
+                rendered["inline_comments"][0].update(extra)
+                self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+
+    def test_line_comments_preserve_subject_and_positive_integer_anchors(self) -> None:
+        canonical, rendered = self.human_source_bundle()
+        rendered["inline_comments"][0]["subject_type"] = "line"
+        result = self.validate(rendered, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for key, values in (
+            ("line", (True, False, 0, -1, "383")),
+            ("start_line", (True, False, 0, -1, 303)),
+            ("side", ("MIDDLE",)),
+            ("subject_type", ("other", None)),
+        ):
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    canonical, rendered = self.human_source_bundle()
+                    index = 1 if key == "start_line" else 0
+                    canonical["findings"][index][key] = value
+                    rendered["inline_comments"][index][key] = value
+                    self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+
+    def test_invalid_canonical_paths_cannot_become_comments(self) -> None:
+        for path in ("", " ", "/absolute.py", "../outside.py", "src/../outside.py", "src\nfile.py"):
+            with self.subTest(path=path):
+                canonical, rendered = self.human_source_bundle()
+                canonical["findings"][0]["path"] = path
+                rendered["inline_comments"][0]["path"] = path
+                self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+
+    def test_report_path_only_finding_remains_in_report_and_audit_inventory(self) -> None:
+        canonical, rendered = self.human_source_bundle()
+        for key in ("path", "line", "side"):
+            canonical["findings"][0].pop(key)
+        removed = rendered["inline_comments"].pop(0)
+        result = self.validate(rendered, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        canonical["findings"][0].update(source_context="Original general finding evidence.",
+                                         fact_lock=["The parser remains unchanged."])
+        canonical["findings"][1].update(source_context="Original metric evidence.", fact_lock=[])
+        audit = self.prepare_audit_rows(canonical, rendered, rendered)
+        self.assertEqual(audit.returncode, 0, audit.stderr)
+        rows = json.loads(audit.stdout)
+        self.assertEqual([(row["id"], row["surface"]) for row in rows], [
+            ("RAV-RUN2-R1-F003", "report"),
+            ("RAV-RUN2-R1-F005", "report"),
+            ("RAV-RUN2-R1-F005", "inline"),
+        ])
+        rendered["inline_comments"].insert(0, removed)
+        self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+
     def test_source_report_tables_reject_blank_line_chunk_joining(self) -> None:
         canonical, source = self.human_source_bundle()
         result = self.validate(source, canonical)
@@ -756,6 +905,12 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         )
         result = self.validate(source, canonical)
         self.assertEqual(result.returncode, 0, result.stderr)
+        omitted = copy.deepcopy(source)
+        omitted["report_markdown"] = omitted["report_markdown"].replace(
+            "- **still-open** — The parser defect remains. https://example.invalid/parser "
+            "(`RAV-RUN2-R1-F003`)\n", "",
+        )
+        self.assertNotEqual(self.validate(omitted, canonical).returncode, 0)
 
     def test_accepts_disposition_also_accounted_for_in_history(self) -> None:
         canonical, source = self.human_source_bundle()
@@ -905,31 +1060,12 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("earlier-feedback line changed", result.stderr)
 
-    def test_accepts_anchored_low_without_inline_comment(self) -> None:
-        canonical = copy.deepcopy(CANONICAL)
-        low = {
-            "id": "RAV-RUN2-R1-F006",
-            "severity": "low",
-            "area": "docs",
-            "path": "docs/cli.md",
-            "line": 7,
-            "report_path": "docs/cli.md",
-            "report_line": 7,
-            "side": "RIGHT",
-            "requested_work": ["The help can name the timeout default."],
-            "suggestion": None,
-        }
-        canonical["findings"].append(low)
-        canonical["report_ids"].append(low["id"])
-        rendered = copy.deepcopy(RENDERED)
-        body = "- **CLI help omits the timeout default** `docs/cli.md:7` — The help can name the timeout default. (`RAV-RUN2-R1-F006`) <!-- review-anvil-report: severity=low area=docs -->"
-        rendered["report_markdown"] += "\n" + body
-        rendered["report_items"].append({"id": low["id"], "rendered_body": body})
-        rendered["predicate_inventory"].append(
-            {"id": low["id"], "requested_work": low["requested_work"]}
-        )
+    def test_anchored_nit_cannot_be_omitted_with_higher_severity_findings(self) -> None:
+        canonical, rendered = self.nit_comment_bundle()
+        rendered["inline_comments"].pop()
         result = self.validate(rendered, canonical)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inline finding inventory mismatch", result.stderr)
 
     def test_accepts_reintroduced_prior_feedback_metadata(self) -> None:
         canonical = copy.deepcopy(CANONICAL)
@@ -956,43 +1092,41 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         result = self.validate(rendered, canonical)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_accepts_anchored_low_when_threshold_is_low(self) -> None:
+    def nit_comment_bundle(self) -> tuple[dict, dict]:
         canonical = copy.deepcopy(CANONICAL)
-        canonical["inline_min_severity"] = "low"
-        low = {
-            "id": "RAV-RUN2-R1-F006",
-            "severity": "low",
-            "area": "docs",
-            "path": "docs/cli.md",
-            "line": 7,
-            "report_path": "docs/cli.md",
-            "report_line": 7,
-            "side": "RIGHT",
-            "requested_work": ["The help can name the timeout default."],
-            "suggestion": None,
+        nit = {
+            "id": "RAV-RUN2-R1-F006", "severity": "nit", "area": "docs",
+            "path": "docs/cli.md", "line": 7, "side": "RIGHT",
+            "report_path": "docs/cli.md", "report_line": 7,
+            "requested_work": ["Consider naming the timeout default."], "suggestion": None,
         }
-        canonical["findings"].append(low)
-        canonical["report_ids"].append(low["id"])
+        canonical["findings"].append(nit)
+        canonical["report_ids"].append(nit["id"])
         rendered = copy.deepcopy(RENDERED)
-        report_body = "- **CLI help omits the timeout default** `docs/cli.md:7` — The help can name the timeout default. (`RAV-RUN2-R1-F006`) <!-- review-anvil-report: severity=low area=docs -->"
-        rendered["report_markdown"] += "\n" + report_body
-        rendered["report_items"].append(
-            {"id": low["id"], "rendered_body": report_body}
-        )
-        rendered["inline_comments"].append(
-            {
-                "path": "docs/cli.md",
-                "line": 7,
-                "side": "RIGHT",
-                "severity": "low",
-                "body": "**CLI help omits the timeout default**\n\nThe help can name the timeout default.\n\n<!-- review-anvil: id=RAV-RUN2-R1-F006 severity=low area=docs -->",
-            }
-        )
-        rendered["predicate_inventory"].append(
-            {"id": low["id"], "requested_work": low["requested_work"]}
-        )
-        result = self.validate(rendered, canonical)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        body = "- **CLI help omits the timeout default** `docs/cli.md:7` — Consider naming the timeout default. (`RAV-RUN2-R1-F006`) <!-- review-anvil-report: severity=nit area=docs -->"
+        rendered["report_markdown"] += "\n" + body
+        rendered["report_items"].append({"id": nit["id"], "rendered_body": body})
+        rendered["inline_comments"].append({
+            "path": "docs/cli.md", "line": 7, "side": "RIGHT", "severity": "nit",
+            "body": "Consider naming the timeout default.\n\n<!-- review-anvil: id=RAV-RUN2-R1-F006 severity=nit area=docs -->",
+        })
+        rendered["predicate_inventory"].append({"id": nit["id"], "requested_work": nit["requested_work"]})
+        return canonical, rendered
+
+    def test_all_anchored_severities_are_comment_candidates(self) -> None:
+        for severity in ("nit", "low", "medium", "high", "critical"):
+            with self.subTest(severity=severity):
+                canonical, rendered = self.nit_comment_bundle()
+                canonical["findings"][-1]["severity"] = severity
+                comment = rendered["inline_comments"][-1]
+                comment["severity"] = severity
+                comment["body"] = comment["body"].replace("severity=nit", "severity=" + severity)
+                old = rendered["report_items"][-1]["rendered_body"]
+                new = old.replace("severity=nit", "severity=" + severity)
+                rendered["report_items"][-1]["rendered_body"] = new
+                rendered["report_markdown"] = rendered["report_markdown"].replace(old, new)
+                result = self.validate(rendered, canonical)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rejects_missing_reintroduced_prior_feedback_metadata(self) -> None:
         canonical = copy.deepcopy(CANONICAL)
