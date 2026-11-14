@@ -108,6 +108,41 @@ class CollectorTests(unittest.TestCase):
             transport.assert_not_called()
 
 
+class TargetProjectionTests(unittest.TestCase):
+    setUp = CollectorTests.setUp
+    def api(self, host, endpoint, paginate=False):
+        result = CollectorTests.api(self, host, endpoint, paginate)
+        if endpoint == "repos/acme/widgets/pulls/7":
+            result["changed_files"] = 1
+            result["head"]["repo"] = {"id": 42, "full_name": "acme/widgets"}
+            result["base"]["repo"] = {"id": 42, "full_name": "acme/widgets"}
+        return result
+
+    def test_stable_projection_preserves_revision_and_complete_scope(self):
+        with patch.object(memory_github, "github_api", side_effect=self.api):
+            result = memory_github.read_pull_target("acme/widgets#7")
+        self.assertEqual(result["target"]["head_sha"], "a" * 40)
+        self.assertEqual(result["target"]["base_sha"], "b" * 40)
+        self.assertEqual(result["target"]["files"], ["src/view.ts"])
+        self.assertEqual(result["head_repository"], {"host": "github.com", "name": "acme/widgets", "id": 42})
+
+    def test_head_move_while_collecting_same_size_inventory_is_rejected(self):
+        self.move = True
+        with patch.object(memory_github, "github_api", side_effect=self.api):
+            with self.assertRaises(memory_github.GitHubError):
+                memory_github.read_pull_target("acme/widgets#7")
+
+    def test_base_move_while_collecting_same_size_inventory_is_rejected(self):
+        def changed(host, endpoint, paginate=False):
+            result = self.api(host, endpoint, paginate)
+            if endpoint == "repos/acme/widgets/pulls/7" and self.head_reads > 1:
+                result["base"]["sha"] = "d" * 40
+            return result
+        with patch.object(memory_github, "github_api", side_effect=changed):
+            with self.assertRaises(memory_github.GitHubError):
+                memory_github.read_pull_target("acme/widgets#7")
+
+
 class TransportTests(unittest.TestCase):
     def test_pagination_flattens_every_page_including_late_human_replies(self):
         pages = [

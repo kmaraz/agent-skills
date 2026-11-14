@@ -36,8 +36,9 @@ only the already-synthesized facts and obligations in its existing packet.
 ## Final clarity pass
 
 After synthesis freezes the decision, dispositions, facts, requested work,
-anchors, and safe suggestions, render both external surfaces through the final
-clarity pass.
+explicit source-based `request_mode`, anchors, and safe suggestions, render both
+external surfaces through one final clarity pass and one action-lock audit wave.
+Do not run repair passes or new audit waves.
 The top-level report is a short human summary: one or two natural detection
 sentences followed by collapsed sections. Every active finding becomes a
 four-column row inside `Issues and fixes` or `Optional suggestions`:
@@ -45,17 +46,23 @@ four-column row inside `Issues and fixes` or `Optional suggestions`:
 `Suggestion` for the third column. Each collapsed row keeps the full diagnosis,
 impact, and requested or suggested change; inline comments retain the same
 anchor-backed detail in GitHub's native UI.
+Every new active finding must carry `request_mode: required | suggested` from
+the accepted source, with the same obligation on report and inline surfaces.
+Use `Issues and fixes` for required work and `Optional suggestions` for suggested
+work regardless of severity: a low correctness fix may be required and a medium
+preference suggested. Invalid explicit modes fail validation. Severity fallback
+is only for old canonical packets without the field.
 
 Do not narrate the review pipeline in the visible summary. Translate internal
 review outcomes into observations about the changed code. Do not require a fixed
 replacement phrase. Choose a natural statement about affected behavior,
 detected issue areas, optional suggestions, or unreproduced uncertainty.
 
-For a low/nit-only report, the visible summary leads with the absence of
-material issues and may mention the number or broad topic of optional
-suggestions. Leave the specific low-priority observation and proposed change
-inside `Optional suggestions`. A true style observation should not become
-the apparent main review result merely because it is the only finding.
+When only suggested findings remain, the visible summary leads with the absence
+of required fixes and may mention the number or broad topic of suggestions.
+Leave the specific optional observation and proposed change inside
+`Optional suggestions`. A preference must not become a mandatory fix merely
+because its severity is medium; a required low fix must not become optional.
 
 Use the review history only when it changes what the author needs to understand
 about the current code. Keep a first-review summary focused on current findings.
@@ -69,6 +76,19 @@ sentences and concrete outcomes over internal mechanics. It cannot change the
 finding inventory, decision, priority, disposition, technical relationships,
 requested work, anchors, or suggestions. Validate its complete JSON bundle with
 `scripts/validate-clarity-output.py` before action-lock auditing or emission.
+If rendering, structural validation, or an audit verdict fails or is
+unverifiable, restore complete already-validated same-surface source bodies,
+not isolated request fragments. For malformed formatting or an invalid combined
+bundle, select the whole source bundle without another model call:
+`python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" --emit-validated "$CLARITY_PACKET" "$CLARITY_SOURCE_BUNDLE"`.
+On exit zero stdout is the exact validated source JSON bytes, not a new rendering
+or a success message. Extract the actual report string and inline bodies from
+the final validated bundle unchanged; do not add blank lines inside tables,
+invent section labels, or edit after validation. Force the final event to
+COMMENT independently of the frozen decision and honor all existing no-post,
+freshness, coverage, and publication guards. An invalid source is diagnostic-only:
+preserve local artifacts and errors, publish nothing, and claim no validated
+success. Never retry the renderer or auditors.
 
 Each top-level finding or disposition line ends with:
 `<!-- review-anvil-report: id=<complete-id> severity=<severity> area=<area> path=<encoded-path> start_line=<number-or-dash> line=<number-or-dash> disposition=<active|deferred|outside> -->`.
@@ -106,10 +126,10 @@ author-facing profile. Preserve evidence tokens verbatim.
 
 ## Inline-comment voice (bodies in `.inline.json`)
 
-The voice rules below do not replace the mandatory two-auditor action-lock gate
-in `action-lock-audit.md`; every rewritten draft body must pass that gate before
-it enters `.inline.json`. The exact-source fallback is exempt and
-forces COMMENT.
+The voice rules below do not replace the single two-auditor action-lock wave
+in `action-lock-audit.md`; each selected rewrite needs both valid passes.
+A failed or unverifiable rewrite uses its exact already-validated source body
+and forces COMMENT without another renderer or audit wave.
 
 Write each inline comment in plain language about the code at that line. Emit
 comments at or above the configured inline threshold; lower-priority findings
@@ -129,9 +149,9 @@ Use one bullet per independently implementable obligation. Prefer separate
 bullets whenever actions remain clear on their own.
 
 Default to starting required work with its action verb.
-End a direct imperative as a statement, not a question. Optional low/nit work
-starts with `Consider …`. Ask a real question only when the source leaves a
-decision unresolved.
+End a direct imperative as a statement, not a question. Work with
+`request_mode: suggested` starts with `Consider …` at any severity. Ask a real
+question only when the source leaves a decision unresolved.
 
 End each body
 with exactly one
@@ -245,10 +265,11 @@ Put requested work under `Suggestions:`. Use one direct-action bullet per
 independently implementable obligation. Use a real question such as `Should …?`
 only when the source leaves a choice unresolved.
 
-Order required behavior before required tests. Keep suggestion grammar for low
-and nit guidance. Never write `the fix`, `in the fix`, or `the corrected path`
-unless the source discusses an existing patch. If no source-backed request
-exists, stop after the consequence. Do not invent why a test exists.
+Order required behavior before required tests. Keep suggestion grammar for
+every `suggested` clause, test, and documentation change at any severity. Never
+write `the fix`, `in the fix`, or `the corrected path` unless the source discusses
+an existing patch. If no source-backed request exists, stop after the consequence.
+Do not invent why a test exists.
 
 Write the visible body in this order:
 
@@ -313,7 +334,7 @@ Voice rules:
 - Keep requested work calm, direct, and conversational.
 - Do not use stock openers, review jargon, or compliment sandwiches. Use only
   the `Suggestions:` label.
-- Severity determines placement; prose needs no alarm words or bold warnings.
+- Severity determines the inline threshold, not obligation or request grammar.
 - Keep the comment as short as the finding allows.
 - Use a suggestion only for a safe, exact replacement; still explain the
   problem.

@@ -7,12 +7,12 @@
 #
 # Subcommands (see the case dispatch at the bottom for exact signatures):
 #
-#   init [<locator>]        — locator parse/auto-detect, gh preflight, marker
-#                             UUID + report path; prints KEY=VALUE lines.
+#   init [<locator>] [--rule-coverage scoped|all]
+#                           — locator/preflight, marker UUID + report path.
 #   post …                  — classify prior feedback and suppress duplicate
 #                             inline threads, prepend marker,
-#                             post as PR review (inline) or top-level comment;
-#                             prints the comment URL.
+#                             submit one PR review; failed/unknown delivery
+#                             retains the report locally without resubmission.
 #   verify-checkout […]     — improve-pr preflight: checkout matches PR head,
 #                             clean worktree; prints KEY=VALUE lines.
 #   post-start …            — post the "starting" comment, cc the author;
@@ -36,6 +36,11 @@
 #
 # Environment switches:
 #   REVIEW_ANVIL_NO_APPROVE=1     never submit APPROVE (downgrade to COMMENT)
+#   REVIEW_ANVIL_RULE_COVERAGE=all
+#                                 require authenticated exhaustive coverage
+#                                 (init also persists --rule-coverage all)
+#   REVIEW_ANVIL_NO_POST=1        retain reports locally without remote writes
+#                                 (init persists intent for later retries)
 #   REVIEW_ANVIL_SKIP_DISMISSED=1 legacy name: skip full PR-history lookups
 #                                 (degraded mode for hosts without GraphQL;
 #                                 also forces APPROVE -> COMMENT)
@@ -96,7 +101,7 @@ report_is_infra_failure() {
 
 cleanup_post_artifacts() {
     local report_path="$1" resolution_policy="${2:-remove}" dir
-    rm -f "$report_path" "${report_path}.inline.json" "${report_path}.approval.json" "${report_path}.followups.json" "${report_path}.context.json" "${report_path}.full.md"
+    rm -f "$report_path" "${report_path}.inline.json" "${report_path}.approval.json" "${report_path}.followups.json" "${report_path}.context.json" "${report_path}.full.md" "${report_path}.rule-coverage" "${report_path}.no-post"
     if [[ "$resolution_policy" != "keep" ]]; then
         rm -f "${report_path}.resolutions.json"
     fi
@@ -111,19 +116,17 @@ cleanup_post_artifacts() {
 # owner/repo/n/report_path locals (bash dynamic scoping). $1 = event,
 # $2 = inline-comments JSON file, or "" for a body-only review. On success
 # prints the review's html_url (possibly empty) and returns 0; on failure
-# prints a one-line warning to stderr and returns 1 — the caller decides the
-# next step in the fallback cascade.
+# prints a warning to stderr and returns 1. Unknown delivery is not success;
+# the caller retains artifacts and must not submit a fallback.
 _submit_review() {
-    # jq availability is preflighted at the top of cmd_post — a die here
-    # would run inside a command-substitution subshell and silently degrade
-    # the cascade instead of aborting.
+    # jq availability is preflighted at the top of cmd_post.
     local event="$1" inline="${2:-}" payload response
     if [[ -n "$inline" ]]; then
         payload=$(jq -n --rawfile body "$report_path" --arg event "$event" --slurpfile comments "$inline" \
-            '{event: $event, body: $body, comments: $comments[0]}')
+            '{event: $event, body: $body, comments: $comments[0]}') || return 1
     else
         payload=$(jq -n --rawfile body "$report_path" --arg event "$event" \
-            '{event: $event, body: $body}')
+            '{event: $event, body: $body}') || return 1
     fi
     if ! response=$(printf '%s' "$payload" | gh api \
                       "repos/${owner}/${repo}/pulls/${n}/reviews" \
@@ -133,7 +136,22 @@ _submit_review() {
             "$(printf '%s' "$response" | head -n1)" >&2
         return 1
     fi
-    printf '%s' "$response" | jq -r '.html_url // empty' 2>/dev/null || true
+    # A zero gh exit without a genuine submitted review is an unknown outcome,
+    # not permission to discard the local report or publish another payload.
+    if ! printf '%s' "$response" | jq -e -s \
+        --rawfile body "$report_path" --arg event "$event" '
+        length == 1 and (.[0] |
+          type == "object" and
+          (.id | type == "number" and . > 0 and . == floor) and
+          .body == $body and
+          .state == (if $event == "APPROVE" then "APPROVED" else "COMMENTED" end) and
+          (.submitted_at | type == "string" and length > 0) and
+          (.html_url == null or (.html_url | type == "string")))
+        ' >/dev/null 2>&1; then
+        printf 'warning: %s review submission outcome is unknown; response did not confirm the submitted report\n' "$event" >&2
+        return 1
+    fi
+    printf '%s' "$response" | jq -r '.html_url // empty'
 }
 
 # Resolve only live threads whose root comment carries review-anvil's terminal
@@ -2215,30 +2233,70 @@ PY
 cmd_check_pins() {
     # Mechanical pin-rejection (the engine's prose algorithm, made binding):
     #   check-pins <preset-name> <pins-csv> [<raw-args>]
-    # Segment-split raw args on commas, take each segment's key (text before
-    # its first ':'), lowercase, abort if it matches a pinned param. A comma
-    # inside a quoted value can split into stray segments, but those only
-    # abort if their derived key exactly equals a pin name — refusing in an
-    # ambiguous case is the safe direction.
+    # Split top-level argument segments without treating quoted focus text
+    # as controls. Validate exhaustive preset controls before removing them
+    # from engine arguments, so duplicates cannot disappear during parsing.
     local preset="${1:-}" pins_csv="${2:-}" raw="${3:-}"
     [[ -n "$preset" && -n "$pins_csv" ]] || die "check-pins: usage: check-pins <preset> <pins-csv> [<raw-args>]"
     if [[ -z "$raw" ]]; then
         printf 'pins-ok\n'
         return 0
     fi
-    local seg key pin pin_norm
-    local IFS=','
-    for seg in $raw; do
-        key=$(printf '%s' "${seg%%:*}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-        [[ -n "$key" ]] || continue
-        for pin in $pins_csv; do
-            pin_norm=$(printf '%s' "$pin" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-            if [[ "$key" == "$pin_norm" ]]; then
-                die "error: $pin_norm is pinned by $preset and cannot be overridden in args"
-            fi
-        done
-    done
-    printf 'pins-ok\n'
+    _py - "$preset" "$pins_csv" "$raw" <<'PY'
+import sys
+
+preset, pins_csv, raw = sys.argv[1:]
+pins = {pin.strip().lower() for pin in pins_csv.split(",")}
+segments, start, quote, escaped, depth = [], 0, None, False, 0
+for i, char in enumerate(raw):
+    if escaped:
+        escaped = False
+    elif char == "\\" and quote:
+        escaped = True
+    elif quote:
+        if char == quote:
+            quote = None
+    elif char in "\"'" and (i == 0 or raw[i - 1].isspace() or raw[i - 1] in ":,=([{"):
+        quote = char
+    elif char in "([{":
+        depth += 1
+    elif char in ")]}":
+        depth -= 1
+    elif char == "," and depth == 0:
+        segments.append(raw[start:i])
+        start = i + 1
+if quote or depth != 0:
+    raise SystemExit("pr-helper: cannot parse preset controls safely")
+segments.append(raw[start:])
+coverage = None
+workers = None
+memory_off = False
+for segment in segments:
+    key, separator, value = segment.partition(":")
+    key = key.strip().lower()
+    value = value.strip().lower()
+    if key in pins:
+        raise SystemExit(f"pr-helper: error: {key} is pinned by {preset} and cannot be overridden in args")
+    if preset == "review-anvil-pr" and key == "rule_coverage":
+        if coverage is not None:
+            raise SystemExit("pr-helper: duplicate rule_coverage control")
+        if not separator or value not in ("scoped", "all"):
+            raise SystemExit("pr-helper: rule_coverage must be scoped|all")
+        coverage = value
+    if preset == "review-anvil-pr" and key == "coverage_workers":
+        if workers is not None:
+            raise SystemExit("pr-helper: duplicate coverage_workers control")
+        if not separator or value not in ("1", "2", "3", "4"):
+            raise SystemExit("pr-helper: coverage_workers must be 1|2|3|4")
+        workers = value
+    if key == "memory" and value == "off":
+        memory_off = True
+if coverage == "all" and memory_off:
+    raise SystemExit("pr-helper: rule_coverage: all requires memory: on")
+if workers is not None and coverage != "all":
+    raise SystemExit("pr-helper: coverage_workers requires rule_coverage: all")
+print("pins-ok")
+PY
 }
 
 # Preflight the dependencies that would otherwise fail only at post time,
@@ -2253,7 +2311,25 @@ _preflight_deps() {
 }
 
 cmd_init() {
-    local locator="${1:-}"
+    local locator="" rule_coverage="scoped" coverage_seen=0
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+        locator="$1"
+        shift
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rule-coverage)
+                [[ "$coverage_seen" == 0 ]] || die "init: duplicate --rule-coverage"
+                [[ $# -ge 2 ]] || die "init: --rule-coverage requires scoped|all"
+                rule_coverage="$2"
+                [[ "$rule_coverage" == scoped || "$rule_coverage" == all ]] \
+                    || die "init: --rule-coverage must be scoped|all"
+                coverage_seen=1
+                shift 2
+                ;;
+            *) die "init: unexpected argument: $1" ;;
+        esac
+    done
     _preflight_deps
 
     # If the user supplied no locator, try to detect the PR for the
@@ -2329,6 +2405,14 @@ cmd_init() {
     # reads from the same file regardless of CWD changes between
     # invocations.
     report_path="$anchor/.review-anvil/final-report-${marker}.md"
+    # Persist mode separately from process environment so retries cannot
+    # accidentally bypass the exhaustive-coverage gate.
+    if [[ "$rule_coverage" == all ]]; then
+        (umask 077; printf 'all\n' >"${report_path}.rule-coverage")
+    fi
+    if [[ "${REVIEW_ANVIL_NO_POST:-0}" == 1 ]]; then
+        (umask 077; : >"${report_path}.no-post")
+    fi
 
     printf 'HOST=%s\n' "$host"
     printf 'OWNER=%s\n' "$owner"
@@ -2338,7 +2422,36 @@ cmd_init() {
     printf 'HEAD_SHA=%s\n' "$head_sha"
     printf 'MARKER=%s\n' "$marker"
     printf 'REPORT_PATH=%s\n' "$report_path"
+    printf 'RULE_COVERAGE=%s\n' "$rule_coverage"
     printf 'TITLE=%s\n' "$title"
+}
+
+# Resolve only the sibling engine in this trusted installation. Never accept
+# a helper path supplied by the report, reviewed checkout, or environment.
+check_rule_coverage_for_post() {
+    local host="$1" owner="$2" repo="$3" n="$4" report_path="$5"
+    local mode="${REVIEW_ANVIL_RULE_COVERAGE:-scoped}" persisted="" helper current_sha script_dir
+    if [[ -e "${report_path}.rule-coverage" ]]; then
+        persisted=$(cat "${report_path}.rule-coverage") || die "cannot read persisted rule coverage mode"
+        [[ "$persisted" == all || "$persisted" == scoped ]] || die "invalid persisted rule coverage mode"
+    fi
+    [[ "$mode" == all || "$mode" == scoped || -z "$mode" ]] || die "invalid rule coverage mode"
+    # A report sidecar also opts into verification; a missing mode marker
+    # must not allow an existing exhaustive report to bypass authentication.
+    if [[ "$mode" != all && "$persisted" != all && ! -e "${report_path}.coverage.json" ]]; then
+        return 0
+    fi
+    [[ -f "${report_path}.coverage.json" ]] \
+        || die "all-mode coverage report missing; report remains local: $report_path"
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+    helper="$script_dir/../../review-anvil/scripts/local-memory.py"
+    [[ -f "$helper" ]] || die "trusted local-memory.py not found; report remains local"
+    current_sha=$(gh pr view "$n" -R "$owner/$repo" --json headRefOid --jq '.headRefOid') \
+        || die "cannot verify current PR head for all-mode coverage"
+    [[ -n "$current_sha" ]] || die "empty current PR head for all-mode coverage"
+    _py "$helper" coverage-check --report "${report_path}.coverage.json" \
+        --repository "$host/$owner/$repo" --number "$n" --head-sha "$current_sha" >&2 \
+        || die "all-mode coverage is incomplete, stale, or unauthenticated; report remains local: $report_path"
 }
 
 cmd_post() {
@@ -2347,17 +2460,21 @@ cmd_post() {
         [[ -n "${!v}" ]] || die "post: missing <$v>"
     done
     [[ -f "$report_path" ]] || die "report file not found: $report_path"
+    if [[ "${REVIEW_ANVIL_NO_POST:-0}" == 1 || -f "${report_path}.no-post" ]]; then
+        printf '%s\n' "$report_path"
+        return 0
+    fi
     if [[ "${REVIEW_ANVIL_POST_INFRA_FAILURES:-0}" != "1" ]] && report_is_infra_failure "$report_path"; then
         die "review-anvil infrastructure failure report detected; refusing to post PR noise (report left at $report_path; set REVIEW_ANVIL_POST_INFRA_FAILURES=1 only for manual debugging)"
     fi
 
     export GH_HOST="$host"
 
-    # Preflight jq at top level: a die inside the cascade's command
-    # substitutions cannot abort the script. Note: gh's --jq is built-in
-    # gojq — it does NOT provide a jq binary on PATH.
+    # Preflight jq at top level. Note: gh's --jq is built-in gojq — it does
+    # NOT provide a jq binary on PATH.
     command -v jq >/dev/null 2>&1 \
         || die "jq not found — required to post reviews (gh's --jq is built-in gojq, not a jq binary; install jq)"
+    check_rule_coverage_for_post "$host" "$owner" "$repo" "$n" "$report_path"
 
     # Prepend the marker atomically, exactly once (post is retryable after a
     # suppression failure — a retry must not stack marker lines).
@@ -2451,89 +2568,18 @@ cmd_post() {
         has_inline=1
     fi
 
-    # Review-submission cascade — a failed approval must never cost the
-    # report (GitHub rejects self-approval with 422, the most common case
-    # for the "review the PR I'm on" workflow):
-    #   1. review {requested event + inline comments}   (if inline exists;
-    #      can also fail when reviewer line refs aren't in the PR's diff)
-    #   2. review {APPROVE, body-only}                  (if event is APPROVE)
-    #   3. downgrade APPROVE -> COMMENT, note it in the report, retry
-    #      {COMMENT + inline}                           (if inline exists)
-    #   4. top-level comment fallback (below)
-    local url
-    if [[ "$has_inline" -eq 1 ]]; then
-        if url=$(_submit_review "$review_event" "$inline_json"); then
-            _emit_post_result "$review_event" "$url"
-            return 0
-        fi
-    fi
-
-    if [[ "$review_event" == "APPROVE" ]]; then
-        local original_report_path="$report_path"
-        local approval_report_path=""
-        if [[ "$has_inline" -eq 1 ]]; then
-            approval_report_path=$(mktemp -t review-anvil-approval.XXXXXX)
-            cat "$report_path" >"$approval_report_path"
-            append_inline_details_to_report "$approval_report_path" "$inline_json"
-            report_path="$approval_report_path"
-        fi
-        if url=$(_submit_review APPROVE ""); then
-            report_path="$original_report_path"
-            [[ -z "$approval_report_path" ]] || rm -f "$approval_report_path"
-            _emit_post_result APPROVE "$url"
-            return 0
-        fi
-        report_path="$original_report_path"
-        [[ -z "$approval_report_path" ]] || rm -f "$approval_report_path"
-        review_event="COMMENT"
-        printf 'warning: approval could not be submitted (common cause: GitHub rejects approving your own PR); downgrading to a comment review\n' >&2
-        append_review_context_note "$report_path" \
-            "Delivery: review-anvil selected APPROVE, but GitHub rejected the approval, so review-anvil posted a comment instead."
-        compact_report_for_github "$report_path" "$inline_json"
-        if [[ "$has_inline" -eq 1 ]]; then
-            if url=$(_submit_review COMMENT "$inline_json"); then
-                _emit_post_result COMMENT "$url"
-                return 0
-            fi
-        fi
-    fi
-
-    # A gh failure while reading the response can leave a review created
-    # server-side; check for our marker among existing reviews before
-    # posting the report a second time.
-    local existing
-    existing=$(gh api "repos/${owner}/${repo}/pulls/${n}/reviews" --paginate \
-               --jq ".[] | select(.body | contains(\"$marker\")) | .html_url" 2>/dev/null \
-               | head -n1 || true)
-    if [[ -n "$existing" ]]; then
-        printf 'note: a review with this marker already exists on the PR; not posting again\n' >&2
-        finalize_post_artifacts "$host" "$owner" "$repo" "$n" "$report_path"
-        printf '%s\n' "$existing"
+    # Submit the policy-selected event exactly once, preserving its full inline
+    # payload. A rejection or lost response never authorizes a weaker event,
+    # a body-only retry, or a top-level comment. Keep all local artifacts when
+    # delivery cannot be confirmed; even marker-only history is not proof that
+    # this exact review was delivered.
+    local url submission_inline=""
+    [[ "$has_inline" -eq 0 ]] || submission_inline="$inline_json"
+    if url=$(_submit_review "$review_event" "$submission_inline"); then
+        _emit_post_result "$review_event" "$url"
         return 0
     fi
-
-    append_inline_details_to_report "$report_path" "$inline_json"
-    # Fallback path: top-level comment + marker URL recovery.
-    if ! gh pr comment "$n" -R "$owner/$repo" --body-file "$report_path" >/dev/null 2>&1; then
-        die "gh pr comment failed for $owner/$repo#$n on host=$host"
-    fi
-
-    # Recover URL via marker lookup (with one retry for read-after-write lag).
-    local url
-    for attempt in 1 2; do
-        url=$(gh api "repos/${owner}/${repo}/issues/${n}/comments" --paginate \
-              --jq ".[] | select(.body | contains(\"$marker\")) | .html_url" 2>/dev/null \
-              | head -n1 || true)
-        [[ -n "$url" ]] && break
-        [[ "$attempt" -eq 1 ]] && sleep 2
-    done
-
-    finalize_post_artifacts "$host" "$owner" "$repo" "$n" "$report_path"
-    if [[ -n "$url" ]]; then
-        printf '%s\n' "$url"
-    else
-        printf 'posted (URL unavailable)\n'
-    fi
+    die "$review_event review submission failed or delivery is unknown; no resubmission attempted; report remains local: $report_path"
 }
 
 cmd_verify_checkout() {

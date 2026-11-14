@@ -42,6 +42,8 @@ Parse the user's free-form args string into:
 | `reviewer_timeout` | `600` (`420` for small diffs) | "timeout 10 minutes" — hard per-reviewer wall-clock cap in seconds for Bash-dispatched reviewers (see `run-reviewer.sh`). Default is ~3× the slowest legitimate reviewer observed in real runs (98–213s); when unset and the diff is under ~500 changed lines (added+removed — the same measure as the adaptive budget tiers), requested rounds use `420` (~2× that observed max) so a hung reviewer pins the wave 3 minutes less. Adaptive rounds always use the full base value — `600`, or `1200` after the >5000-line doubling (doubling transforms the base; the small-diff reduction never applies to adaptive rounds). Explicit user values are never scaled or doubled |
 | `report_path` | unset | File path; when set, the engine writes the final report there (creating parent dirs) and prints exactly that path as its last output line so downstream consumers can pick it up |
 | `memory_snapshot` | unset | Trusted absolute path to the frozen observation/local-rule snapshot prepared by `review-anvil-pr`; unset means no local memory or learned rules. See `references/local-memory.md` |
+| `rule_coverage` | `scoped` | `scoped` or `all` — exhaustive supported local-rule assessment for a memory-enabled read-only PR review; see `references/rule-coverage.md` |
+| `coverage_workers` | `4` | Integer 1–4 caps simultaneous ordinary reviewers for new single-pass runs, never reviewer count/mix. Historical criteria-first retains its routing-only cap. No hidden provider/backend override. |
 
 `run_ordinal` is trusted invocation context, not a free-form user parameter.
 Use `run_ordinal` only when it is a positive trusted value. Treat an absent
@@ -49,10 +51,19 @@ value or `unavailable` as local/degraded context and omit `RUN` from item IDs.
 Keep UUID markers as the collision-resistant run identity. The ordinal adds
 human-readable provenance; it does not replace the marker.
 
+`coverage_run` is trusted invocation context issued by `coverage-start`, not a
+free-form user parameter. Only the PR preset may hand off its authenticated
+run ID. Bind it to the canonical repository and frozen PR metadata before
+dispatch; never accept a user, reviewed-source or worker-supplied replacement.
+
 ### Parsing
 
 - Split the args on top-level commas; canonicalize each segment to a `(param, value)` pair — explicit `key: value` maps directly, plain-English forms per the table. Unrecognized segments are noted and ignored.
 - **First occurrence wins** per param; later duplicates are dropped with `warning: user-supplied <param>=<value> ignored — earlier value wins`. Unset params take defaults.
+- Exception: reject invalid or duplicate `rule_coverage` segments rather than applying first-occurrence-wins. `all` requires a read-only PR target, an authenticated `memory_snapshot` and a trusted `coverage_run`; missing prerequisites are errors, never scoped fallback. Reject `coverage_run` in ordinary user args and reject a coverage run paired with `scoped`.
+- Reject duplicate/invalid `coverage_workers` values and explicit worker controls
+  without `rule_coverage: all`. The coverage coordinator enforces the numeric
+  limit independently of prose parsing.
 - Presets assemble `<pins>, <user-args>, <overridable defaults>`: pins come first so first-occurrence-wins makes them authoritative; defaults come last so user args beat them.
 - **Pin-rejection (presets; defense in depth against the prose parser being talked into overrides):** before assembling, segment-split `$ARGUMENTS` as above, lowercase each segment's key (the text before its first `:`), and abort with `error: <param> is pinned by <preset-name> and cannot be overridden in args` if any key equals a pinned param. Match segment *keys*, never raw substrings — `focus: "target: PR safety"` has key `focus` and must pass. A host that cannot segment-split must abort (`error: pin-rejection unavailable in this environment; refusing to invoke engine without pin enforcement`), not degrade to substring scanning.
 - `agents`: a count (use the mix table below) or an explicit mix naming `codex`/`codex-exec` / `claude`/`claude-exec` — honor a mix exactly.
@@ -155,7 +166,63 @@ Capture the target's state at round start so all reviewers see the same input:
 
 ### 2. Dispatch reviewers in parallel
 
+For a new **single-pass** `rule_coverage=all` run on any host, follow
+`references/rule-coverage.md` **before ordinary dispatch**. Construct complete
+ordinary tasks with their original lenses, scoped advisory snapshots and context.
+In OMP, default/count-only selection passes them to `CriteriaCoordinator`, which
+directly assigns every supported rule, including off-path/global rules, to those
+actual reviewers. Inline the full unchanged indexed criteria and strict response
+schema before private paths and the complete original ordinary task verbatim.
+Feed the actual normal reports into §3. Each reviewer returns
+`{reviewer_id, review_markdown, result_groups, candidates_json}`; groups explicitly
+cover every assigned index with a genuine shared verdict and evidence. Candidates
+use canonical rule IDs, never indices. Empty assignments still require the normal
+review. Storage batches are not worker jobs.
+
+Read complete original sources for ambiguity, source/policy conflict or possible
+violation; do not automatically reread every history. Missing evidence is genuine
+`not_assessed` and blocks completion, not a reason to synthesize a verdict.
+Persist raw envelopes, actual markdown, decoded genuine candidates and pending
+transactions before acknowledgement. Resume replays pending data, preserves
+acknowledged work and rejected inventories, and uses the authenticated stored
+strategy and archived original prompts; never reset, convert or recollect a run.
+
+Explicit external mixes and other hosts use the reference's phase-CLI
+integration with their actual requested backends, signed assignments and grouped
+responses; never substitute native proxies. **Launch one ordinary cohort only:
+no applicability workers, duplicate ordinary wave or extra coverage cohort.**
+`coverage_workers` caps ordinary concurrency without changing reviewer count.
+Historical criteria-first retains its archived applicability protocol and
+routing-only cap. The recipes below retain scoped/historical dispatch behavior;
+single-pass external launches apply the following override.
+
+**Single-pass external dispatch:** leave `REVIEW_ANVIL_REQUIRE_FINDINGS` unset
+for the outer JSON envelope (explicitly unset an inherited value); the backend
+still validates the actual inner terminal findings fence. For external Codex,
+verify the selected trusted installation supports forced stdin (`exec ... -`)
+before dispatch; if unavailable or unsupported, fail that requested backend
+clearly without substitution. Write the identical complete inlined prompt to an
+owner-only finite file (private directory, file mode `0600`). Preserve the
+watchdog, sandbox, model and all other existing flags, replacing only the prompt
+argv with literal `-` and stdin with that file:
+
+```bash
+unset REVIEW_ANVIL_REQUIRE_FINDINGS
+bash <wrapper> <private-response-file> <reviewer_timeout> -- \
+  "$CODEX_BIN" exec -m gpt-6.1-sol \
+    -c 'model_reasoning_effort="high"' \
+    -c 'shell_environment_policy.inherit="all"' \
+    --ephemeral --sandbox read-only -C <project-dir> - \
+  < <owner-only-complete-prompt-file>
+```
+
+Do not put the large prompt in argv or use `/dev/null` for this single-pass
+Codex launch. Existing Claude stdin-file dispatch already avoids the argv limit;
+retain its EOF, timeout and permission controls. The complete external protocol,
+including strict schema and phase recording, is in `references/rule-coverage.md`.
+
 #### In OMP with a native task tool
+
 
 For default/count-only agent selection, use the host's native task subagents
 instead of requiring separately installed Codex/Claude CLIs. Label these
@@ -167,7 +234,7 @@ custom output schemas: use general-purpose native task workers (omit the
 override the required fenced findings block. Supply the complete reviewer
 Task block and its terminal schema verbatim; prohibit source edits, commits,
 publishing and execution of reviewed code. Validate the returned findings
-block and use the existing single protocol retry/failure policy. Record actual
+block and retain failures without redispatch. Record actual
 backend/model coverage; native same-model redundancy is not cross-provider
 independence.
 
@@ -176,6 +243,13 @@ rendering and action-lock audits too, with each stage's existing prompt and
 output schema. Keep proof execution restricted to the configured isolated
 runner and retain all validators, timeouts and safe fallbacks. Native tasks do
 not use the shell watchdog. Wait only for tasks launched by this run.
+
+For native finalization, use the canonical structured-result transport in
+`references/rule-coverage.md#finalization-result-transport`. Persistent Eval
+cells use `timeout: 0`; start/wait stays on the Eval thread. Python `write`,
+`Path.write_text` and `_Directory.write` are synchronous, never awaited.
+Persist the complete schema-parsed `.wait()` value before displaying counts;
+neither `read(agent://...)` nor printed/output display text is machine transport.
 
 An explicit Codex/Claude mix still requests those real backends: resolve their
 CLIs and fail with the missing prerequisite rather than relabel native tasks.
@@ -228,7 +302,7 @@ run-reviewer.sh <out_file> <timeout_seconds> -- <command> [args...]
 - Captures exit status; stderr goes to `<out_file>.err` (kept for diagnosis).
 - Prints one classification: `STATUS=ok` | `timeout` | `empty` (exit 0, nothing written) | `protocol` (normal-review output did not end with a complete fenced findings block) | `failed` (+ `EXIT_CODE=<n>`).
 
-Treat any STATUS other than `ok` as a failed reviewer (see Failure handling), with the tail of `.err` as the reason. `protocol` gets the one corrective retry defined there before it becomes a failure. Set `REVIEW_ANVIL_REQUIRE_FINDINGS=1` only for normal reviewer waves; reproduction and adversarial prompts have different output schemas. Reviewer output/prompt files live under `.review-anvil/`; clean them up after the round's synthesis.
+Treat any STATUS other than `ok` as a failed reviewer (see Failure handling), with the tail of `.err` as the reason; do not retry `protocol` or a host timeout. Set `REVIEW_ANVIL_REQUIRE_FINDINGS=1` only for ordinary markdown reviewer output, not the single-pass outer JSON envelope, reproduction or adversarial schemas. Retain all-mode prompts, outputs and candidate inventories in the private archive; scoped reviewer output/prompt files live under `.review-anvil/` until synthesis finishes.
 
 **Host tool timeouts must outlive the wrapper.** Any host Bash call that can block on a reviewer — the background-and-`wait` fallback above, the serial last resort, or an inline replication of the wrapper contract — must set the Bash *tool's* own timeout to at least `reviewer_timeout + 90` seconds (wrapper deadline + 30s TERM→KILL grace + margin). Host defaults are far lower (Claude Code's is 120s) and SIGKILL a healthy wait mid-review; the kill then masquerades as a reviewer failure and silently burns that reviewer's lens coverage. On hosts with background dispatch (`run_in_background`), never block a foreground call on a reviewer at all. If the host caps tool timeouts below `reviewer_timeout + 90`, prefer detached dispatch plus short non-blocking status checks over shrinking the reviewer budget; reducing `reviewer_timeout` is a last resort, floored at 300s and forbidden for >5000-line diffs (their timeout is deliberately doubled).
 
@@ -243,9 +317,44 @@ If parallel dispatch is genuinely impossible (no Agent tool, no background bash)
 
 The `codex-exec` and `claude-exec` skills document the same recipes from the reviewer side; the canonical dispatch lives here.
 
+### 2a. Assess exhaustive local-rule coverage
+
+For new `rule_coverage=all` runs, the **single-pass** integration in §2
+performs one ordinary reviewer cohort with no applicability wave. Follow
+`references/rule-coverage.md`: preserve a real verdict for every frozen
+criterion, signed exact reviewer partitions, complete ordinary reports,
+real violation candidates and unresolved questions. All assigned criteria,
+including global and indirectly affected criteria, require substantive review.
+Path mismatch alone is insufficient for a negative verdict.
+
+Read complete frozen original sources for ambiguity, policy conflicts and
+candidate violations. Their private packet paths are retrieval access, not
+proof they were inspected. Do not require every ordinary reviewer to reread
+every unrelated historical discussion.
+
+Use actual retained normal reports for synthesis and all genuine candidate
+arrays for adjudication. Commit only acknowledged ordinary responses after
+complete phase validation; never synthesize negative rows from routing.
+Obtain fresh PR metadata, seal and independently verify the signed sidecar
+before successful review delivery. Any `not_assessed`, missing response, stale
+target/support or failed phase blocks signed completion and posting. Automatically
+finish an honest partial local report with diagnostics; do not await manual resume.
+
+Explicitly resumed historical full-evidence and criteria-first runs keep their
+original coordinators, archived prompts, assignments and signatures. Never
+convert them or discard saved outputs. Start a new strategy-bound run only
+when the user requests a new review or the verified changed-diff branch permits its single fresh run.
+
 ### 3. Synthesize
 
 When all reviewers return:
+
+For `rule_coverage=all`, include the complete coverage candidate inventory,
+deduplicate it with normal findings, and preserve a disposition for every
+violation candidate. Never turn learned-rule prose directly into an actionable
+finding or silently omit a candidate because another rule raised the same
+root cause. Audit helper-produced completion and candidate accounting before
+the final synthesis; raw evidence stays out of clarity/action-lock rendering.
 
 - **Dedup** on `(file, line, root cause)` when present, else `(area, root cause)`. Keep the highest-severity instance, record which reviewers raised it, and keep divergent anchors as `file_alternates: [...]`. Merge the instances' `context` lists (schema in `references/reviewer-prompt.md`): drop the finding's own anchor and repeats of the same location, keep the first reviewer's order, and keep at most 8 entries. Drop an entry only when you checked it and its location does not exist or does not show what its label says; never invent entries. Record the finding's `revision`: the commit its origin round reviewed — the PR head SHA for a PR target, otherwise `git rev-parse HEAD` at that round's snapshot; leave it unset for an uncommitted working-tree diff.
 - **Group** by severity (`critical` → `nit`), then topic.
@@ -345,7 +454,7 @@ Plausible-but-wrong findings are the dominant failure mode of LLM review, and bo
 - Findings raised independently by **2+ reviewers** and not listed as reproduction candidates may skip batched reproduction; consensus is the signal (this is why dedup records who raised what). Still open enough code/context before destructive action to ensure the fix path is coherent.
 - **Deletions ("delete this"/dead/unused/redundant) require reproduction plus execution when `per_fix` applies the cut** — the highest-blast-radius, highest-false-positive class. In `per_fix`, after reproduction confirms the cut, apply it and run the full test suite: a **red gate means keep it**. A green gate is necessary but not sufficient (it only proves *test-covered* behavior), so the reproduction/skeptic pass must also look for a concrete reason the code must stay, visible in the diff (trust boundary, aliasing copy, ordering, back-compat, dedup, edge semantics — or another specific contract). The two cover different blind spots: the gate catches callers the skeptic can't see; the skeptic catches behavior no test exercises. Block **only** on a red gate or a specific skeptic refutation — not on generic "there might be an unseen caller" (that's what the gate tests). Read-only mode has only the skeptic. Blocked → **Deferred** (`We set this aside because the code is still needed — <what>`).
 - If `reproduction=off`, say so in the round summary and final report. Required reproduction candidates — including single-reviewer `medium`+ findings, deletion/high-risk findings, and orchestrator-uncertain findings — cannot become actionable unless the orchestrator independently reproduces them from code/tests/runtime evidence; otherwise move them to Deferred with `We set this aside because the needed check was not run.`
-- `low`/`nit` findings skip verification: they're below the auto-fix gate and surface as suggestions either way.
+- `low`/`nit` findings remain below the auto-fix gate. Determine required versus suggested work from the source obligation, independently of severity; a low-severity correctness fix can still be required.
 
 Canonical examples for where reproduction helps and where it must stay out of
 the way live in `references/reproduction-examples.md`. After changing this
@@ -592,6 +701,11 @@ relationship. Do not promote incidental fixture values, proof citations,
 process instructions, or requested-work predicates into diagnostic locks.
 Retain those in the existing evidence/source context and requested-work fields.
 
+Freeze `request_mode: required|suggested` for every new active finding from its
+source obligation. Use the same mode for report and inline work. Severity is
+priority, not permission to weaken a required fix or strengthen a preference.
+Retain the source basis and every coupled requested-work clause.
+
 For example, if a later action can produce the same result, a check made only
 after that action does not prove the earlier action worked. Explain that gap
 and retain the source-backed conditions under which the later action can
@@ -608,9 +722,25 @@ safe exact suggestions, helper-only `prior_feedback`, and run details.
 Do not include raw reviewer prose, refuted candidates, superseded plans, or
 repository context.
 
+Assemble the complete pre-clarity source bundle using the same output schema
+as the renderer. Validate it against the frozen packet **before dispatch**:
+
+```bash
+python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" \
+  "$CLARITY_PACKET" "$CLARITY_SOURCE_BUNDLE"
+```
+
+Build each table as one contiguous block: join its header, separator and all
+data rows with single newlines. Use blank lines only between complete blocks,
+never between table lines. A generic double-newline join of individual report
+chunks must not split a table. If source validation fails, retain the source and
+emit a local diagnostic failure report; do not dispatch a renderer, repair with
+another model, publish or label that source as validated.
+Retain each validated source bundle and its exact report/inline bytes.
+
 Read `references/clarity-pass-prompt.md` and dispatch one clean read-only
 renderer under the synthesis-side deadline rule. When using Codex for this
-renderer or for any action-lock auditor/repair pass, apply the lazy resolution
+renderer or for any action-lock auditor, apply the lazy resolution
 rule above and invoke `"$CODEX_BIN" exec -m gpt-6.1-sol -c 'model_reasoning_effort="high"' -c 'shell_environment_policy.inherit="all"'`;
 if the renderer/auditor workdir is not a trusted git repository (for example
 `-C /tmp`), add `--skip-git-repo-check` or run it from the trusted synthesis
@@ -632,22 +762,37 @@ python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" \
 ```
 
 Do not post or approve an unvalidated clarity bundle. On renderer failure,
-timeout, malformed JSON, or validation failure, fall back to the pre-clarity
-report and inline bodies, force the review event to COMMENT, and record the
-reason in Run details.
+timeout, malformed JSON, or validation failure, restore the byte-identical
+validated pre-clarity report and inline bodies, force the review event to
+COMMENT in the approval artifact, and record the reason in delivery diagnostics.
+Do not change the frozen source decision or reconstruct fallback tables.
+Use `--emit-validated "$CLARITY_PACKET" "$CLARITY_SOURCE_BUNDLE"` to select
+the complete exact source bundle; if it fails, deliver a diagnostic-only report.
 
 Each active or disposition report line ends with:
 `<!-- review-anvil-report: id=<complete-id> severity=<severity> area=<area> path=<encoded-path> start_line=<number-or-dash> line=<number-or-dash> disposition=<active|deferred|outside> -->`.
 The renderer uses dashes for missing IDs and locations. No machine metadata or
 code location remains visible in the report.
 
-For a valid bundle, freeze the exact requested-work prose, source fact locks,
-the minimum source context needed to resolve antecedents and
-current-versus-target behavior, and the exact evidence used by either surface.
-Run two independent post-render action-lock auditors from
-`references/action-lock-audit.md` in one parallel wave. Audit every byte-exact
-`report_items[].rendered_body`, `disposition_items[].rendered_body`, and
-complete inline body.
+For a valid bundle, prepare the auditor inputs with the trusted validator,
+not model-authored or ad-hoc row assembly:
+
+```bash
+umask 077
+python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" --audit-rows \
+  "$CLARITY_PACKET" "$CLARITY_SOURCE_BUNDLE" "$CLARITY_BUNDLE" \
+  > "$CLARITY_AUDIT_ROWS"
+```
+
+This command validates both complete bundles against the canonical packet and
+emits only the JSON audit-row array. Feed that unchanged array to two independent
+post-render auditors from `references/action-lock-audit.md` in one parallel wave.
+Each row retains the complete byte-exact same-surface `source_body`, structured
+`source_location`, unchanged source context/fact locks, newline-joined exact
+requested-work clauses and complete `rendered_body`. Do not summarize source
+bodies, invent location predicates or split coupled boundaries into commands.
+Use fresh private artifact paths for the single audit wave and retain its complete
+row array and raw responses. No renderer repair or second audit wave is allowed.
 
 Fact locks are surface-specific:
 
@@ -655,23 +800,25 @@ Fact locks are surface-specific:
   suggested change, even when an inline comment carries the same anchored
   detail.
 - Inline rows keep the complete diagnosis and requested work.
-- Critical/high/medium report and inline rows use required mode.
-- Low/nit report rows and disposition rows use suggestion/boundary mode.
-- Inline anchors remain structural validator fields, not prose fact locks.
+- New report and inline rows use the same explicit source-based `request_mode`.
+- Only legacy packets without that field retain severity-derived modes; disposition rows use boundary mode.
+- Report/disposition `source_location` preserves `path`, `start_line` and `line`,
+  including explicit nulls; inline locations preserve exactly the present anchor
+  keys. Frozen visible report fields remain checked; inline anchors are
+  structural evidence, not prose fact locks.
 
-For each audit row, derive `request_mode` from severity, surface, and
-disposition: `required`, `suggested`, or `boundary`.
+The CLI derives canonical opaque audit IDs and request modes. A missing-ID
+disposition uses private `AUDIT:disposition:<index>`, never a report finding ID.
 
-Validate each auditor's complete per-ID output and combine valid failures from
-either auditor. Repair only surfaces with valid failed verdicts, validate the
-entire repaired bundle again, and run two new clean auditors once. Any
-unverifiable first-wave surface, failed or unverifiable second-wave surface, or
-invalid repaired bundle uses exact-source fallback and forces COMMENT. A
-report-surface fallback restores the complete pre-clarity report; an
-inline-surface fallback restores only that exact source body. For a passed
-rewrite, emit only the byte-identical validated and audited report item or
-inline body. Remove the temporary clarity packet and bundle with the other
-round artifacts.
+Validate each auditor's complete per-ID output once. Retain each complete raw
+returned value using the native transport recipe before validation; never parse
+truncated displays. Any failed or unverifiable audit selects the complete exact
+validated source bundle and forces COMMENT through the existing approval guard.
+Do not repair, regenerate or re-audit. A source-invalid bundle yields only local
+diagnostics and cannot publish. For a passed rewrite, validate the final selected
+bundle and write its report string as exact UTF-8 bytes and its unchanged inline
+bodies; do not trim, rebuild tables or append prose after validation. Retain the
+selected bundle and diagnostic inventories with the local report.
 
 Use the validated bundle only as an intermediate artifact. Write only the
 validated `report_markdown` string to `report_path`, and write only validated
@@ -760,10 +907,9 @@ If `report_path` is set:
 
 ### Failure handling
 
-- A reviewer fails or times out in a requested round → log `<agent>: failed (<reason>)` in the round summary and proceed; no retries except the protocol-only case below. For Bash-dispatched reviewers, failure = wrapper STATUS `timeout`/`empty`/`failed`, reason = tail of `.err`; `protocol` follows the next rule. In an adaptive round, any reviewer failure is an abort before fixes from that round are applied.
-- **Protocol-only corrective retry:** a non-empty response that asks for confirmation, emits only a plan/status update, or otherwise omits the complete fenced findings block is not review output. Bash reviewers surface this as `STATUS=protocol`; detect the same shape directly for Agent-tool reviewers. Re-dispatch that reviewer exactly once on the same snapshot and lens with this prefix: `PROTOCOL RETRY: Begin the already-authorized read-only review immediately. Do not ask for confirmation or present a plan. Return the completed review now and end with the required fenced findings block.` Do not answer the confirmation request and do not count the first attempt as a reviewer result. If the retry also violates the protocol, record the reviewer as failed (`confirmation/plan-only output after corrective retry`) and follow the normal requested/adaptive-round failure rules. This is the only content-level retry; do not retry weak, clean, or merely unstructured reviews.
-- A dispatch call — foreground or background — that dies with exit 143 or ends with **no `STATUS=` line** in its output was killed by the *host tool's* timeout before the wrapper could classify — misconfigured dispatch (see §2 "Host tool timeouts"), not a reviewer failure. Fix the dispatch mode (raise the tool timeout or go detached) and re-dispatch that reviewer exactly once; only a second identical death counts as a failed reviewer.
-- **All** reviewers fail → abort the loop and report. Never carry on with zero findings — that's a misleading clean signal.
+- A reviewer fails, times out, emits malformed/plan-only output or dies before a wrapper status → retain its actual output and failure once. No retry, replacement, protocol correction or repeated same-target wave. Continue independent original jobs when trust/freshness remains valid; abort fixes in a productive adaptive round as before.
+- All reviewers fail → automatically emit a local failure report; never turn missing work into a clean review or wait for a resume instruction.
+- For read-only PRs, use actual-diff observation and cancellation from `references/rule-coverage.md`. Only a verified changed diff permits one fresh run. Metadata-only drift, unknown comparison, failed formatting, missing evidence and failed submission never authorize a new cohort.
 - `git commit` fails (hook, conflict) → surface the error, stop the loop, leave partial fixes in the worktree. Never `--no-verify`, never amend earlier commits.
 - **On any abort, if `report_path` is set, write a failure report to it before stopping** — the usual header block, a `## Failure` section stating what happened and at which round, plus any completed round summaries. Downstream consumers (`review-anvil-improve-pr`'s post-update step) depend on the file existing on every exit path, success or failure. Write `{"event": "COMMENT"}` to `.approval.json` in this case.
 
@@ -796,6 +942,36 @@ During execution: print `Round 2/3: dispatching 2 codex-exec + 1 claude-exec on 
 ### Final report
 
 After the last round, emit a fresh top-level report (a new document, not a replacement for the per-round blocks).
+
+For `rule_coverage=all`, put the trusted helper's coverage summary in collapsed
+review context: strategy, frozen run/target, assessed/total, remaining, verdict
+counts, applicability packet count, ordinary reviewer count and inactive
+exclusions. Separately summarize actual confirmed/dismissed/deferred candidates.
+Only authenticated `completed` coverage with no unassessed rules is exhaustive.
+Incomplete runs write local diagnostics and truthful remaining counts, never
+a postable successful review. Preserve the private signed per-rule sidecar;
+do not publish raw private rules or source discussions.
+
+Keep progress accounting separate from coverage completion. "Validate local
+report artifacts" may complete for a truthful incomplete local report.
+"Determine coverage status" records actual remaining rules/questions.
+"Record signed coverage outcome" completes after recording actual successful
+`coverage-finish` and independent `coverage-check`, or the concrete
+`failed`/`blocked_not_run` outcome when coverage cannot be verified. Recording
+unavailable coverage never means verification succeeded. Deliver the local
+report and finish the checklist in the same invocation; never append or leave
+"Verify signed coverage sidecar" active or blocked after terminal local delivery.
+State **partial/local delivery; review and coverage incomplete** with concrete
+blockers when signed completion is unavailable.
+
+For every all-mode report-path delivery, retain an owner-only bounded sibling
+`<report_path>.delivery.json` using the diagnostic contract in
+`references/rule-coverage.md#audit-seal-and-publish`. It separates local artifact
+delivery from overall review completion and records actual coverage identity,
+counts, signed-verification state and blockers. Preserve any existing
+`blocked-signature-verification.json` diagnostic and link it; neither diagnostic
+is signature or approval authority. Retain these diagnostics through cleanup;
+they do not require an open verification task after terminal local delivery.
 
 `author-resolved` and `author-explanation-accepted` history do not affect the review decision or approval.
 

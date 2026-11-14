@@ -176,6 +176,223 @@ class ClarityOutputValidatorTests(unittest.TestCase):
                 text=True,
             )
 
+    def prepare_audit_rows(self, canonical: dict, source: dict, rendered: dict) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ("canonical.json", "source.json", "rendered.json")]
+            for path, value in zip(paths, (canonical, source, rendered), strict=True):
+                path.write_text(json.dumps(value), encoding="utf-8")
+            return subprocess.run(
+                ["python3", str(VALIDATOR), "--audit-rows", *map(str, paths)],
+                check=False, capture_output=True, text=True,
+            )
+
+    def audit_fixture(self) -> tuple[dict, dict]:
+        canonical = copy.deepcopy(CANONICAL)
+        for finding in canonical["findings"]:
+            finding["source_context"] = "The accepted diagnosis and its original supporting evidence."
+            finding["fact_lock"] = ["The configured entry point uses the old parser."]
+        canonical["findings"][0]["requested_work"] = [
+            "Use the shared parser while keeping the existing exit condition unchanged.",
+            "Add an offline test that exercises the entry point without network access.",
+        ]
+        source = copy.deepcopy(RENDERED)
+        source["predicate_inventory"][0]["requested_work"] = canonical["findings"][0]["requested_work"]
+        return canonical, source
+
+    def test_audit_rows_bind_complete_original_surfaces_and_frozen_locations(self) -> None:
+        canonical, source = self.audit_fixture()
+        rendered = copy.deepcopy(source)
+        original = source["report_items"][0]["rendered_body"]
+        rewritten = original.replace("Use the shared parser and cover the entry point offline.",
+                                     "Use the shared parser while keeping the exit condition unchanged.")
+        rendered["report_items"][0]["rendered_body"] = rewritten
+        rendered["report_markdown"] = rendered["report_markdown"].replace(original, rewritten)
+        result = self.prepare_audit_rows(canonical, source, rendered)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {(row["id"], row["surface"]): row for row in json.loads(result.stdout)}
+        self.assertEqual(set(rows), {
+            ("RAV-RUN2-R1-F003", "report"), ("RAV-RUN2-R1-F003", "inline"),
+            ("RAV-RUN2-R1-F005", "report"), ("RAV-RUN2-R1-F005", "inline"),
+        })
+        report = rows[("RAV-RUN2-R1-F003", "report")]
+        self.assertEqual(report["source_location"], {"path": "every_eval_ever/cli.py", "start_line": None, "line": 383})
+        self.assertEqual(report["source_context"], "The accepted diagnosis and its original supporting evidence.")
+        self.assertEqual(report["source_body"], original)
+        self.assertEqual(report["rendered_body"], rewritten)
+        self.assertEqual(report["source_requested_work"],
+                         "Use the shared parser while keeping the existing exit condition unchanged.\n"
+                         "Add an offline test that exercises the entry point without network access.")
+        self.assertEqual(report["request_mode"], "required")
+        inline = rows[("RAV-RUN2-R1-F005", "inline")]
+        self.assertEqual(inline["source_location"], {
+            "path": "every_eval_ever/converters/alpaca_eval/adapter.py", "start_line": 300,
+            "line": 302, "side": "RIGHT", "start_side": "RIGHT",
+        })
+        self.assertEqual(inline["source_body"], source["inline_comments"][1]["body"])
+
+    def test_audit_preparation_rejects_changed_anchors_or_missing_source_evidence(self) -> None:
+        canonical, source = self.audit_fixture()
+        altered = copy.deepcopy(source)
+        altered["inline_comments"][0]["line"] = 999
+        result = self.prepare_audit_rows(canonical, source, altered)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        canonical["findings"][0].pop("source_context")
+        result = self.prepare_audit_rows(canonical, source, source)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_audit_preparation_preserves_optional_requests_without_promoting_boundaries(self) -> None:
+        canonical, source = self.audit_fixture()
+        canonical["findings"][0]["severity"] = "nit"
+        canonical["inline_min_severity"] = "nit"
+        canonical["findings"][0]["requested_work"] = [
+            "Consider using Container while keeping the wrapper class and key unchanged."
+        ]
+        source["predicate_inventory"][0]["requested_work"] = canonical["findings"][0]["requested_work"]
+        for item in source["report_items"]:
+            if item["id"] == "RAV-RUN2-R1-F003":
+                old = item["rendered_body"]
+                item["rendered_body"] = old.replace("severity=medium", "severity=nit")
+                source["report_markdown"] = source["report_markdown"].replace(old, item["rendered_body"])
+        source["inline_comments"][0]["severity"] = "nit"
+        source["inline_comments"][0]["body"] = source["inline_comments"][0]["body"].replace("severity=medium", "severity=nit")
+        result = self.prepare_audit_rows(canonical, source, source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        report = next(row for row in rows if row["id"] == "RAV-RUN2-R1-F003" and row["surface"] == "report")
+        self.assertEqual(report["request_mode"], "suggested")
+        inline = next(row for row in rows if row["id"] == "RAV-RUN2-R1-F003" and row["surface"] == "inline")
+        self.assertEqual(inline["request_mode"], "suggested")
+        self.assertEqual(report["source_requested_work"],
+                         "Consider using Container while keeping the wrapper class and key unchanged.")
+
+    def test_explicit_request_mode_overrides_severity_on_both_surfaces(self) -> None:
+        canonical, source = self.human_source_bundle()
+        canonical["inline_min_severity"] = "low"
+        for finding, mode in zip(canonical["findings"], ("required", "suggested"), strict=True):
+            finding.update(request_mode=mode, source_context="Accepted source evidence.",
+                           fact_lock=["The accepted diagnosis remains unchanged."])
+        canonical["findings"][0]["severity"] = "low"
+        canonical["findings"][1]["requested_work"] = [
+            "Consider validating populated numeric cells as finite values within their metric rules.",
+            "Consider entering invalid rows in SourceConversionResult.",
+        ]
+        source["predicate_inventory"][1]["requested_work"] = canonical["findings"][1]["requested_work"]
+        first = source["report_items"][0]["rendered_body"]
+        required = first.replace("| Medium |", "| Low |").replace("severity=medium", "severity=low")
+        source["report_items"][0]["rendered_body"] = required
+        source["inline_comments"][0]["severity"] = "low"
+        source["inline_comments"][0]["body"] = source["inline_comments"][0]["body"].replace(
+            "severity=medium", "severity=low")
+        second = source["report_items"][1]["rendered_body"]
+        suggested = second.replace("Validate populated", "Consider validating populated")
+        source["report_items"][1]["rendered_body"] = suggested
+        source["report_markdown"] = source["report_markdown"].replace(
+            first + "\n" + second,
+            required + "\n\n</details>\n\n<details>\n<summary>Optional suggestions</summary>\n\n"
+            "| Severity | Location | Suggestion | Suggested change |\n|---|---|---|---|\n" + suggested,
+        )
+        source["inline_comments"][1]["body"] = source["inline_comments"][1]["body"].replace(
+            "- Validate populated", "- Consider validating populated").replace(
+            "- Enter invalid rows", "- Consider entering invalid rows")
+        self.assertEqual(self.validate(source, canonical).returncode, 0)
+        result = self.prepare_audit_rows(canonical, source, source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {(row["id"], row["surface"]): row for row in json.loads(result.stdout)}
+        for surface in ("report", "inline"):
+            self.assertEqual(rows[("RAV-RUN2-R1-F003", surface)]["request_mode"], "required")
+            self.assertEqual(rows[("RAV-RUN2-R1-F005", surface)]["request_mode"], "suggested")
+            self.assertEqual(rows[("RAV-RUN2-R1-F005", surface)]["source_requested_work"],
+                             "Consider validating populated numeric cells as finite values within their metric rules.\n"
+                             "Consider entering invalid rows in SourceConversionResult.")
+        misplaced = copy.deepcopy(source)
+        misplaced["report_markdown"] = misplaced["report_markdown"].replace(
+            "<summary>Issues and fixes</summary>", "<summary>Optional suggestions</summary>", 1)
+        self.assertNotEqual(self.validate(misplaced, canonical).returncode, 0)
+
+    def test_invalid_explicit_request_modes_fail_before_audit_output(self) -> None:
+        for mode in ("optional", "boundary", "", None, False, [], {}):
+            with self.subTest(mode=mode):
+                canonical, source = self.audit_fixture()
+                canonical["findings"][0]["request_mode"] = mode
+                result = self.prepare_audit_rows(canonical, source, source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("invalid request_mode", result.stderr)
+
+    def test_emit_validated_preserves_exact_source_bytes_without_reformatting(self) -> None:
+        canonical, source = self.human_source_bundle()
+        # Non-default serialization and Unicode expose a serialize-after-validation fallback.
+        source["report_markdown"] = source["report_markdown"].replace("still need changes", "still need changes — unchanged")
+        payload = ("\n" + json.dumps(source, ensure_ascii=False, indent=3) + "\n\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            packet = Path(directory) / "canonical.json"
+            bundle = Path(directory) / "source.json"
+            packet.write_text(json.dumps(canonical), encoding="utf-8")
+            bundle.write_bytes(payload)
+            result = subprocess.run(
+                ["python3", str(VALIDATOR), "--emit-validated", str(packet), str(bundle)],
+                check=False, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, payload)
+            emitted = json.loads(result.stdout)
+            self.assertEqual(emitted["report_markdown"], source["report_markdown"])
+            self.assertEqual(emitted["inline_comments"], source["inline_comments"])
+            invalid_sources = [
+                payload.replace(b"<summary>Issues and fixes</summary>", b"<summary>Invented issues</summary>"),
+                payload.replace(b"disposition=active", b"disposition=invented"),
+                b"not JSON",
+            ]
+            for invalid in invalid_sources:
+                with self.subTest(invalid=invalid[:40]):
+                    bundle.write_bytes(invalid)
+                    rejected = subprocess.run(
+                        ["python3", str(VALIDATOR), "--emit-validated", str(packet), str(bundle)],
+                        check=False, capture_output=True,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertEqual(rejected.stdout, b"")
+
+    def test_unidentified_disposition_has_private_audit_identity_and_no_author_work(self) -> None:
+        canonical, source = self.human_source_bundle()
+        for finding in canonical["findings"]:
+            finding.update(source_context="Accepted original evidence.", fact_lock=[])
+        deferred = {"severity": "medium", "area": "runtime",
+                    "text": "Runtime behavior remains unconfirmed.", "reason": "No attributable baseline record exists."}
+        canonical["set_aside"] = [deferred]
+        source["metadata_inventory"]["set_aside"] = [deferred]
+        body = ("- Runtime behavior remains unconfirmed. No attributable baseline record exists. "
+                "<!-- review-anvil-report: id=- severity=medium area=runtime "
+                "path=- start_line=- line=- disposition=deferred -->")
+        source["disposition_items"] = [{"id": None, "rendered_body": body}]
+        source["report_markdown"] = source["report_markdown"].replace(
+            "<details>\n<summary>Review context</summary>",
+            "<details>\n<summary>Set aside</summary>\n\n" + body + "\n\n</details>\n\n"
+            "<details>\n<summary>Review context</summary>",
+        )
+        result = self.prepare_audit_rows(canonical, source, source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = next(item for item in json.loads(result.stdout) if item["request_mode"] == "boundary")
+        self.assertEqual(row["id"], "AUDIT:disposition:0")
+        self.assertEqual(row["source_requested_work"], "")
+        self.assertEqual(row["source_location"], {"path": None, "start_line": None, "line": None})
+        self.assertEqual(row["source_fact_lock"], [
+            "Runtime behavior remains unconfirmed.", "No attributable baseline record exists.",
+        ])
+        self.assertNotIn("AUDIT:disposition:0", source["report_markdown"])
+        deferred.update(
+            source_context="Runtime behavior remains unconfirmed. No attributable baseline record exists.",
+            fact_lock=["No attributable baseline record exists."],
+        )
+        result = self.prepare_audit_rows(canonical, source, source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = next(item for item in json.loads(result.stdout) if item["request_mode"] == "boundary")
+        self.assertEqual(row["source_context"],
+                         "Runtime behavior remains unconfirmed. No attributable baseline record exists.")
+        self.assertEqual(row["source_fact_lock"], ["No attributable baseline record exists."])
+
     def assert_rejected(self, rendered: dict, diagnostic: str) -> None:
         result = self.validate(rendered)
         self.assertNotEqual(result.returncode, 0)
@@ -473,6 +690,139 @@ class ClarityOutputValidatorTests(unittest.TestCase):
             "inline_comments": [],
             "predicate_inventory": [],
         }
+        result = self.validate(rendered, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def human_source_bundle(self) -> tuple[dict, dict]:
+        canonical = copy.deepcopy(CANONICAL)
+        canonical["report_style"] = "human-summary"
+        rendered = copy.deepcopy(RENDERED)
+        rows = [
+            "| Medium | `every_eval_ever/cli.py:383` | The entry point uses the old parser. | "
+            "Use the shared parser and add one offline test. "
+            "<!-- review-anvil-report: id=RAV-RUN2-R1-F003 severity=medium "
+            "area=cli path=every_eval_ever%2Fcli.py start_line=- line=383 disposition=active --> |",
+            "| Medium | `every_eval_ever/converters/alpaca_eval/adapter.py:300-302` | "
+            "Invalid metrics bypass row handling. | Validate populated numeric cells and record invalid rows. "
+            "<!-- review-anvil-report: id=RAV-RUN2-R1-F005 severity=medium "
+            "area=input-validation path=every_eval_ever%2Fconverters%2Falpaca_eval%2Fadapter.py "
+            "start_line=300 line=302 disposition=active --> |",
+        ]
+        rendered["report_items"] = [
+            {"id": "RAV-RUN2-R1-F003", "rendered_body": rows[0]},
+            {"id": "RAV-RUN2-R1-F005", "rendered_body": rows[1]},
+        ]
+        rendered["disposition_items"] = []
+        table = "\n".join(["| Severity | Location | Issue | Suggested change |", "|---|---|---|---|", *rows])
+        rendered["report_markdown"] = (
+            "The parser and numeric conversion still need changes.\n\n"
+            "<details>\n<summary>Issues and fixes</summary>\n\n"
+            + table + "\n\n</details>\n\n"
+            "<details>\n<summary>Review context</summary>\n\n"
+            "Two conversion problems remain.\nPublication is unsafe until both are fixed.\n"
+            "CLI and metric conversion.\nTwo concerns checked.\noff\n\n</details>\n\n"
+            "_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._"
+        )
+        return canonical, rendered
+
+    def test_source_report_tables_reject_blank_line_chunk_joining(self) -> None:
+        canonical, source = self.human_source_bundle()
+        result = self.validate(source, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for boundary in (
+            "| Suggested change |\n|---|",
+            "|---|---|---|---|\n| Medium",
+            "disposition=active --> |\n| Medium",
+        ):
+            broken = copy.deepcopy(source)
+            broken["report_markdown"] = broken["report_markdown"].replace(
+                boundary, boundary.replace("\n", "\n\n"), 1
+            )
+            with self.subTest(boundary=boundary):
+                self.assertNotEqual(self.validate(broken, canonical).returncode, 0)
+
+    def test_human_source_preserves_active_finding_history_without_duplicating_rows(self) -> None:
+        canonical, source = self.human_source_bundle()
+        earlier = {"id": "RAV-RUN2-R1-F003", "status": "still-open",
+                   "text": "The parser defect remains.", "url": "https://example.invalid/parser"}
+        canonical["earlier_feedback"] = [earlier]
+        source["metadata_inventory"]["earlier_feedback"] = [earlier]
+        source["report_markdown"] = source["report_markdown"].replace(
+            "<details>\n<summary>Review context</summary>",
+            "<details>\n<summary>Earlier feedback</summary>\n\n"
+            "- **still-open** — The parser defect remains. https://example.invalid/parser "
+            "(`RAV-RUN2-R1-F003`)\n\n</details>\n\n"
+            "<details>\n<summary>Review context</summary>",
+        )
+        result = self.validate(source, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_disposition_also_accounted_for_in_history(self) -> None:
+        canonical, source = self.human_source_bundle()
+        deferred = {"id": "RAV-RUN1-R1-F009", "severity": "low", "area": "runtime",
+                    "text": "Runtime concern.", "reason": "No reproducible case."}
+        earlier = {"id": deferred["id"], "status": "reported", "text": "Runtime concern was reported."}
+        canonical["report_ids"].append(deferred["id"])
+        canonical["earlier_feedback"] = [earlier]
+        canonical["set_aside"] = [deferred]
+        source["metadata_inventory"]["earlier_feedback"] = [earlier]
+        source["metadata_inventory"]["set_aside"] = [deferred]
+        body = ("- Runtime concern stays deferred: no reproducible case. "
+                "<!-- review-anvil-report: id=RAV-RUN1-R1-F009 severity=low "
+                "area=runtime path=- start_line=- line=- disposition=deferred -->")
+        source["disposition_items"] = [{"id": deferred["id"], "rendered_body": body}]
+        source["report_markdown"] = source["report_markdown"].replace(
+            "<details>\n<summary>Review context</summary>",
+            "<details>\n<summary>Earlier feedback</summary>\n\n"
+            "- **reported** — Runtime concern was reported. (`RAV-RUN1-R1-F009`)\n\n</details>\n\n"
+            "<details>\n<summary>Set aside</summary>\n\n" + body + "\n\n</details>\n\n"
+            "<details>\n<summary>Review context</summary>",
+        )
+        result = self.validate(source, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def history_overlap_bundle(self) -> tuple[dict, dict]:
+        canonical = copy.deepcopy(CANONICAL)
+        earlier = {
+            "id": "RAV-RUN2-R1-F003",
+            "status": "still-open",
+            "text": "The earlier parser defect is still present.",
+            "url": "https://example.invalid/parser",
+        }
+        canonical["earlier_feedback"] = [earlier]
+        rendered = copy.deepcopy(RENDERED)
+        rendered["metadata_inventory"]["earlier_feedback"] = [earlier]
+        rendered["report_markdown"] += (
+            "\n- **still-open** — The earlier parser defect is still present. "
+            "https://example.invalid/parser (`RAV-RUN2-R1-F003`)\n"
+        )
+        return canonical, rendered
+
+    def test_accepts_active_finding_also_accounted_for_in_history(self) -> None:
+        canonical, rendered = self.history_overlap_bundle()
+        result = self.validate(rendered, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_history_overlap_does_not_allow_duplicate_active_or_history_rows(self) -> None:
+        canonical, rendered = self.history_overlap_bundle()
+        for extra in (
+            rendered["report_items"][0]["rendered_body"],
+            "- **still-open** — The earlier parser defect is still present. "
+            "https://example.invalid/parser (`RAV-RUN2-R1-F003`)",
+        ):
+            duplicate = copy.deepcopy(rendered)
+            duplicate["report_markdown"] += "\n" + extra + "\n"
+            with self.subTest(extra=extra):
+                self.assertNotEqual(self.validate(duplicate, canonical).returncode, 0)
+
+    def test_history_overlap_still_requires_every_history_only_identity(self) -> None:
+        canonical, rendered = self.history_overlap_bundle()
+        earlier = {"id": "RAV-RUN1-R1-F009", "status": "fixed", "text": "Earlier issue fixed."}
+        canonical["earlier_feedback"].append(earlier)
+        rendered["metadata_inventory"]["earlier_feedback"].append(copy.deepcopy(earlier))
+        rendered["report_markdown"] += "\n- **fixed** — Earlier issue fixed. (`RAV-RUN1-R1-F009`)\n"
+        self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+        canonical["report_ids"].append(earlier["id"])
         result = self.validate(rendered, canonical)
         self.assertEqual(result.returncode, 0, result.stderr)
 

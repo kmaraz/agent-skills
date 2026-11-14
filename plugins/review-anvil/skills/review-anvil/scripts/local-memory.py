@@ -10,7 +10,7 @@ import stat
 import sys
 
 from memory_github import GitHubError, collect_feedback, read_policy, resolve_pull_request, resolve_repository
-from memory_store import MemoryError, MemoryStore
+from memory_store import MemoryError, MemoryStore, _repository
 
 MAX_INPUT = 32 * 1024 * 1024
 
@@ -26,20 +26,30 @@ def read_json(path):
     return json.loads(data)
 
 
-def output(value, path=None):
+def output(value, path=None, summary=None):
     encoded = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
     if path:
         # Never follow symlinks or overwrite an earlier run snapshot.
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(encoded)
-        print(json.dumps({"output": str(Path(path).absolute())}))
+        print(json.dumps(summary if summary is not None else {"output": str(Path(path).absolute())}))
     else:
         print(encoded, end="")
 
 
 def repository_key(repository):
-    return repository["host"] + "/" + repository["name"]
+    return _repository(repository["host"] + "/" + repository["name"])
+
+
+def coverage_backend(repository, run_id):
+    """Select only after authenticating persisted strategy, never unsigned input."""
+    from memory_coverage import RuleCoverage
+    legacy = RuleCoverage(repository)
+    if legacy.status(run_id).get("assessment_strategy") in ("criteria-first", "single-pass"):
+        from memory_criteria import CriteriaCoverage
+        return CriteriaCoverage(repository)
+    return legacy
 
 
 def prepare_feedback(locator):
@@ -118,6 +128,37 @@ def parser():
     rules_apply.add_argument("--output", required=True)
     rules_inspect = sub.add_parser("rules-inspect", help="Inspect saved local rules and historical migration provenance")
     rules_inspect.add_argument("repository")
+    coverage_start = sub.add_parser("coverage-start", help="Freeze all supported rules for exhaustive PR coverage")
+    coverage_start.add_argument("--prepared", required=True)
+    for name in ("coverage-next", "coverage-status", "coverage-finish",
+                 "coverage-reserve", "coverage-outstanding", "coverage-criteria",
+                 "coverage-assign", "coverage-evidence", "coverage-commit"):
+        command = sub.add_parser(name, help="Assess or inspect an authenticated all-rule coverage run")
+        command.add_argument("repository")
+        command.add_argument("--run-id", required=True)
+        if name not in {"coverage-status", "coverage-commit"}:
+            command.add_argument("--output", required=True)
+        if name == "coverage-reserve":
+            command.add_argument("--workers", type=int, choices=range(1, 5), default=4)
+        elif name == "coverage-criteria":
+            command.add_argument("--context", required=True)
+        elif name == "coverage-assign":
+            command.add_argument("--reviewers", nargs="+", required=True)
+            command.add_argument("--context", help="Bind complete frozen context before direct assignment")
+    criteria_record = sub.add_parser("coverage-criteria-record", help="Record explicit per-criterion applicability")
+    criteria_record.add_argument("--packet", required=True)
+    criteria_record.add_argument("--results", required=True)
+    review_record = sub.add_parser("coverage-review-record", help="Record an assigned ordinary review and its assessments")
+    review_record.add_argument("--assignment", required=True)
+    review_record.add_argument("--response", required=True)
+    coverage_record = sub.add_parser("coverage-record", help="Save exact per-rule verdicts for an issued batch")
+    coverage_record.add_argument("--batch", required=True)
+    coverage_record.add_argument("--results", required=True)
+    coverage_check = sub.add_parser("coverage-check", help="Verify complete coverage and the current PR before publication")
+    coverage_check.add_argument("--report", required=True)
+    coverage_check.add_argument("--repository")
+    coverage_check.add_argument("--number", type=int)
+    coverage_check.add_argument("--head-sha")
     seed_start = sub.add_parser("seed-start", help="Start or resume a compact sequential PR seed run")
     seed_start.add_argument("repository")
     seed_start.add_argument("--seeds", nargs="+", required=True)
@@ -190,6 +231,114 @@ def main(argv=None):
             output(store.record_run(snapshot, read_json(args.dispositions)))
         elif args.command == "verify-target":
             output(verify_target(read_json(args.prepared), read_json(args.snapshot)))
+        elif args.command.startswith("coverage-"):
+            from memory_coverage import RuleCoverage
+            if args.command == "coverage-start":
+                from memory_criteria import CriteriaCoverage
+                prepared = read_json(args.prepared)
+                coverage = CriteriaCoverage(repository_key(prepared["packet"]["repository"]))
+                value = coverage.start_single_pass(prepared)
+            elif args.command == "coverage-criteria-record":
+                from memory_criteria import CriteriaCoverage
+                packet = read_json(args.packet)
+                coverage = CriteriaCoverage(packet["repository"])
+                if coverage.status(packet.get("run_id")).get("assessment_strategy") == "single-pass":
+                    raise MemoryError("Single-pass protocol does not accept applicability responses")
+                value = coverage.record_applicability(packet, read_json(args.results))
+            elif args.command == "coverage-review-record":
+                from memory_criteria import CriteriaCoverage
+                assignment = read_json(args.assignment)
+                coverage = CriteriaCoverage(assignment["repository"])
+                value = coverage.record_review(assignment, read_json(args.response))
+            elif args.command == "coverage-record":
+                batch = read_json(args.batch)
+                coverage = RuleCoverage(batch["repository"])
+                value = coverage.record(batch, read_json(args.results))
+            elif args.command == "coverage-check":
+                report = read_json(args.report)
+                coverage = RuleCoverage(report["repository"])
+                # Authenticate before trusting report-provided network locators.
+                value = coverage.verify_report(report)
+                coverage = coverage_backend(coverage.repository, report["run_id"])
+                if ((args.repository and coverage.repository != _repository(args.repository))
+                        or (args.number is not None and report["target"]["number"] != args.number)
+                        or (args.head_sha and report["target"]["head_sha"] != args.head_sha)):
+                    raise MemoryError("Coverage report belongs to another repository or PR revision")
+                current = collect_feedback(report["target"]["url"])
+                if (repository_key(current["repository"]) != coverage.repository
+                        or current["repository"]["id"] != report["repository_id"]):
+                    raise MemoryError("Coverage repository numeric identity changed")
+                value = coverage.verify_report(report, current["pr"])
+            else:
+                if args.command != "coverage-finish" and "://" not in args.repository and args.repository.count("/") == 2:
+                    # Scheduling authenticates the existing local numeric identity.
+                    # It never initializes missing memory or needs remote discovery.
+                    coverage = coverage_backend(args.repository, args.run_id)
+                else:
+                    locator = args.repository
+                    if "://" not in locator and locator.count("/") == 2:
+                        locator = "https://" + locator
+                    repo = resolve_repository(locator)
+                    coverage = coverage_backend(repository_key(repo), args.run_id)
+                    coverage.init(repo["id"])
+                strategy = coverage.status(args.run_id).get("assessment_strategy")
+                if args.command in {"coverage-criteria", "coverage-assign", "coverage-evidence", "coverage-commit"}:
+                    if strategy not in ("criteria-first", "single-pass"):
+                        raise MemoryError("Phase commands require an authenticated phase-managed run")
+                    if args.command == "coverage-criteria":
+                        if strategy == "single-pass":
+                            raise MemoryError("Single-pass protocol has no applicability stage")
+                        coverage.bind_context(args.run_id, read_json(args.context))
+                        packets = coverage.applicability_packets(args.run_id)
+                        payload, count = {"packets": packets}, len(packets)
+                    elif args.command == "coverage-assign":
+                        if args.context is not None:
+                            coverage.bind_context(args.run_id, read_json(args.context))
+                        assignments = coverage.assign(args.run_id, args.reviewers)
+                        payload, count = {"assignments": assignments}, len(assignments)
+                    elif args.command == "coverage-evidence":
+                        packets = coverage.evidence_packets(args.run_id)
+                        payload, count = {"packets": packets}, len(packets)
+                    else:
+                        output(coverage.commit(args.run_id))
+                        return 0
+                    summary = coverage.status(args.run_id)
+                    summary.update(output=str(Path(args.output).absolute()), artifact_count=count)
+                    output(payload, args.output, summary=summary)
+                    return 0
+                if strategy in ("criteria-first", "single-pass") and args.command in {"coverage-next", "coverage-reserve", "coverage-outstanding"}:
+                    raise MemoryError("Phase-managed runs use assigned ordinary reviewers, not legacy coverage workers")
+                if args.command == "coverage-next":
+                    value = coverage.next(args.run_id)
+                    if value["status"] == "ready":
+                        summary = {key: value[key] for key in
+                                   ("repository", "run_id", "batch_index", "status")}
+                        summary["output"] = str(Path(args.output).absolute())
+                        output(value, args.output, summary=summary)
+                        return 0
+                elif args.command in {"coverage-reserve", "coverage-outstanding"}:
+                    value = (coverage.reserve(args.run_id, args.workers)
+                             if args.command == "coverage-reserve"
+                             else coverage.outstanding(args.run_id))
+                    summary = {key: item for key, item in value.items() if key != "batches"}
+                    summary["batch_indices"] = [batch["batch_index"] for batch in value["batches"]]
+                    summary["output"] = str(Path(args.output).absolute())
+                    output(value, args.output, summary=summary)
+                    return 0
+                elif args.command == "coverage-finish":
+                    status = coverage.status(args.run_id)
+                    current = collect_feedback(status["target"]["url"])
+                    if (repository_key(current["repository"]) != coverage.repository
+                            or current["repository"]["id"] != repo["id"]):
+                        raise MemoryError("Coverage repository numeric identity changed")
+                    report = coverage.finish(args.run_id, current["pr"])
+                    value = coverage.status(args.run_id)
+                    value["output"] = str(Path(args.output).absolute())
+                    output(report, args.output, summary=value)
+                    return 0
+                else:
+                    value = coverage.status(args.run_id)
+            output(value)
         elif args.command.startswith("seed-"):
             from memory_seed import SeedRuns, parse_selectors
             repo = resolve_repository(args.repository)

@@ -245,6 +245,67 @@ activated or reconciled remotely. Existing proposal PRs are left untouched.
 See the [local rules contract](plugins/review-anvil/skills/review-anvil/references/rule-promotion.md)
 for assessment JSON, source provenance and local storage.
 
+#### Exhaustive local rule coverage
+
+The default `rule_coverage: scoped` uses the bounded scoped snapshot above.
+To explicitly consider every supported saved rule, including deciding whether
+off-path criteria apply, use:
+
+```text
+/skill:review-anvil-pr owner/repo#123, post: false, rules: off, rule_coverage: all, coverage_workers: 4
+```
+
+`rules: off` isolates saved-rule use from generating new criteria; it does
+not disable coverage. `memory: off` cannot be combined with exhaustive coverage.
+New all-mode runs use **single-pass** coverage: every supported saved rule is
+assigned directly to exactly one of the actual ordinary reviewers. Complete,
+unchanged rule objects and the response schema are inlined before each complete
+ordinary task and lens. No rule is filtered for path mismatch, and there is no
+applicability-model stage or extra coverage reviewer cohort.
+
+Reviewers return explicit indexed verdict groups; each group's evidence must
+genuinely establish the verdict for every listed rule, including its exceptions.
+Original discussions and supporting observations remain frozen and accessible.
+Read complete originals for ambiguity, source/policy conflicts or possible
+violations, rather than rereading all histories automatically.
+`coverage_workers: 1`–`4` (default `4`) caps simultaneous ordinary reviewers,
+not their total count or lenses. Historical criteria-first runs retain their
+routing-only worker cap. Storage `batch_count` is not a worker count.
+
+Every supported rule receives a determinate verdict or an explicit open
+question. Violations enter normal synthesis, verification and adversarial
+review; learned prose never overrides manual policy or establishes a defect by
+itself. Only authenticated, complete coverage can pass the publication gate.
+See the [exhaustive coverage protocol](plugins/review-anvil/skills/review-anvil/references/rule-coverage.md).
+
+The private phase ledger binds direct signed reviewer assignments,
+actual normal review reports, verdicts and genuine violation packets to the
+same frozen run. Each original reviewer task is issued at most once; malformed,
+missing, rejected or failed output never triggers replacement. Independent
+original jobs continue when trust/freshness permits. Accepted results remain
+immutable, and all returned candidate/report inventories remain available for
+adjudication. Missing evidence stays `not_assessed`; partial coverage cannot seal
+or publish. The workflow automatically delivers an honest local partial/failure
+report without a manual resume step.
+
+Actual-diff checkpoints compare complete patches, paths, modes and binary
+content. A verified changed diff supersedes current work, requests cancellation
+and permits one fresh ordinary run; metadata/SHA-only drift does not. There is
+no continuous watcher during a blocking native wait. New starts never adopt a
+matching incomplete archive. Historical full-evidence/criteria-first signatures
+and recovery protocols remain intact.
+
+Clarity uses one renderer and one audit wave, with exact validated-source fallback
+and no repair/re-audit. Required versus optional work follows source obligation,
+independently of severity. Publication makes one review submission; failed or
+unknown delivery retains local artifacts without resending or weaker fallback.
+Fresh identity, metadata, signed coverage and no-post gates remain mandatory.
+Use a fresh OMP session after updating installed Python code.
+
+`post: false` independently forbids remote mutation, even with complete coverage.
+No fixed runtime or speedup is promised: fewer worker dispatches alone do not
+establish lower latency or less substantive assessment.
+
 
 
 #### Repository-specific review rules

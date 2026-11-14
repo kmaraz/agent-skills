@@ -113,6 +113,16 @@ def load_object(path: str, label: str) -> dict[str, Any]:
     return value
 
 
+def finding_request_mode(finding: dict[str, Any]) -> str:
+    if "request_mode" in finding:
+        mode = finding["request_mode"]
+        if mode not in ("required", "suggested"):
+            raise InvalidBundle(f"{finding.get('id')} invalid request_mode {mode!r}")
+        return mode
+    # Stored canonical packets predate explicit source-based obligation modes.
+    return "suggested" if finding.get("severity") in {"low", "nit"} else "required"
+
+
 def indexed_findings(canonical: dict[str, Any]) -> dict[str, dict[str, Any]]:
     findings = canonical.get("findings")
     if not isinstance(findings, list):
@@ -126,6 +136,7 @@ def indexed_findings(canonical: dict[str, Any]) -> dict[str, dict[str, Any]]:
             raise InvalidBundle(f"invalid canonical finding id {finding_id}")
         if finding_id in indexed:
             raise InvalidBundle(f"duplicate canonical finding {finding_id}")
+        finding_request_mode(finding)
         indexed[finding_id] = finding
     return indexed
 
@@ -195,27 +206,27 @@ def report_id_inventory(
     disposition_ids = {
         item.get("id") for item in structured_dispositions(canonical) if item.get("id")
     }
-    extra_ids = set(report_ids) - set(findings)
-    if extra_ids != history_ids | disposition_ids:
+    expected_ids = set(findings) | history_ids | disposition_ids
+    if set(report_ids) != expected_ids:
         raise InvalidBundle(
             "report_ids do not match identified history and dispositions"
         )
     return set(report_ids)
 
 
-def validate_report(report: Any, expected_ids: set[str]) -> None:
+def validate_report(report: Any, expected_counts: dict[str, int]) -> None:
     if not isinstance(report, str):
         raise InvalidBundle("report_markdown must be a string")
     report_ids = REPORT_ID_RE.findall(report)
     for finding_id in report_ids:
-        if finding_id not in expected_ids:
+        if finding_id not in expected_counts:
             raise InvalidBundle(f"unknown report finding {finding_id}")
     counts = Counter(report_ids)
     for finding_id, count in counts.items():
-        if count > 1:
+        if count != expected_counts[finding_id]:
             raise InvalidBundle(f"report finding {finding_id} appears {count} times")
-    if set(report_ids) != expected_ids:
-        missing = sorted(expected_ids - set(report_ids))
+    if set(report_ids) != set(expected_counts):
+        missing = sorted(set(expected_counts) - set(report_ids))
         raise InvalidBundle(
             "report finding inventory mismatch; missing " + ", ".join(missing)
         )
@@ -315,11 +326,11 @@ def validate_human_report_envelope(
     dispositions = structured_dispositions(canonical)
     expected_sections = {
         "Issues and fixes": any(
-            finding.get("severity") not in {"low", "nit"}
+            finding_request_mode(finding) == "required"
             for finding in findings.values()
         ),
         "Optional suggestions": any(
-            finding.get("severity") in {"low", "nit"}
+            finding_request_mode(finding) == "suggested"
             for finding in findings.values()
         ),
         "Earlier feedback": bool(canonical.get("earlier_feedback")),
@@ -345,7 +356,7 @@ def validate_human_report_envelope(
             continue
         label = (
             "Optional suggestions"
-            if finding.get("severity") in {"low", "nit"}
+            if finding_request_mode(finding) == "suggested"
             else "Issues and fixes"
         )
         rows_by_section[label].append(item.get("rendered_body"))
@@ -631,8 +642,19 @@ def validate(canonical: dict[str, Any], rendered: dict[str, Any]) -> None:
             f"decision changed from {expected_decision} to {actual_decision}"
         )
     report = rendered.get("report_markdown")
+    if not isinstance(report, str):
+        raise InvalidBundle("report_markdown must be a string")
     validate_metadata(canonical, rendered, report)
-    validate_report(report, expected_report_ids)
+    # An identity has one finding/disposition surface and may also have its
+    # exact earlier-feedback surface. Repetition within either role stays invalid.
+    expected_counts = dict.fromkeys(expected_report_ids, 1)
+    surfaced_ids = set(findings) | {
+        item.get("id") for item in structured_dispositions(canonical) if item.get("id")
+    }
+    for item in canonical.get("earlier_feedback") or []:
+        if item.get("id") in surfaced_ids:
+            expected_counts[item["id"]] = 2
+    validate_report(report, expected_counts)
     validate_report_items(report, rendered, findings, human_style)
     validate_disposition_items(report, rendered, canonical, human_style)
     if human_style:
@@ -645,19 +667,114 @@ def validate(canonical: dict[str, Any], rendered: dict[str, Any]) -> None:
     validate_predicates(rendered, findings)
 
 
+def prepare_action_audit_rows(
+    canonical: dict[str, Any], source: dict[str, Any], rendered: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Conserve frozen source evidence; semantic verdicts still belong to auditors."""
+    validate(canonical, source)
+    validate(canonical, rendered)
+    findings = indexed_findings(canonical)
+    rows: list[dict[str, Any]] = []
+
+    def text(value: Any, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidBundle(f"audit preparation requires {label}")
+        return value
+
+    def row(finding_id: str, surface: str, finding: dict[str, Any],
+            source_body: str, rendered_body: str, disposition: bool = False) -> dict[str, Any]:
+        if disposition:
+            disposition_facts = [text(finding.get(key), key) for key in ("text", "reason")]
+            context = text(finding.get("source_context", "\n".join(disposition_facts)), "source_context")
+            facts = finding.get("fact_lock", disposition_facts)
+            work, mode = finding.get("requested_work", []), "boundary"
+        else:
+            context = text(finding.get("source_context"), "source_context")
+            facts, work = finding.get("fact_lock"), finding.get("requested_work")
+            mode = finding_request_mode(finding)
+        for values, label in ((facts, "fact_lock"), (work, "requested_work")):
+            if not isinstance(values, list):
+                raise InvalidBundle(f"audit preparation requires {label} array")
+            for value in values:
+                text(value, label)
+        location = ({key: finding[key] for key in ANCHOR_KEYS if key in finding}
+                    if surface == "inline" else {
+                        "path": finding.get("report_path"),
+                        "start_line": finding.get("report_start_line"),
+                        "line": finding.get("report_line"),
+                    })
+        return {
+            "id": finding_id, "surface": surface, "request_mode": mode,
+            "source_context": context, "source_fact_lock": list(facts),
+            "source_requested_work": "\n".join(work), "source_location": location,
+            "source_body": source_body, "rendered_body": rendered_body,
+        }
+
+    source_reports = {item["id"]: item["rendered_body"] for item in source["report_items"]}
+    for item in rendered["report_items"]:
+        finding_id = item["id"]
+        rows.append(row(finding_id, "report", findings[finding_id],
+                        source_reports[finding_id], item["rendered_body"]))
+    source_inline = {marker_from_body(item["body"]).group("id"): item["body"]
+                     for item in source["inline_comments"]}
+    for item in rendered["inline_comments"]:
+        finding_id = marker_from_body(item["body"]).group("id")
+        rows.append(row(finding_id, "inline", findings[finding_id],
+                        source_inline[finding_id], item["body"]))
+    dispositions = structured_dispositions(canonical)
+    if dispositions:
+        if canonical.get("report_style") != "human-summary":
+            raise InvalidBundle("audit dispositions require validated human-summary surfaces")
+        for index, (finding, original, item) in enumerate(zip(
+                dispositions, source["disposition_items"], rendered["disposition_items"], strict=True)):
+            finding_id = finding.get("id") or f"AUDIT:disposition:{index}"
+            rows.append(row(finding_id, "report", finding,
+                            original["rendered_body"], item["rendered_body"], disposition=True))
+    return rows
+
+def validated_source_bytes(canonical: dict[str, Any], path: str) -> bytes:
+    """Validate and return the same bytes, without a formatting fallback rewrite."""
+    try:
+        payload = Path(path).read_bytes()
+        source = json.loads(payload)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise InvalidBundle(f"cannot read source bundle: {error}") from error
+    if not isinstance(source, dict):
+        raise InvalidBundle("source bundle must be a JSON object")
+    validate(canonical, source)
+    return payload
+
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
+    audit = len(argv) > 1 and argv[1] == "--audit-rows"
+    emit = len(argv) > 1 and argv[1] == "--emit-validated"
+    if len(argv) != (5 if audit else 4 if emit else 3):
         print(
-            "usage: validate-clarity-output.py <canonical.json> <rendered.json>",
+            "usage: validate-clarity-output.py <canonical.json> <rendered.json>\n"
+            "       validate-clarity-output.py --audit-rows <canonical.json> <source.json> <rendered.json>\n"
+            "       validate-clarity-output.py --emit-validated <canonical.json> <source.json>",
             file=sys.stderr,
         )
         return 2
     try:
-        validate(load_object(argv[1], "canonical packet"), load_object(argv[2], "rendered bundle"))
+        if emit:
+            payload = validated_source_bytes(load_object(argv[2], "canonical packet"), argv[3])
+            sys.stdout.buffer.write(payload)
+        elif audit:
+            rows = prepare_action_audit_rows(
+                load_object(argv[2], "canonical packet"),
+                load_object(argv[3], "source bundle"),
+                load_object(argv[4], "rendered bundle"),
+            )
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+        else:
+            validate(load_object(argv[1], "canonical packet"), load_object(argv[2], "rendered bundle"))
     except InvalidBundle as error:
         print(f"clarity-output: {error}", file=sys.stderr)
         return 1
-    print("clarity-output: valid")
+    if not audit and not emit:
+        print("clarity-output: valid")
     return 0
 
 

@@ -294,3 +294,49 @@ def collect_feedback(locator, cwd=None):
         },
         "sources": sources,
     }
+
+
+def read_pull_target(locator, cwd=None):
+    """Read one complete target projection, without checkpointing feedback."""
+    repository, number = resolve_pull_request(locator, cwd=cwd)
+    host, name = repository["host"], repository["name"]
+    endpoint = f"repos/{name}/pulls/{number}"
+    pr = _object(github_api(host, endpoint), "pull request")
+    head, base = _revision(pr, number)
+    base_repo = _object(_object(pr.get("base"), "base").get("repo"), "base repository")
+    head_repo = _object(_object(pr.get("head"), "head").get("repo"), "head repository")
+    if base_repo.get("id") != repository["id"] or base_repo.get("full_name") != name:
+        raise GitHubError("Pull request base repository identity changed")
+    if type(head_repo.get("id")) is not int or head_repo["id"] <= 0:
+        raise GitHubError("Pull request head repository identity is unavailable")
+    head_name = _name(head_repo.get("full_name"))
+    files = _array(github_api(host, f"{endpoint}/files?per_page=100", paginate=True), "PR files")
+    if type(pr.get("changed_files")) is not int or pr["changed_files"] != len(files):
+        raise GitHubError("Complete changed-file inventory is unavailable")
+    paths = []
+    for item in files:
+        for key in ("filename", "previous_filename"):
+            if key == "filename" or key in item:
+                value = _path(item.get(key))
+                if value not in paths:
+                    paths.append(value)
+    labels = pr.get("labels", [])
+    if not isinstance(labels, list) or any(not isinstance(item, dict) or not isinstance(item.get("name"), str) for item in labels):
+        raise GitHubError("Malformed PR labels")
+    closing = _object(github_api(host, endpoint), "closing pull request")
+    closing_head = _object(_object(closing.get("head"), "head").get("repo"), "head repository")
+    closing_base = _object(_object(closing.get("base"), "base").get("repo"), "base repository")
+    if (_revision(closing, number) != (head, base)
+            or any(closing.get(key) != pr.get(key) for key in ("title", "body", "html_url", "labels", "changed_files"))
+            or any(current.get(key) != original.get(key)
+                   for current, original in ((closing_head, head_repo), (closing_base, base_repo))
+                   for key in ("id", "full_name"))):
+        raise GitHubError("Pull request target moved during file collection")
+    return {
+        "schema_version": 1, "repository": repository,
+        "head_repository": {"host": host, "name": head_name, "id": head_repo["id"]},
+        "target": {"number": number, "head_sha": head, "base_sha": base,
+                   "title": pr.get("title", ""), "body": pr.get("body") or "",
+                   "url": pr.get("html_url"), "files": paths},
+        "labels": sorted(item["name"] for item in labels),
+    }
