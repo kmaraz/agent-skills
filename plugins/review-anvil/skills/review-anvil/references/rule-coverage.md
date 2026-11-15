@@ -126,7 +126,11 @@ Use a fresh OMP session after installed engine changes; do not mix cached old Py
 Use this Python recipe for the existing single clarity renderer and one
 two-auditor wave, in persistent Eval cells with **`timeout: 0`**.
 Do not retry a failed renderer/auditor, repair, or dispatch a second audit wave.
-Prepare `finalization_requests` from the stage's trusted prompt/schema, with
+For the renderer, load the trusted `validate-clarity-output.py --renderer-schema`
+output described in the engine's Final clarity pass and pass it unchanged as
+`request["schema"]`. Never invent native renderer schemas or use object-valued
+`const`/`enum`. Keep the auditor contracts unchanged.
+Prepare `finalization_requests` from the stage's trusted prompt and schema, with
 unique private artifact basenames: one renderer or two independent auditors.
 Create the finalization root with `tempfile.mkdtemp(prefix="anvil-finalization-")`
 or use an existing exclusively owned `0700` root. `_Directory` is for this

@@ -743,13 +743,24 @@ not this renderer input or its public `run_details`.
 Do not include raw reviewer prose, refuted candidates, superseded plans, or
 repository context.
 
-Assemble the complete pre-clarity source bundle using the same output schema
-as the renderer. Validate it against the frozen packet **before dispatch**:
+Build the initial source draft with its summary, complete finding/disposition
+tables, inline bodies, predicate inventory and footer. Construct required frozen
+context exactly once with the trusted helper, before retaining the validated
+source or dispatching the renderer:
 
 ```bash
-python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" \
-  "$CLARITY_PACKET" "$CLARITY_SOURCE_BUNDLE"
+python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" --assemble-source \
+  "$CLARITY_PACKET" "$CLARITY_SOURCE_DRAFT" > "$CLARITY_SOURCE_BUNDLE"
 ```
+
+The helper shares the validator's visible-metadata projection. It inserts exact
+scope, checks and author-relevant limitations into Review context and exact
+history lines into Earlier feedback, without duplicating present values or
+changing findings/inline bodies. The draft may omit `metadata_inventory`; the
+helper constructs it from the frozen packet. Supplied inventory must still match.
+The helper emits a source only after full validation. Check its exit status.
+Never use assembly to repair an already frozen source, renderer output or
+fallback; subsequent validation and `--emit-validated` remain read-only.
 
 Build each table as one contiguous block: join its header, separator and all
 data rows with single newlines. Use blank lines only between complete blocks,
@@ -758,6 +769,21 @@ chunks must not split a table. If source validation fails, retain the source and
 emit a local diagnostic failure report; do not dispatch a renderer, repair with
 another model, publish or label that source as validated.
 Retain each validated source bundle and its exact report/inline bytes.
+
+For native OMP rendering, obtain the transport schema from the trusted helper:
+
+```bash
+python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" --renderer-schema \
+  "$CLARITY_PACKET" "$CLARITY_SOURCE_BUNDLE" > "$CLARITY_RENDERER_SCHEMA"
+```
+
+Require exit 0, load this JSON file, and pass it unchanged as the renderer's
+`request["schema"]` in the native transport recipe. Do not construct a schema
+ad hoc, freeze whole objects with `const`/`enum`, or use unconstrained objects.
+The helper preserves source field sets and nested/heterogeneous item types;
+empty source arrays stay empty. Exact values, order, identities and anchors
+remain enforced by the existing validator, not provider-specific value locks.
+Keep one renderer attempt and the existing exact-source fallback/COMMENT.
 
 Read `references/clarity-pass-prompt.md` and dispatch one clean read-only
 renderer under the synthesis-side deadline rule. When using Codex for this

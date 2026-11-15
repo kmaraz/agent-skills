@@ -299,9 +299,17 @@ no continuous watcher during a blocking native wait. New starts never adopt a
 matching incomplete archive. Historical full-evidence/criteria-first signatures
 and recovery protocols remain intact.
 
-Clarity uses one renderer and one audit wave, with exact validated-source fallback
-and no repair/re-audit. Required versus optional work follows source obligation,
-independently of severity. Publish every useful line/file-anchored finding as its
+Initial source assembly deterministically inserts required frozen scope, checks,
+author-relevant limitations and prior-feedback lines using the validator's
+shared metadata projection. It preserves finding/inline bodies and validates
+before emitting the source; it never repairs frozen source or renderer output.
+Native rendering loads its typed transport schema from the same trusted helper,
+using validated source field sets rather than model-authored object constants.
+Exact values still pass the original validator; schema compatibility does not
+replace frozen-metadata or finding checks.
+Clarity then uses one renderer and one audit wave, with exact validated-source
+fallback and no repair/re-audit. Required versus optional work follows source
+obligation, independently of severity. Publish every useful line/file-anchored finding as its
 own review comment, including optional low/nit suggestions; keep only unanchored
 details in the main body and preserve complete local evidence. Internal knowledge
 counts, signatures and orchestration diagnostics stay local.

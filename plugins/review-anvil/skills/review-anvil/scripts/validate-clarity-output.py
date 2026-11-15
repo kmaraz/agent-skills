@@ -242,21 +242,34 @@ def earlier_feedback_line(item: dict[str, Any]) -> str:
         line += f' (`{item["id"]}`)'
     return line
 
+def visible_metadata(canonical: dict[str, Any]) -> dict[str, list[str]]:
+    """Project only metadata that the report must show, shared with assembly."""
+    return {
+        "Review context": [
+            value for value in (
+                canonical.get("scope"),
+                canonical.get("checks"),
+                *(item for item in (canonical.get("set_aside") or []) if isinstance(item, str)),
+                *(item for item in (canonical.get("outside_scope") or []) if isinstance(item, str)),
+                *(canonical.get("run_details") or []),
+            ) if value
+        ],
+        "Earlier feedback": [
+            earlier_feedback_line(item) for item in (canonical.get("earlier_feedback") or [])
+        ],
+    }
+
+
 def validate_metadata(
     canonical: dict[str, Any], rendered: dict[str, Any], report: str
 ) -> None:
     expected = {field: canonical.get(field) for field in METADATA_FIELDS}
     if rendered.get("metadata_inventory") != expected:
         raise InvalidBundle("metadata inventory changed")
-    visible_values = [
-        expected["scope"],
-        expected["checks"],
-        *(item.get("text") for item in (expected["earlier_feedback"] or [])),
-        *(item for item in (expected["set_aside"] or []) if isinstance(item, str)),
-        *(item for item in (expected["outside_scope"] or []) if isinstance(item, str)),
-        *(expected["run_details"] or []),
+    missing = [
+        value for values in visible_metadata(expected).values()
+        for value in values if value not in report
     ]
-    missing = [value for value in visible_values if value and value not in report]
     if missing:
         raise InvalidBundle(f"report omits frozen metadata: {missing[0]}")
     for item in expected["earlier_feedback"] or []:
@@ -769,6 +782,65 @@ def prepare_action_audit_rows(
                             original["rendered_body"], item["rendered_body"], disposition=True))
     return rows
 
+def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
+    """Construct initial frozen context; never repair renderer or fallback output."""
+    if canonical.get("report_style") != "human-summary":
+        raise InvalidBundle("source assembly requires human-summary")
+    source = dict(draft)
+    source.setdefault("metadata_inventory", {field: canonical.get(field) for field in METADATA_FIELDS})
+    report = source.get("report_markdown")
+    if not isinstance(report, str):
+        raise InvalidBundle("report_markdown must be a string")
+    if REVIEW_FOOTER not in report:
+        raise InvalidBundle("review footer is missing")
+    for label, values in visible_metadata(canonical).items():
+        blocks = compact_details_blocks(report)
+        missing = list(dict.fromkeys(value for value in values if value not in report))
+        if label in blocks:
+            if not missing:
+                continue
+            block = next(match for match in COMPACT_DETAILS_RE.finditer(report)
+                         if match.group(1) == label)
+            end = block.end(2)
+            report = report[:end] + "\n\n" + "\n\n".join(missing) + report[end:]
+        elif values or label == "Review context":
+            section = f"<details>\n<summary>{label}</summary>\n\n" + "\n\n".join(missing) + "\n\n</details>"
+            report = report.replace(REVIEW_FOOTER, section + "\n\n" + REVIEW_FOOTER, 1)
+    source["report_markdown"] = report
+    validate(canonical, source)
+    return source
+
+
+def renderer_schema(canonical: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """Describe validated source types, never freeze object values in provider schemas."""
+    validate(canonical, source)
+
+    def shape(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return {
+                "type": "object",
+                "properties": {key: shape(item) for key, item in value.items()},
+                "required": list(value),
+                "additionalProperties": False,
+            }
+        if isinstance(value, list):
+            if not value:
+                return {"type": "array", "items": {"type": "null"}, "maxItems": 0}
+            variants = []
+            for item in value:
+                variant = shape(item)
+                if variant not in variants:
+                    variants.append(variant)
+            return {"type": "array", "items": variants[0] if len(variants) == 1 else {"anyOf": variants}}
+        types = {str: "string", bool: "boolean", int: "integer", float: "number", type(None): "null"}
+        kind = types.get(type(value))
+        if kind is None:
+            raise InvalidBundle("renderer source contains a non-JSON value")
+        return {"type": kind}
+
+    return shape(source)
+
+
 def validated_source_bytes(canonical: dict[str, Any], path: str) -> bytes:
     """Validate and return the same bytes, without a formatting fallback rewrite."""
     try:
@@ -786,16 +858,26 @@ def validated_source_bytes(canonical: dict[str, Any], path: str) -> bytes:
 def main(argv: list[str]) -> int:
     audit = len(argv) > 1 and argv[1] == "--audit-rows"
     emit = len(argv) > 1 and argv[1] == "--emit-validated"
-    if len(argv) != (5 if audit else 4 if emit else 3):
+    assemble = len(argv) > 1 and argv[1] == "--assemble-source"
+    schema = len(argv) > 1 and argv[1] == "--renderer-schema"
+    if len(argv) != (5 if audit else 4 if emit or assemble or schema else 3):
         print(
             "usage: validate-clarity-output.py <canonical.json> <rendered.json>\n"
             "       validate-clarity-output.py --audit-rows <canonical.json> <source.json> <rendered.json>\n"
-            "       validate-clarity-output.py --emit-validated <canonical.json> <source.json>",
+            "       validate-clarity-output.py --emit-validated <canonical.json> <source.json>\n"
+            "       validate-clarity-output.py --assemble-source <canonical.json> <draft.json>\n"
+            "       validate-clarity-output.py --renderer-schema <canonical.json> <source.json>",
             file=sys.stderr,
         )
         return 2
     try:
-        if emit:
+        if schema:
+            contract = renderer_schema(load_object(argv[2], "canonical packet"), load_object(argv[3], "source bundle"))
+            print(json.dumps(contract, ensure_ascii=False, indent=2))
+        elif assemble:
+            source = assemble_source(load_object(argv[2], "canonical packet"), load_object(argv[3], "source draft"))
+            print(json.dumps(source, ensure_ascii=False, indent=2))
+        elif emit:
             payload = validated_source_bytes(load_object(argv[2], "canonical packet"), argv[3])
             sys.stdout.buffer.write(payload)
         elif audit:
@@ -810,7 +892,7 @@ def main(argv: list[str]) -> int:
     except InvalidBundle as error:
         print(f"clarity-output: {error}", file=sys.stderr)
         return 1
-    if not audit and not emit:
+    if not audit and not emit and not assemble and not schema:
         print("clarity-output: valid")
     return 0
 

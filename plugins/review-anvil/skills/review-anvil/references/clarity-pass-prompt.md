@@ -101,6 +101,12 @@ omit vague statements that an internal assessment or question remains incomplete
 
 Return one JSON object and no surrounding prose or Markdown fence:
 
+Native OMP dispatch uses the trusted `validate-clarity-output.py --renderer-schema`
+projection of the validated source. Preserve its object field sets, including
+nested metadata and optional anchor/suggestion fields. The transport schema
+constrains types; the existing validator separately checks exact frozen values.
+Do not add fields or reconstruct missing metadata.
+
 ```json
 {
   "decision": "APPROVE | COMMENT",

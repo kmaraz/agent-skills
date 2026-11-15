@@ -175,6 +175,26 @@ class ClarityOutputValidatorTests(unittest.TestCase):
                 text=True,
             )
 
+    def assemble_source(self, canonical: dict, draft: dict) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ("canonical.json", "draft.json")]
+            for path, value in zip(paths, (canonical, draft), strict=True):
+                path.write_text(json.dumps(value), encoding="utf-8")
+            return subprocess.run(
+                ["python3", str(VALIDATOR), "--assemble-source", *map(str, paths)],
+                check=False, capture_output=True, text=True,
+            )
+
+    def renderer_schema(self, canonical: dict, source: dict) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ("canonical.json", "source.json")]
+            for path, value in zip(paths, (canonical, source), strict=True):
+                path.write_text(json.dumps(value), encoding="utf-8")
+            return subprocess.run(
+                ["python3", str(VALIDATOR), "--renderer-schema", *map(str, paths)],
+                check=False, capture_output=True, text=True,
+            )
+
     def prepare_audit_rows(self, canonical: dict, source: dict, rendered: dict) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             paths = [Path(directory) / name for name in ("canonical.json", "source.json", "rendered.json")]
@@ -720,6 +740,183 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         )
         return canonical, rendered
 
+    def test_source_assembly_includes_exact_frozen_context_without_changing_findings(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        canonical["run_details"] = ["Mobile rendering was not verified in a browser.", "Unicode boundary — unchanged."]
+        canonical["second_check"] = "Private second-check outcome."
+        start = draft["report_markdown"].index("<details>\n<summary>Review context</summary>")
+        end = draft["report_markdown"].index("</details>", start) + len("</details>")
+        draft["report_markdown"] = draft["report_markdown"][:start] + draft["report_markdown"][end:]
+        draft.pop("metadata_inventory")
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source = json.loads(result.stdout)
+        self.assertEqual(self.validate(source, canonical).returncode, 0)
+        report = source["report_markdown"]
+        for text in ("CLI and metric conversion.", "Two concerns checked.",
+                     "Mobile rendering was not verified in a browser.", "Unicode boundary — unchanged."):
+            self.assertEqual(report.count(text), 1)
+        for field in ("decision_reason", "result", "second_check"):
+            self.assertNotIn(canonical[field], report)
+        self.assertEqual(
+            {key: value for key, value in source.items() if key not in {"report_markdown", "metadata_inventory"}},
+            {key: value for key, value in draft.items() if key != "report_markdown"},
+        )
+
+    def test_source_assembly_extends_existing_context_without_duplicate_metadata(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        canonical["run_details"] = ["Two concerns checked.", "The browser check was not run."]
+        draft["metadata_inventory"]["run_details"] = canonical["run_details"]
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source = json.loads(result.stdout)
+        self.assertEqual(source["report_markdown"].count("<summary>Review context</summary>"), 1)
+        self.assertEqual(source["report_markdown"].count("Two concerns checked."), 1)
+        self.assertEqual(source["report_markdown"].count("The browser check was not run."), 1)
+        unchanged = self.assemble_source(canonical, source)
+        self.assertEqual(unchanged.returncode, 0, unchanged.stderr)
+        self.assertEqual(json.loads(unchanged.stdout), source)
+
+    def test_source_assembly_places_exact_prior_feedback_in_its_own_section(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        canonical["earlier_feedback"] = [{
+            "id": "RAV-RUN2-R1-F003", "status": "still-open",
+            "text": "The parser defect remains.", "url": "https://example.invalid/parser",
+        }]
+        draft.pop("metadata_inventory")
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)["report_markdown"]
+        expected = ("- **still-open** — The parser defect remains. https://example.invalid/parser "
+                    "(`RAV-RUN2-R1-F003`)")
+        self.assertEqual(report.splitlines().count(expected), 1)
+        self.assertIn("<summary>Earlier feedback</summary>\n\n" + expected, report)
+
+    def test_source_assembly_cannot_hide_invalid_decision_findings_or_inventory(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        mutations = [
+            ("decision", "APPROVE"),
+            ("inline_comments", []),
+            ("metadata_inventory", {}),
+            ("report_markdown", draft["report_markdown"].replace("|---|---|---|---|\n", "|---|---|---|---|\n\n")),
+        ]
+        for field, value in mutations:
+            with self.subTest(field=field):
+                broken = copy.deepcopy(draft)
+                broken[field] = value
+                result = self.assemble_source(canonical, broken)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_assembled_source_remains_exact_fallback_when_renderer_drops_limitation(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        canonical["run_details"] = ["Mobile rendering was not verified in a browser."]
+        draft["metadata_inventory"]["run_details"] = canonical["run_details"]
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source = json.loads(result.stdout)
+        rendered = copy.deepcopy(source)
+        rendered["report_markdown"] = rendered["report_markdown"].replace(canonical["run_details"][0], "")
+        self.assertNotEqual(self.validate(rendered, canonical).returncode, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            packet, bundle = (Path(directory) / name for name in ("canonical.json", "source.json"))
+            packet.write_text(json.dumps(canonical), encoding="utf-8")
+            bundle.write_bytes(result.stdout.encode("utf-8"))
+            fallback = subprocess.run(
+                ["python3", str(VALIDATOR), "--emit-validated", str(packet), str(bundle)],
+                check=False, capture_output=True,
+            )
+            self.assertEqual(fallback.returncode, 0, fallback.stderr)
+            self.assertEqual(fallback.stdout, result.stdout.encode("utf-8"))
+
+    def test_renderer_schema_preserves_nested_metadata_and_distinct_file_line_shapes(self) -> None:
+        canonical, draft = self.file_comment_bundle(explicit=True)
+        canonical["earlier_feedback"] = [{
+            "id": "RAV-RUN2-R1-F003", "status": "still-open",
+            "text": "The parser defect remains.", "url": "https://example.invalid/parser",
+            "evidence": {"revision": 42, "accepted": True, "ratio": 1.5, "note": None,
+                         "flags": [True, "author"]},
+        }]
+        draft.pop("metadata_inventory")
+        assembled = self.assemble_source(canonical, draft)
+        self.assertEqual(assembled.returncode, 0, assembled.stderr)
+        source = json.loads(assembled.stdout)
+        result = self.renderer_schema(canonical, source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        schema = json.loads(result.stdout)
+        self.assertEqual(schema["type"], "object")
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["required"]), set(source))
+        metadata = schema["properties"]["metadata_inventory"]
+        self.assertEqual(metadata["type"], "object")
+        self.assertNotIn("const", metadata)
+        evidence = metadata["properties"]["earlier_feedback"]["items"]["properties"]["evidence"]
+        self.assertEqual(evidence, {
+            "type": "object", "additionalProperties": False,
+            "required": ["revision", "accepted", "ratio", "note", "flags"],
+            "properties": {
+                "revision": {"type": "integer"}, "accepted": {"type": "boolean"},
+                "ratio": {"type": "number"}, "note": {"type": "null"},
+                "flags": {"type": "array", "items": {"anyOf": [
+                    {"type": "boolean"}, {"type": "string"},
+                ]}},
+            },
+        })
+        anchors = schema["properties"]["inline_comments"]["items"]["anyOf"]
+        self.assertEqual([set(item["required"]) for item in anchors], [
+            {"path", "severity", "body", "subject_type"},
+            {"path", "start_line", "line", "side", "start_side", "severity", "body", "suggestion"},
+        ])
+        self.assertTrue(all(not item["additionalProperties"] for item in anchors))
+        self.assertEqual(anchors[1]["properties"]["line"], {"type": "integer"})
+        self.assertNotIn("The parser defect remains.", result.stdout)
+        self.assertNotIn(source["report_markdown"], result.stdout)
+
+    def test_renderer_schema_supports_empty_review_without_untyped_objects(self) -> None:
+        canonical = {
+            "report_style": "human-summary", "decision": "APPROVE", "report_ids": [],
+            "decision_reason": "No restriction.", "result": "No findings.",
+            "scope": "Configuration formatting.", "checks": "Static inspection.",
+            "second_check": "No challenges.", "earlier_feedback": [], "set_aside": [],
+            "outside_scope": [], "run_details": [], "findings": [],
+        }
+        draft = {
+            "decision": "APPROVE", "report_items": [], "disposition_items": [],
+            "inline_comments": [], "predicate_inventory": [],
+            "report_markdown": "No material issue was identified.\n\n"
+                               "_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._",
+        }
+        assembled = self.assemble_source(canonical, draft)
+        self.assertEqual(assembled.returncode, 0, assembled.stderr)
+        result = self.renderer_schema(canonical, json.loads(assembled.stdout))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        schema = json.loads(result.stdout)
+        self.assertEqual(schema["properties"]["report_items"], {
+            "type": "array", "items": {"type": "null"}, "maxItems": 0,
+        })
+        self.assertEqual(schema["properties"]["report_markdown"], {"type": "string"})
+
+    def test_renderer_schema_never_certifies_value_changes_or_invalid_source(self) -> None:
+        canonical, source = self.human_source_bundle()
+        valid = self.renderer_schema(canonical, source)
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        for mutation in ("decision", "metadata", "anchor", "work"):
+            with self.subTest(mutation=mutation):
+                changed = copy.deepcopy(source)
+                if mutation == "decision":
+                    changed["decision"] = "APPROVE"
+                elif mutation == "metadata":
+                    changed["metadata_inventory"]["scope"] = "Another scope."
+                elif mutation == "anchor":
+                    changed["inline_comments"][0]["path"] = "another.py"
+                else:
+                    changed["predicate_inventory"][0]["requested_work"] = ["Skip the fix."]
+                self.assertNotEqual(self.validate(changed, canonical).returncode, 0)
+                rejected = self.renderer_schema(canonical, changed)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected.stdout, "")
+
+
     def test_private_metadata_need_not_appear_in_source_or_rendered_report(self) -> None:
         canonical, source = self.human_source_bundle()
         for field in ("decision_reason", "result", "second_check"):
@@ -1028,7 +1225,6 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         )
         result = self.validate(rendered, canonical)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("earlier-feedback line changed", result.stderr)
 
     def test_rejects_swapped_earlier_feedback_statuses(self) -> None:
         canonical = copy.deepcopy(CANONICAL)
@@ -1058,7 +1254,6 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         )
         result = self.validate(rendered, canonical)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("earlier-feedback line changed", result.stderr)
 
     def test_anchored_nit_cannot_be_omitted_with_higher_severity_findings(self) -> None:
         canonical, rendered = self.nit_comment_bundle()
