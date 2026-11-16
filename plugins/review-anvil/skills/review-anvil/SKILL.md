@@ -255,6 +255,14 @@ cells use `timeout: 0`; start/wait stays on the Eval thread. Python `write`,
 Persist the complete schema-parsed `.wait()` value before displaying counts;
 neither `read(agent://...)` nor printed/output display text is machine transport.
 
+Before freezing each new OMP worker prompt, require its final result to be
+submitted through the model-visible native `yield` tool **directly**, including
+ordinary reviewers, reproduction, adversaries, renderer and action auditors.
+Eval may prepare data, but `tool.yield`/`getattr(tool, 'yield')` inside Eval only
+returns a nested tool result; it does not complete the native task. Printed
+JSON, files and assistant prose are not substitutes. Keep archived prompts
+unchanged and preserve the existing contracts on other hosts.
+
 An explicit Codex/Claude mix still requests those real backends: resolve their
 CLIs and fail with the missing prerequisite rather than relabel native tasks.
 Do not perform Codex lazy resolution for a native dispatch. Other hosts retain

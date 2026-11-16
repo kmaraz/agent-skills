@@ -6,6 +6,8 @@ Return exactly the inline schema's envelope. review_markdown is your actual full
 
 candidates_json is a JSON STRING encoding the actual complete candidate array, preserving arbitrary nested fields. Exactly one genuine candidate per violated canonical rule_id is required, with an original supported source_url and actionable finding evidence. Candidates use rule_id, never an index. Use the string "[]" only for genuinely no criterion violations. Candidates supplement and never erase ordinary findings.
 
+On OMP, submit the complete envelope using the model-visible native yield tool DIRECTLY. Eval may prepare the data, but never invoke tool.yield or getattr(tool, 'yield') inside Eval: a nested "Result submitted" does not complete the native task. Printed JSON, files and assistant prose do not replace native submission. Other hosts keep their existing result-submission mechanism.
+
 BEGIN INDEXED CRITERIA JSON
 {criteria_json}
 END INDEXED CRITERIA JSON

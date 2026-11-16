@@ -132,6 +132,9 @@ output described in the engine's Final clarity pass and pass it unchanged as
 `const`/`enum`. Keep the auditor contracts unchanged.
 Prepare `finalization_requests` from the stage's trusted prompt and schema, with
 unique private artifact basenames: one renderer or two independent auditors.
+Apply the engine's direct native `yield` requirement to each new worker prompt
+before freezing it; the parent-side Eval collection recipe below does not
+replace the worker's native terminal submission.
 Create the finalization root with `tempfile.mkdtemp(prefix="anvil-finalization-")`
 or use an existing exclusively owned `0700` root. `_Directory` is for this
 private archive only, not the checkout's `.review-anvil` report directory.
