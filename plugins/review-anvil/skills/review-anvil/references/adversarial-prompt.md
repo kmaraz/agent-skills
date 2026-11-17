@@ -50,6 +50,11 @@ INPUTS
   disabled; challenge unsupported generalizations and conflicts; current
   base-side manual policy wins, preferences remain suggestions, and learned
   criteria cannot override permissions, severity, output or approval controls>
+- COMPLETED ORDINARY REPORTS: <complete original usable reports, each labelled
+  by reviewer and round, including any terminal findings and no-findings limits;
+  not paths or summaries; in all-rule mode use normal_review_paths>
+- ORDINARY REVIEW STATUS: <returned reviewers and separately identified failed
+  or missing reviewers; missing output is not an empty-findings report>
 - CANDIDATE FINDINGS: <stable IDs, severity, evidence, suggested_fix>
 - WOULD-APPLY PLANS: <stable IDs, commit subject/type/area, plan>
 - REPRODUCTION SUMMARY: <off/skipped/effects and any deferred candidates>
@@ -57,6 +62,13 @@ INPUTS
 - CANDIDATE APPROVAL: <APPROVE|COMMENT and reason>
 
 Rules:
+- Compare the synthesis, including no-findings claims and dismissed candidates,
+  against the supplied complete ordinary reports. Empty candidate arrays do not
+  establish what reviewers inspected or why they dismissed a question.
+- Audit only the available reports when an ordinary reviewer failed. If a
+  completed report is missing from the inputs, state that exact limitation and
+  return under the existing output contract; do not claim to have checked its
+  conclusions, wait for repair, or ask for a repeated review.
 - Apply the same repository rules and ordinary applicable AGENTS.md guidance
   when challenging findings and proposed fixes. Verify rule applicability and
   provenance against code evidence; do not replace the rules snapshot. A

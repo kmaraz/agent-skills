@@ -498,6 +498,17 @@ When `report_path` is set, write follow-ups once, after the final round, to `<re
 When `adversarial` is not `off`, run a bounded post-synthesis gate after
 dedup/reproduction and before writing the final report artifacts. Read
 `references/adversarial-prompt.md` before dispatching adversarial reviewers.
+Before constructing any adversary request, collect every usable ordinary
+report from the completed reviewer wave, including a wave ended by failure
+or deadline. In all-rule mode use `normal_review_paths`, not only acknowledged
+knowledge responses. Inline each complete original report, including its
+terminal findings block when present and no-findings limitations, labelled by reviewer and
+round. Supply this identical frozen report set to every adversary on initial
+dispatch; paths, counts, empty candidate arrays and synthesis summaries are
+not substitutes. List failed/missing ordinary reviewers separately. Do not
+send reports only after an adversary has returned or redispatch it to repair
+the handoff. Missing inputs follow existing adversary failure handling.
+
 Dispatch every adversary of the selected mode in parallel — one message,
 multiple background tool calls, exactly like §2 reviewers, under the
 Concurrency section's deadline rule — and synthesize verdicts when all return
