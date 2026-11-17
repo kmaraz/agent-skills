@@ -209,6 +209,94 @@ print(json.dumps(responses[endpoint]))
         self.run_cli("rules-plan", "--context", str(self.root/"unused"), success=False)
         self.assertFalse((self.root/"gh-calls.jsonl").exists())
 
+    def test_private_import_then_snapshot_keeps_foreign_provenance_and_get_only_transport(self):
+        source = LocalRules(fixture.REPOSITORY, self.root / "memory")
+        context = source.prepare(fixture.base())
+        saved = source.apply(context, fixture.assessment(context))
+        responses = json.loads(self.env["GH_FIXTURES"])
+        responses["repos/acme/service"] = {"id": 43, "full_name": "acme/service", "default_branch": "main"}
+        self.env["GH_FIXTURES"] = json.dumps(responses)
+        manifest = self.root / "selection.json"
+        manifest.write_text(json.dumps([{"rule_id": saved["rules"][0]["id"], "paths": ["src/**"],
+                                         "reason": "Explicit target adoption of a portable convention."}]))
+        donor_before = {path.name: path.read_bytes() for path in source.directory.iterdir() if path.is_file()}
+        imported_path = self.root / "imported.json"
+        self.run_cli("rules-import", "acme/service", "--from", "acme/widgets",
+                     "--selection", str(manifest), "--output", str(imported_path))
+        self.assertTrue(json.loads(imported_path.read_text())["imports"])
+        self.assertEqual({path.name: path.read_bytes() for path in source.directory.iterdir() if path.is_file()}, donor_before)
+        snapshot_path = self.root / "imported-snapshot.json"
+        self.run_cli("snapshot", "--repository", "acme/service", "--revision", "c" * 40,
+                     "--files", "src/service.ts", "--output", str(snapshot_path))
+        snapshot = json.loads(snapshot_path.read_text())
+        self.assertEqual(snapshot["repository"], "github.com/acme/service")
+        self.assertEqual(snapshot["local_rules"]["rules"][0]["source_urls"],
+                         [fixture.packet()["sources"][0]["url"]])
+        target = MemoryStore("github.com/acme/service", self.root / "memory")
+        target.verify_snapshot(snapshot)
+        self.assertEqual(snapshot["local_rules"]["rules"][0]["paths"], ["src/**"])
+        outside_path = self.root / "outside-snapshot.json"
+        self.run_cli("snapshot", "--repository", "acme/service", "--revision", "c" * 40,
+                     "--files", "docs/guide.md", "--output", str(outside_path))
+        self.assertEqual(json.loads(outside_path.read_text())["local_rules"]["rules"], [])
+        calls = [json.loads(line) for line in (self.root / "gh-calls.jsonl").read_text().splitlines()]
+        self.assertTrue(all(call[call.index("--method") + 1] == "GET" for call in calls))
+
+    def test_private_import_rejects_bad_inputs_without_overwriting_either_store(self):
+        source = LocalRules(fixture.REPOSITORY, self.root / "memory")
+        context = source.prepare(fixture.base())
+        saved = source.apply(context, fixture.assessment(context))
+        target = LocalRules("github.com/acme/service", self.root / "memory")
+        target.init(43)
+        responses = json.loads(self.env["GH_FIXTURES"])
+        responses["repos/acme/service"] = {"id": 43, "full_name": "acme/service"}
+        responses["repos/acme/uninitialized"] = {"id": 44, "full_name": "acme/uninitialized"}
+        self.env["GH_FIXTURES"] = json.dumps(responses)
+        valid = {"rule_id": saved["rules"][0]["id"], "paths": ["src/**"], "reason": "Portable convention."}
+        manifest = self.root / "selection.json"
+        artifact = self.root / "import-result.json"
+        artifact.write_text("preserve existing output")
+
+        def contents():
+            return {str(path.relative_to(self.root / "memory")): path.read_bytes()
+                    for path in (self.root / "memory").rglob("*") if path.is_file()}
+
+        before = contents()
+        for selection in ({}, [valid, valid], [{**valid, "extra": True}],
+                          [{**valid, "rule_id": "rule-" + "0" * 24}],
+                          [{**valid, "paths": ["../escape"]}], [{**valid, "reason": ""}]):
+            with self.subTest(selection=selection):
+                manifest.write_text(json.dumps(selection))
+                self.run_cli("rules-import", "acme/service", "--from", "acme/widgets",
+                             "--selection", str(manifest), "--output", str(artifact), success=False)
+                self.assertEqual(contents(), before)
+                self.assertEqual(artifact.read_text(), "preserve existing output")
+        manifest.write_text("{")
+        self.run_cli("rules-import", "acme/service", "--from", "acme/widgets",
+                     "--selection", str(manifest), success=False)
+        self.assertEqual(contents(), before)
+        manifest.unlink()
+        manifest.symlink_to(artifact)
+        self.run_cli("rules-import", "acme/service", "--from", "acme/widgets",
+                     "--selection", str(manifest), success=False)
+        self.assertEqual(contents(), before)
+        manifest.unlink()
+        manifest.write_text(json.dumps([valid]))
+        for source_locator in ("not a repository", "acme/absent", "acme/uninitialized"):
+            with self.subTest(source=source_locator):
+                self.run_cli("rules-import", "acme/service", "--from", source_locator,
+                             "--selection", str(manifest), success=False)
+                self.assertEqual(contents(), before)
+        for endpoint in ("repos/acme/widgets", "repos/acme/service"):
+            with self.subTest(identity=endpoint):
+                mismatched = copy.deepcopy(responses)
+                mismatched[endpoint]["id"] += 100
+                self.env["GH_FIXTURES"] = json.dumps(mismatched)
+                self.run_cli("rules-import", "acme/service", "--from", "acme/widgets",
+                             "--selection", str(manifest), success=False)
+                self.assertEqual(contents(), before)
+        self.assertEqual(artifact.read_text(), "preserve existing output")
+
 
 if __name__ == "__main__":
     unittest.main()

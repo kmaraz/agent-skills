@@ -238,8 +238,8 @@ independently controlled by `post`: `post: false` still learns and applies local
 rules. `rules: off` skips new rule generation but loads supported saved rules;
 `memory: off` disables both observations and learned rules.
 
-Changed or invalidated supporting evidence excludes affected rules. Unrelated
-memory updates do not discard them. Base-side project policy takes precedence
+Changed or invalidated native supporting evidence excludes affected rules.
+Unrelated memory updates do not discard them. Base-side project policy takes precedence
 over local preferences; comments cannot grant permissions or override findings
 schemas, severity, approval or verification requirements.
 
@@ -247,6 +247,14 @@ Old proposal metadata is retained as private history, not automatically
 activated or reconciled remotely. Existing proposal PRs are left untouched.
 See the [local rules contract](plugins/review-anvil/skills/review-anvil/references/rule-promotion.md)
 for assessment JSON, source provenance and local storage.
+
+On explicit request, selected native rules can also be privately adopted from
+another locally initialized repository with the trusted `rules-import` helper.
+The target keeps signed, scoped copies with unchanged original source URLs;
+its own observations and rules are preserved. These copies load with
+`rules: off` and in all-rule mode, but do not follow later donor changes.
+Reimport a reviewed selection to refresh it, or an empty selection to remove
+that origin. See [private adoption](plugins/review-anvil/skills/review-anvil/references/rule-promotion.md#explicit-private-adoption-from-another-repository).
 
 #### Exhaustive local rule coverage
 

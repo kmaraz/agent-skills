@@ -151,6 +151,11 @@ correction can restore that interpretation. To compare or recover from bad
 knowledge, run with `memory: off`, inspect the record and explicitly
 correct/invalidate it. No reset/delete-all command is needed for ordinary use.
 
+Explicitly adopted cross-repository rules are separate signed catalog copies,
+not native target observations. Refresh or remove them with `rules-import`
+and a reviewed selection, rather than `correct`/`invalidate` on their namespaced
+support IDs. See [private adoption](rule-promotion.md#explicit-private-adoption-from-another-repository).
+
 ## Privacy and limits
 
 The local store and private run records contain sensitive derived claims, source references and collected feedback. They are not public evaluation fixtures and must not be committed to the reviewed repository. Do not log raw discussions or secrets. Local initialization verifies GitHub access, not company approval for the model already used by OMP. Human review remains active during the pilot. Explicit seed ranges are supported; scheduled collection, automatic repository-wide history discovery, remote shared storage, Slack and voice ingestion remain separate later steps.

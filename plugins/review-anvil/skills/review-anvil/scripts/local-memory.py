@@ -128,6 +128,11 @@ def parser():
     rules_apply.add_argument("--output", required=True)
     rules_inspect = sub.add_parser("rules-inspect", help="Inspect saved local rules and historical migration provenance")
     rules_inspect.add_argument("repository")
+    rules_import = sub.add_parser("rules-import", help="Privately adopt explicitly selected rules from another repository")
+    rules_import.add_argument("repository")
+    rules_import.add_argument("--from", dest="source", required=True)
+    rules_import.add_argument("--selection", required=True)
+    rules_import.add_argument("--output")
     coverage_start = sub.add_parser("coverage-start", help="Freeze all supported rules for exhaustive PR coverage")
     coverage_start.add_argument("--prepared", required=True)
     for name in ("coverage-next", "coverage-status", "coverage-finish",
@@ -366,7 +371,22 @@ def main(argv=None):
             output(value)
         elif args.command.startswith("rules-"):
             from memory_rules import LocalRules
-            if args.command == "rules-prepare":
+            if args.command == "rules-import":
+                selections = read_json(args.selection)
+                source_repo = resolve_repository(args.source)
+                target_repo = resolve_repository(args.repository)
+                source = LocalRules(repository_key(source_repo))
+                rules = LocalRules(repository_key(target_repo))
+                if source.repository == rules.repository:
+                    raise MemoryError("Rule imports require a different source repository")
+                # Inspect, never initialize, the donor. Validate the full selected
+                # closure before even binding an existing unbound target.
+                if source.inspect()["repository_id"] != source_repo["id"]:
+                    raise MemoryError("Source repository numeric identity mismatch")
+                source._export_import(selections)
+                rules.init(target_repo["id"])
+                output(rules.import_rules(source, selections), args.output)
+            elif args.command == "rules-prepare":
                 base = read_policy(args.repository)
                 rules = LocalRules(base["repository"])
                 rules.init(base["repository_id"])

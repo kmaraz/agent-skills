@@ -92,13 +92,44 @@ discard supported criteria merely to fit a review snapshot budget.
 
 Read the result and summarize activated/updated rules and context-only/triage dispositions. These are active **local learned criteria**, not newly merged repository policy. The completed review retains its original frozen snapshot; the next snapshot loads the new rules. Local learning happens independently of whether the review is posted. If learning fails, retain diagnostics and report the failure separately without claiming activation or discarding a completed review.
 
+## Explicit private adoption from another repository
+
+Only on an explicit user request, select supported native rules from another
+locally initialized repository. Check each rule's conditions, examples,
+exceptions and the target's current policy; do not transfer an entire catalog
+merely because the repositories share an organization or language.
+
+Create a private JSON array with one `{rule_id, paths, reason}` per selected
+source rule. `paths` is the justified target scope; `reason` explains adoption.
+Keep the selection and original evidence outside Git.
+
+```bash
+python3 <memory-helper> rules-import acme/service --from acme/widgets \
+  --selection /private/run/selection.json --output /private/run/import-result.json
+```
+
+The helper verifies repository identities and current native source support,
+then saves a signed copy under the target's existing `local-rules.json`.
+Source objects and URLs remain unchanged and visibly identify their origin.
+Namespaced IDs prevent collisions; foreign feedback is never inserted into
+the target's observation/checkpoint state. Existing target rules are preserved.
+Imported rules load through ordinary scoped snapshots and all-rule assessment,
+including with `rules: off`; normal source-evidence and publication checks apply.
+
+This is a pinned copy, not live sharing. Donor corrections, invalidations and
+later rule changes do not automatically update an adopted copy. Repeat the
+command with a newly reviewed selection to replace only that origin's imports;
+an empty array removes that origin's imports. Native rule learning preserves
+imports. Transitive imports are rejected. The target remains usable without
+the donor store, and previously issued authenticated snapshots remain intact.
+
 ## Loading, inspection and migration
 
 ```bash
 python3 <memory-helper> rules-inspect owner/repo
 ```
 
-`current` shows all presently supported rules plus inactive IDs. Snapshots select by scope under the total 64 KiB budget and include exact rules with full supporting observation/source evidence under `local_rules`. `omitted_rule_count` reports supported rules excluded by the budget, separately from `inactive_rule_ids`; never claim those omitted rules were loaded. Evidence is checked per rule: unrelated memory generation changes do not deactivate it, while changed/deleted/disputed/invalidated sources or corrected observations immediately prevent loading the affected rule until reassessment. Reviewers always compare loaded criteria against current base-side policy, including when generation is disabled.
+`current` shows all presently supported rules plus inactive IDs. Snapshots select by scope under the total 64 KiB budget and include exact rules with full supporting observation/source evidence under `local_rules`. `omitted_rule_count` reports supported rules excluded by the budget, separately from `inactive_rule_ids`; never claim those omitted rules were loaded. Native evidence is checked per rule: unrelated memory generation changes do not deactivate it, while changed/deleted/disputed/invalidated sources or corrected observations immediately prevent loading the affected native rule until reassessment. Explicit adoptions retain the pinned-copy semantics above. Reviewers always compare loaded criteria against current base-side policy, including when generation is disabled.
 
 The first assessment authenticates legacy `rule-proposals.json` and archives the complete signed metadata in `local-rules.json` as `legacy_publication`. Existing signed receipts, plans and attempts remain provenance only. They are never activated, reconciled, withdrawn or used to infer current remote state. The old file remains untouched. A fresh source-backed assessment is required to activate local rules; corrupt legacy or local metadata fails closed. Real existing draft PRs are not changed by this migration.
 

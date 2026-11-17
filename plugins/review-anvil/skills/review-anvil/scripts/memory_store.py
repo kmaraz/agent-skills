@@ -798,7 +798,19 @@ class MemoryStore:
         ids = self._snapshot_ids(snapshot)
         if snapshot["repository_id"] != state["repository_id"] or snapshot["generation"] > state["generation"]:
             raise MemoryError("Snapshot repository identity or generation mismatch")
-        if any(oid not in state["observations"] for oid in ids):
+        imported_ids = set()
+        if "local_rules" in snapshot:
+            # _snapshot_ids already validated exact imported projections and
+            # their complete closure, without consulting today's catalog.
+            imported_ids = {oid for oid, record in snapshot["local_rules"]["observations"].items()
+                            if "origin" in record}
+            if any(rule.get("origin", {}).get("repository_id") == state["repository_id"]
+                   for rule in snapshot["local_rules"]["rules"]):
+                raise MemoryError("Snapshot import has the target repository identity")
+        # Only the fully validated local-rule import closure is foreign. Native
+        # observations (including top-level ones) retain the membership check.
+        native_ids = (ids - imported_ids) | {record["id"] for record in snapshot["observations"]}
+        if any(oid not in state["observations"] for oid in native_ids):
             raise MemoryError("Snapshot refers to unknown repository observations")
         return ids
 

@@ -4,7 +4,7 @@ import hashlib
 import re
 import unicodedata
 
-from memory_store import MemoryStore, MemoryError, _MISSING, _digest, _integer, _matches, _paths, _text
+from memory_store import MemoryStore, MemoryError, MAX_FILE_BYTES, _MISSING, _digest, _integer, _json, _matches, _paths, _proposal, _repository, _text
 
 MAX_POLICY_BYTES = 128 * 1024
 _METADATA = "local-rules.json"
@@ -33,6 +33,22 @@ def _prose(value, label, maximum=16000, single=False):
 def _record(record):
     return {key: copy.deepcopy(value) for key, value in record.items() if key not in {"history", "fingerprints"}}
 
+
+
+def _namespace(repository, kind, original):
+    return "import-" + _digest({"repository": repository, "kind": kind, "id": original})[:40]
+
+
+def _scope(value):
+    paths = _paths(value)
+    if any(any(char in path for char in "`<>|!") or any(unicodedata.category(char) == "Cf" for char in path) for path in paths):
+        raise MemoryError("Invalid Markdown in rule scope")
+    return paths
+
+
+def _frozen(rules, observations, sources):
+    return {"rules": rules, "observations": observations, "sources": sources,
+            "inactive_rule_ids": [], "omitted_rule_count": 0, "precedence": "base-side-policy-first"}
 
 class LocalRules(MemoryStore):
     """One atomic local rules transaction under the existing memory lock."""
@@ -74,7 +90,7 @@ class LocalRules(MemoryStore):
             return {"schema_version": 2, "repository": self.repository,
                     "repository_id": state["repository_id"], "rules": [], "known_rules": {},
                     "assessment": None, "legacy_publication": self._legacy(directory, state)}
-        _fields(value, _METADATA_FIELDS, "local rule metadata")
+        _fields(value, _METADATA_FIELDS | ({"imports"} if "imports" in value else set()), "local rule metadata")
         self._authenticate(directory, "local-rule-metadata", value)
         if (type(value["schema_version"]) is not int or value["schema_version"] != 2
                 or value["repository"] != self.repository or value["repository_id"] != state["repository_id"]
@@ -85,6 +101,7 @@ class LocalRules(MemoryStore):
             self._authenticate(directory, "rule-proposal-metadata", legacy)
             if legacy["repository"] != self.repository or legacy["repository_id"] != state["repository_id"]:
                 raise MemoryError("Archived metadata repository mismatch")
+        self._imports(value, state)
         return value
 
     def _save(self, directory, metadata):
@@ -208,7 +225,173 @@ class LocalRules(MemoryStore):
             metadata["assessment"] = saved_assessment
             for rule in rules:
                 metadata["known_rules"][rule["key"]] = {"id": rule["id"], "title": rule["title"]}
+            self._imports(metadata, state)
             return copy.deepcopy(self._save(directory, metadata))
+
+    def _selections(self, selections):
+        if not isinstance(selections, list) or len(_json(selections).encode("utf-8")) > MAX_FILE_BYTES:
+            raise MemoryError("Import selections must be a bounded list")
+        result, seen = [], set()
+        for item in selections:
+            _fields(item, {"rule_id", "paths", "reason"}, "rule import selection")
+            rid = _text(item["rule_id"], "import rule ID", 100)
+            if not re.fullmatch(r"rule-[a-f0-9]{24}", rid) or rid in seen:
+                raise MemoryError("Invalid or duplicate import rule ID")
+            seen.add(rid)
+            result.append({"rule_id": rid, "paths": _scope(item["paths"]),
+                           "reason": _prose(item["reason"], "import adoption reason", 8000)})
+        return sorted(result, key=lambda item: item["rule_id"])
+
+    def _native_closure(self, value):
+        """Validate an unchanged native-only donor closure, never another import."""
+        if (not isinstance(value, dict) or not isinstance(value.get("rules"), list)
+                or any(not isinstance(rule, dict) or "origin" in rule for rule in value["rules"])):
+            raise MemoryError("Only native rules may be imported")
+        self.validate_frozen(value)
+        observations, sources = value["observations"], value["sources"]
+        for oid, record in observations.items():
+            _fields(record, {"id", "claim", "rationale", "paths", "sources", "kind", "advisory",
+                             "status", "source_versions", "created_at", "updated_at"}, "native import observation")
+            if record["id"] != oid or record["advisory"] is not True:
+                raise MemoryError("Invalid native import observation identity")
+            _proposal({key: record[key] for key in ("id", "claim", "rationale", "paths", "sources", "kind")})
+            if set(record["source_versions"]) != set(record["sources"]):
+                raise MemoryError("Invalid native import source closure")
+            _text(record["created_at"], "observation creation time", 100)
+            _text(record["updated_at"], "observation update time", 100)
+        for sid, saved in sources.items():
+            _fields(saved, {"source", "pr_number", "version"}, "native import source")
+            _integer(saved["pr_number"], "import source PR number")
+            if saved["source"]["id"] != sid:
+                raise MemoryError("Invalid native import source identity")
+        context = {"digest": "", "observations": list(observations.values()), "sources": sources}
+        assessment = {"context_digest": "", "dispositions": [
+            {"observation_id": oid, "disposition": "activate", "reason": "Pinned native support."}
+            for oid in observations], "rules": [
+                {key: rule[key] for key in _RULE_FIELDS} for rule in value["rules"]]}
+        rules, _ = self._assessment(context, assessment)
+        if rules != value["rules"] or value != _frozen(rules, observations, sources):
+            raise MemoryError("Noncanonical or incomplete native import closure")
+
+    def _export_import(self, selections):
+        selections = self._selections(selections)
+        with self._locked() as directory:
+            state = self._state(directory)
+            _integer(state["repository_id"], "origin repository ID")
+            metadata = self._metadata(directory, state)
+            # Only native rules participate, even when the donor has adoptions.
+            native = {**metadata, "imports": []}
+            catalog = self._selected(directory, state, None, native)
+            catalog = {**catalog, "omitted_rule_count": 0}
+            current = {rule["id"]: rule for rule in catalog["rules"]}
+            if any(item["rule_id"] not in current for item in selections):
+                raise MemoryError("Import requires a currently supported native rule")
+            rules = [copy.deepcopy(current[item["rule_id"]]) for item in selections]
+            observations = {oid: copy.deepcopy(catalog["observations"][oid])
+                            for rule in rules for oid in rule["observation_ids"]}
+            sources = {sid: copy.deepcopy(catalog["sources"][sid])
+                       for record in observations.values() for sid in record["sources"]}
+            frozen = _frozen(rules, observations, sources)
+            self._native_closure(frozen)
+            return {"repository": self.repository, "repository_id": state["repository_id"],
+                    "catalog_digest": _digest(catalog), "selections": selections, "frozen": frozen}
+
+    def _project_import(self, item):
+        _fields(item, {"repository", "repository_id", "catalog_digest", "selections", "frozen"}, "import origin")
+        repository = item["repository"]
+        if _repository(repository) != repository or repository == self.repository:
+            raise MemoryError("Import origin must be a different canonical repository")
+        _integer(item["repository_id"], "origin repository ID")
+        if not isinstance(item["catalog_digest"], str) or not re.fullmatch(r"[a-f0-9]{64}", item["catalog_digest"]):
+            raise MemoryError("Invalid origin catalog digest")
+        selections = self._selections(item["selections"])
+        if selections != item["selections"]:
+            raise MemoryError("Noncanonical import selections")
+        frozen = item["frozen"]
+        donor = LocalRules(repository, self.root)
+        donor._native_closure(frozen)
+        if [rule["id"] for rule in frozen["rules"]] != [row["rule_id"] for row in selections]:
+            raise MemoryError("Import selection does not match pinned native rules")
+        identity = {"repository": repository, "repository_id": item["repository_id"]}
+        observations, sources, rules = {}, {}, []
+        for sid, saved in frozen["sources"].items():
+            sources[_namespace(repository, "source", sid)] = {
+                **copy.deepcopy(saved), "origin": {**identity, "id": sid}}
+        for oid, record in frozen["observations"].items():
+            projected = copy.deepcopy(record)
+            projected.update({"id": _namespace(repository, "observation", oid),
+                              "origin": {**identity, "id": oid},
+                              "sources": [_namespace(repository, "source", sid) for sid in record["sources"]],
+                              "source_versions": {_namespace(repository, "source", sid): version
+                                                  for sid, version in record["source_versions"].items()}})
+            observations[projected["id"]] = projected
+        for original, selection in zip(frozen["rules"], selections):
+            rule = copy.deepcopy(original)
+            key = _namespace(repository, "topic", original["key"])
+            ids = sorted(_namespace(repository, "observation", oid) for oid in original["observation_ids"])
+            rule.update({"key": key, "id": "rule-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:24],
+                         "paths": selection["paths"], "observation_ids": ids,
+                         "evidence": {oid: _digest(observations[oid]) for oid in ids},
+                         "rationale": (original["rationale"] + "\n\nAdopted from " + repository
+                                       + " (" + original["id"] + "): " + selection["reason"]),
+                         "origin": {**identity, "catalog_digest": item["catalog_digest"],
+                                    "rule": copy.deepcopy(original), "paths": copy.deepcopy(selection["paths"]),
+                                    "reason": selection["reason"]}})
+            rules.append(rule)
+        return _frozen(rules, observations, sources)
+
+    def _imports(self, metadata, state):
+        imports = metadata.get("imports", [])
+        if not isinstance(imports, list):
+            raise MemoryError("Invalid rule imports")
+        origins, numbers = set(), set()
+        rule_ids = {rule["id"] for rule in metadata["rules"]}
+        keys = {rule["key"] for rule in metadata["rules"]}
+        rule_ids.update(rule["id"] for rule in metadata["known_rules"].values())
+        observations, sources = set(state["observations"]), set(state["sources"])
+        for item in imports:
+            projected = self._project_import(item)
+            repository, number = item["repository"], item["repository_id"]
+            if repository in origins or number in numbers or number == state["repository_id"] or not item["selections"]:
+                raise MemoryError("Duplicate, self, or empty import origin")
+            origins.add(repository)
+            numbers.add(number)
+            for rule in projected["rules"]:
+                if rule["id"] in rule_ids or rule["key"] in keys:
+                    raise MemoryError("Imported rule namespace collision")
+                rule_ids.add(rule["id"])
+                keys.add(rule["key"])
+            if observations.intersection(projected["observations"]) or sources.intersection(projected["sources"]):
+                raise MemoryError("Imported evidence namespace collision")
+            observations.update(projected["observations"])
+            sources.update(projected["sources"])
+
+    def import_rules(self, source: "LocalRules", selections: list[dict]) -> dict:
+        if not isinstance(source, LocalRules) or source.repository == self.repository:
+            raise MemoryError("Rule imports require a different native source repository")
+        # Capture and release the donor lock BEFORE acquiring the target lock.
+        item = source._export_import(selections)
+        with self._locked(exclusive=True) as directory:
+            state = self._state(directory)
+            _integer(state["repository_id"], "target repository ID")
+            metadata = self._metadata(directory, state)
+            if any(row["repository"] == source.repository and row["repository_id"] != item["repository_id"]
+                   for row in metadata.get("imports", [])):
+                raise MemoryError("Origin repository numeric identity changed")
+            imports = [copy.deepcopy(row) for row in metadata.get("imports", [])
+                       if row["repository"] != source.repository]
+            if item["selections"]:
+                imports.append(item)
+            imports.sort(key=lambda row: row["repository"])
+            if imports == metadata.get("imports", []) and "signature" in metadata:
+                return copy.deepcopy(metadata)
+            updated = {**metadata}
+            if imports:
+                updated["imports"] = imports
+            else:
+                updated.pop("imports", None)
+            self._imports(updated, state)
+            return copy.deepcopy(self._save(directory, updated))
 
     def _selected(self, directory, state, files, metadata=None):
         metadata = self._metadata(directory, state) if metadata is None else metadata
@@ -235,6 +418,17 @@ class LocalRules(MemoryStore):
                         sources[sid] = copy.deepcopy(state["sources"][sid])
                 continue
             inactive.append(rule["id"])
+        for item in metadata.get("imports", []):
+            projected = self._project_import(item)
+            for rule in projected["rules"]:
+                if files is not None and rule["paths"] and not any(
+                        _matches(pattern, path) for pattern in rule["paths"] for path in files):
+                    continue
+                rules.append(rule)
+                for oid in rule["observation_ids"]:
+                    observations[oid] = projected["observations"][oid]
+                    for sid in observations[oid]["sources"]:
+                        sources[sid] = projected["sources"][sid]
         return {"rules": rules, "observations": observations, "sources": sources,
                 "inactive_rule_ids": inactive, "precedence": "base-side-policy-first"}
 
@@ -258,22 +452,115 @@ class LocalRules(MemoryStore):
         if not isinstance(observations, dict) or not isinstance(value["sources"], dict):
             raise MemoryError("Invalid frozen local rule evidence")
         used, source_ids, rule_ids = set(), set(), set()
+        imported_ids = set()
+        origins, origin_numbers = {}, {}
         for rule in value["rules"]:
-            _fields(rule, _RULE_FIELDS | {"id", "source_urls", "evidence"}, "frozen local rule")
+            imported = isinstance(rule, dict) and "origin" in rule
+            _fields(rule, _RULE_FIELDS | {"id", "source_urls", "evidence"} | ({"origin"} if imported else set()), "frozen local rule")
+            _text(rule["id"], "frozen rule ID", 100)
+            if (not isinstance(rule["observation_ids"], list) or not rule["observation_ids"]
+                    or any(not isinstance(oid, str) for oid in rule["observation_ids"])
+                    or len(set(rule["observation_ids"])) != len(rule["observation_ids"])
+                    or not isinstance(rule["evidence"], dict)):
+                raise MemoryError("Invalid frozen rule support")
+            if imported:
+                imported_ids.update(self._validate_imported_rule(rule, observations, value["sources"]))
+                origin = rule["origin"]
+                repository, number = origin["repository"], origin["repository_id"]
+                if ((repository in origins and origins[repository] != (number, origin["catalog_digest"]))
+                        or (number in origin_numbers and origin_numbers[number] != repository)):
+                    raise MemoryError("Conflicting frozen import origins")
+                origins[repository], origin_numbers[number] = (number, origin["catalog_digest"]), repository
             if rule["id"] in rule_ids or not rule["observation_ids"]:
                 raise MemoryError("Duplicate or unsupported frozen local rule")
             rule_ids.add(rule["id"])
             for oid in rule["observation_ids"]:
                 record = observations.get(oid)
-                if record is None or record["status"] != "active" or _digest(record) != rule["evidence"].get(oid):
+                if (not isinstance(record, dict) or record.get("status") != "active"
+                        or _digest(record) != rule["evidence"].get(oid)
+                        or not isinstance(record.get("sources"), list)
+                        or any(not isinstance(sid, str) for sid in record["sources"])
+                        or not isinstance(record.get("source_versions"), dict)):
                     raise MemoryError("Frozen local rule lacks matching evidence")
                 used.add(oid)
                 for sid in record["sources"]:
                     source = value["sources"].get(sid)
+                    if not isinstance(source, dict) or not {"source", "pr_number", "version"} <= source.keys():
+                        raise MemoryError("Invalid frozen local rule source")
+                    self._validate_source_shape(source, imported)
                     if (source is None or source["version"] != record["source_versions"].get(sid)
                             or source["version"] != _digest(source["source"])):
                         raise MemoryError("Frozen local rule source version mismatch")
-                    self._validate_source(source["source"], source["pr_number"])
+                    if not imported:
+                        if "origin" in record or "origin" in source:
+                            raise MemoryError("Native rule cannot use imported evidence")
+                        self._validate_source(source["source"], source["pr_number"])
                     source_ids.add(sid)
         if used != observations.keys() or source_ids != value["sources"].keys():
             raise MemoryError("Unrelated frozen local rule evidence")
+        return imported_ids
+
+    def _validate_imported_rule(self, rule, observations, sources):
+        origin = rule["origin"]
+        _fields(origin, {"repository", "repository_id", "catalog_digest", "rule", "paths", "reason"}, "frozen rule origin")
+        _integer(origin["repository_id"], "origin repository ID")
+        identity = {key: origin[key] for key in ("repository", "repository_id")}
+        native_observations, native_sources = {}, {}
+        if _repository(origin["repository"]) != origin["repository"]:
+            raise MemoryError("Noncanonical frozen import origin")
+        if not isinstance(rule["observation_ids"], list) or not rule["observation_ids"]:
+            raise MemoryError("Imported rule requires complete support")
+        for oid in rule["observation_ids"]:
+            record = observations.get(oid)
+            if not isinstance(record, dict) or "origin" not in record:
+                raise MemoryError("Imported rule lacks origin observation")
+            descriptor = record["origin"]
+            _fields(descriptor, {"repository", "repository_id", "id"}, "observation origin")
+            _integer(descriptor["repository_id"], "observation origin repository ID")
+            original_id = _text(descriptor["id"], "origin observation ID", 100)
+            if descriptor != {**identity, "id": original_id} or oid != _namespace(origin["repository"], "observation", original_id):
+                raise MemoryError("Imported observation namespace or origin mismatch")
+            original = {key: copy.deepcopy(value) for key, value in record.items() if key != "origin"}
+            _fields(original, {"id", "claim", "rationale", "paths", "sources", "kind", "advisory",
+                               "status", "source_versions", "created_at", "updated_at"}, "imported observation")
+            original.update({"id": original_id, "sources": [], "source_versions": {}})
+            if (not isinstance(record["sources"], list) or not record["sources"]
+                    or any(not isinstance(sid, str) for sid in record["sources"])
+                    or len(set(record["sources"])) != len(record["sources"])
+                    or not isinstance(record["source_versions"], dict)
+                    or set(record["source_versions"]) != set(record["sources"])):
+                raise MemoryError("Invalid imported observation support")
+            for sid in record["sources"]:
+                saved = sources.get(sid)
+                if not isinstance(saved, dict) or "origin" not in saved:
+                    raise MemoryError("Imported rule lacks origin source")
+                _fields(saved, {"source", "pr_number", "version", "origin"}, "imported source")
+                source_origin = saved["origin"]
+                _fields(source_origin, {"repository", "repository_id", "id"}, "source origin")
+                _integer(source_origin["repository_id"], "source origin repository ID")
+                original_sid = _text(source_origin["id"], "origin source ID", 150)
+                if source_origin != {**identity, "id": original_sid} or sid != _namespace(origin["repository"], "source", original_sid):
+                    raise MemoryError("Imported source namespace or origin mismatch")
+                native_sources[original_sid] = {key: copy.deepcopy(value) for key, value in saved.items() if key != "origin"}
+                original["sources"].append(original_sid)
+                original["source_versions"][original_sid] = record["source_versions"][sid]
+            native_observations[original_id] = original
+        original_rule = origin["rule"]
+        if not isinstance(original_rule, dict) or "id" not in original_rule:
+            raise MemoryError("Invalid imported original rule")
+        item = {**identity, "catalog_digest": origin["catalog_digest"],
+                "selections": [{"rule_id": original_rule["id"], "paths": origin["paths"], "reason": origin["reason"]}],
+                "frozen": _frozen([original_rule], native_observations, native_sources)}
+        projected = self._project_import(item)
+        if (projected["rules"] != [rule]
+                or any(observations[oid] != record for oid, record in projected["observations"].items())
+                or any(sources[sid] != saved for sid, saved in projected["sources"].items())):
+            raise MemoryError("Imported rule projection or frozen support was modified")
+        return set(projected["observations"])
+
+    def _validate_source_shape(self, saved, imported):
+        _fields(saved, {"source", "pr_number", "version"} | ({"origin"} if imported else set()),
+                "frozen supporting source")
+        _integer(saved["pr_number"], "source PR number")
+        if not isinstance(saved["source"], dict) or "id" not in saved["source"]:
+            raise MemoryError("Invalid frozen original source")
