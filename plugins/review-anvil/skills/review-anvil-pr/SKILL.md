@@ -373,6 +373,18 @@ A present but unrecognized helper severity also aborts; an absent helper field m
 
 **Finding context.** The helper validates `<REPORT_PATH>.context.json` (schema in `../review-anvil/references/report-artifacts.md`) and embeds each finding's record as one hidden `<!-- review-anvil: context={…} -->` line at the end of the top-level report, before the footer, for every finding the report still lists, including findings that also get an inline comment. It drops invalid items with a warning; a missing or malformed file, or a report block that would exceed the size budget, never blocks the post.
 
+**Pre-render classification.** Before freezing the canonical packet, the engine
+runs the trusted helper's `classify-feedback <host> <owner> <repo> <n>
+<canonical_json>` command. It reads the provisional packet without modifying it
+and emits reconciled JSON on stdout using the same candidate classifier as the
+post-time refresh. Build the summary, source, inline inventory and approval
+from that output. Known unchanged findings retain their original identities
+and severity in Earlier feedback instead of being delivered again; explicit
+reintroduction and serious-history approval rules remain unchanged. This
+read-only preparation also applies with `post: false` and performs no review
+submission or resolution. A classification failure does not authorize an
+unfiltered post or a renderer/reviewer retry.
+
 **Prior-feedback continuity.** Before review, the engine fetches every root review thread with open/resolved/outdated state, replies from the PR author, and findings from earlier review-anvil review bodies and fallback comments. Reviewers must account for every ledger item and validate author explanations against the current code; GitHub `resolved` means only that the discussion closed, not that the code was proven fixed. Immediately before posting, the helper refreshes this paginated history. Rows explicitly marked `disposition=deferred` or `disposition=outside` are historical/context dispositions, not active delivery or reintroduction candidates; preserve them without demoting them again. They still delimit finding blocks, and unresolved critical/high prior feedback still restricts approval. If that refresh would remove, demote, or suppress an active item from a compact report, posting fails closed and leaves the artifacts for a rerun so the visible summary can be rendered from the refreshed inventory; the helper never leaves a stale summary over a changed finding set. Legacy report forms retain compatible duplicate suppression. Different canonical IDs never collapse solely because prose is similar.
 
 Only the PR author resolving a GitHub review thread creates `author-resolved` status. This requires the API-confirmed `resolvedBy` identity to match the PR author; ordinary thread resolution remains `resolved` and is revalidated. After a successful review delivery, the helper also processes `<REPORT_PATH>.resolutions.json`. The artifact binds its dispositions to the `HEAD_SHA` captured by `init`; a non-empty artifact is rejected if the live PR head differs. The helper resolves only still-open roots with a live terminal review-anvil finding marker and the exact requested finding ID. Allowed dispositions are `fixed`, `stale`, and `author-explanation-accepted`; the last also requires a live PR-author reply. Human-authored/non-anvil threads are never resolved, and an `outdated` anchor alone does not qualify.

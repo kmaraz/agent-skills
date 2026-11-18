@@ -749,6 +749,34 @@ explain its concrete benefit. Keep speculative questions private unless they
 identify a concrete current-change risk, its evidence limit and a useful way to
 verify it. Retain every candidate's full disposition in the private audit.
 
+For a PR review, mechanically reconcile the provisional canonical packet with
+the captured PR's history before freezing it or constructing any source bodies:
+
+```bash
+bash "$ENGINE_ROOT/../review-anvil-pr/scripts/pr-helper.sh" classify-feedback \
+  "$HOST" "$OWNER" "$REPO" "$N" "$CLARITY_PACKET_DRAFT" > "$CLASSIFIED_CLARITY_PACKET"
+```
+
+Use the trusted installed helper, as for the earlier history lookup. The input
+has the packet fields below; each finding's `title` is its author-facing
+diagnosis, not private source context. Check the command's exit status and use
+the returned inventory, not the original active list. This reuses the posting
+helper's status-aware matcher: known unchanged findings become Earlier feedback
+with their original IDs, status, URL and severity, without duplicate inline
+delivery. Closed/suppressed feedback is removed unless the existing explicit
+reintroduction rules allow it. Keep identified history in `report_ids`.
+Recompute the human summary and active counts from this reconciled inventory;
+retain unresolved critical/high history's approval effect even when no active
+findings remain. Never upgrade a resulting COMMENT merely because a finding
+moved into history. With history lookup explicitly skipped, classification
+preserves the inventory and disallows APPROVE.
+
+Only then freeze the canonical packet and build the initial source below.
+Do not run classification against frozen source, renderer output or fallback.
+Posting still refreshes history independently: unchanged history must not
+change the frozen inventory; genuinely new classification changes retain the
+existing fail-closed guard. No reviewer retry or second rendering attempt.
+
 Run one clean final clarity pass after the report facts are frozen and before
 emitting any final artifact. First retain a complete pre-clarity report and
 inline-body set for safe fallback. Then build `FROZEN_CLARITY_PACKET` from only

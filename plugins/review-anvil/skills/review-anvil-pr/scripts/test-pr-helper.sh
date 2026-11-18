@@ -1938,6 +1938,156 @@ JSON
     ! grep -Eq 'Prior PR feedback status|still-open|\*\*\(inline\)\*\*' "$tmp/review-body.md"
     [[ ! -e "$tmp/comment.md" ]] || fail "duplicate suppression used a comment fallback"
 }
+test_canonical_history_is_classified_before_rendering() {
+    local tmp bin fixture packet
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    fixture="$tmp/graphql.json"
+    cat >"$fixture" <<'JSON'
+{"data":{"repository":{"pullRequest":{
+  "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "reviews":{"nodes":[{"state":"COMMENTED","body":"<!-- review-anvil-marker: earlier -->\n<summary>Optional suggestions</summary>\n- Consider animating the visible surface. <!-- review-anvil-report: id=RAV-RUN1-R1-F001 severity=low area=animation path=src%2Fdialog.ts start_line=- line=12 disposition=active -->","url":"https://example.invalid/earlier"}],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+  "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+}}}}
+JSON
+    packet="$tmp/packet.json"
+    cat >"$packet" <<'JSON'
+{
+  "report_style":"human-summary","decision":"APPROVE",
+  "report_ids":["RAV-RUN1-R1-F001"],
+  "decision_reason":"No required changes remain.","result":"No new actionable findings.",
+  "scope":"Dialog animation.","checks":"Static review.","second_check":"off",
+  "earlier_feedback":[],"set_aside":[],"outside_scope":[],"run_details":[],
+  "findings":[{"id":"RAV-RUN1-R1-F001","severity":"low","request_mode":"suggested","area":"animation","title":"Consider animating the visible surface.","path":"src/dialog.ts","line":12,"side":"RIGHT","report_path":"src/dialog.ts","report_line":12,"source_context":"The visible surface remains opaque during dismissal.","fact_lock":["The surface remains opaque."],"requested_work":["Consider animating the visible surface."]}]
+}
+JSON
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$packet" >"$tmp/classified.json"
+    jq -e '
+      .decision == "APPROVE" and .findings == []
+      and .report_ids == ["RAV-RUN1-R1-F001"]
+      and (.earlier_feedback | length) == 1
+      and .earlier_feedback[0].id == "RAV-RUN1-R1-F001"
+      and .earlier_feedback[0].status == "reported"
+      and .earlier_feedback[0].severity == "low"
+      and .earlier_feedback[0].url == "https://example.invalid/earlier"
+      and (.earlier_feedback[0].text | contains("Consider animating the visible surface."))
+    ' "$tmp/classified.json" >/dev/null
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/classified.json" >"$tmp/again.json"
+    jq -e --slurpfile original "$tmp/classified.json" '. == $original[0]' "$tmp/again.json" >/dev/null
+    jq 'del(.findings[0].title) | .findings[0].source_context = "PRIVATE-EVIDENCE-NOT-FOR-PUBLICATION"' "$packet" >"$tmp/private.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/private.json" >"$tmp/public.json"
+    jq -e '.earlier_feedback[0].text | contains("PRIVATE-EVIDENCE-NOT-FOR-PUBLICATION") | not' "$tmp/public.json" >/dev/null
+    REVIEW_ANVIL_SKIP_DISMISSED=1 GH_MOCK_GRAPHQL_FAIL=1 PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$packet" >"$tmp/degraded.json"
+    jq -e --slurpfile original "$packet" '
+      .decision == "COMMENT" and .findings == $original[0].findings
+      and .earlier_feedback == $original[0].earlier_feedback
+    ' "$tmp/degraded.json" >/dev/null
+    local validator report severity event
+    validator="$ROOT/../../review-anvil/scripts/validate-clarity-output.py"
+    for severity in low high; do
+        jq --arg severity "$severity" '.findings[0].severity = $severity' "$packet" >"$tmp/input-$severity.json"
+        GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+          "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/input-$severity.json" >"$tmp/canonical-$severity.json"
+        event=APPROVE
+        [[ "$severity" != high ]] || event=COMMENT
+        jq -e --arg event "$event" '.decision == $event' "$tmp/canonical-$severity.json" >/dev/null
+        jq '{
+          decision,
+          report_markdown:(.result + "\n\n_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._"),
+          report_items:[],disposition_items:[],inline_comments:[],predicate_inventory:[]
+        }' "$tmp/canonical-$severity.json" >"$tmp/draft-$severity.json"
+        python3 "$validator" --assemble-source "$tmp/canonical-$severity.json" "$tmp/draft-$severity.json" >"$tmp/source-$severity.json"
+        python3 "$validator" "$tmp/canonical-$severity.json" "$tmp/source-$severity.json" >/dev/null
+        report="$tmp/report-$severity.md"
+        jq -r '.report_markdown' "$tmp/source-$severity.json" >"$report"
+        jq '.inline_comments' "$tmp/source-$severity.json" >"$report.inline.json"
+        # Post-time protection must also retain a high carry-forward's severity
+        # if a caller supplies an unsafe approval sidecar.
+        printf '{"event":"APPROVE","head_sha":"head-sha","approval_allowed":true}\n' >"$report.approval.json"
+        GH_MOCK_GRAPHQL_RESPONSE="$fixture" GH_MOCK_REVIEW_PAYLOAD="$tmp/payload-$severity.json" \
+          GH_MOCK_WRITE_LOG="$tmp/writes-$severity.jsonl" PATH="$bin:$PATH" \
+          "$HELPER" post github.com acme widgets 42 "classified-$severity" "$report" >/dev/null
+        jq -e --arg event "$event" '
+          .event == $event and ((.comments // []) == [])
+          and (.body | contains("<summary>Earlier feedback</summary>"))
+          and ([.body | scan("RAV-RUN1-R1-F001")] | length) == 1
+        ' "$tmp/payload-$severity.json" >/dev/null
+        jq -s -e 'length == 1' "$tmp/writes-$severity.jsonl" >/dev/null
+    done
+    jq --slurpfile published "$tmp/payload-high.json" '
+      .data.repository.pullRequest.reviews.nodes += [{
+        state:"COMMENTED",body:$published[0].body,url:"https://example.invalid/carried-high"
+      }]
+    ' "$fixture" >"$tmp/third-run.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$tmp/third-run.json" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$packet" >"$tmp/third-classified.json"
+    jq -e '.decision == "COMMENT" and .earlier_feedback[0].severity == "high"' "$tmp/third-classified.json" >/dev/null
+
+    # Similar prose with a different complete ID remains a separate finding.
+    jq '.findings[0].id = "RAV-RUN2-R1-F001" | .report_ids = ["RAV-RUN2-R1-F001"]' "$packet" >"$tmp/new.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/new.json" >"$tmp/new-classified.json"
+    jq -e '.findings[0].id == "RAV-RUN2-R1-F001" and .earlier_feedback == []' "$tmp/new-classified.json" >/dev/null
+    local legacy
+    jq '.findings[0] |= (.area = "authentication" | .title = "Reject null.")' "$packet" >"$tmp/short.json"
+    for legacy in "" "RAVF007 "; do
+        jq --arg legacy "$legacy" '.data.repository.pullRequest |= (
+          .reviews.nodes = []
+          | .reviewThreads.nodes = [{
+            isResolved:false,isOutdated:false,path:"src/dialog.ts",line:12,
+            comments:{nodes:[{body:("**" + $legacy + "[low] authentication** — Reject null."),url:"https://example.invalid/id-less"}]}
+          }]
+        )' "$fixture" >"$tmp/legacy.json"
+        GH_MOCK_GRAPHQL_RESPONSE="$tmp/legacy.json" PATH="$bin:$PATH" \
+          "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/short.json" >"$tmp/short-classified.json"
+        jq -e '.findings == [] and .earlier_feedback[0].id == "RAV-RUN1-R1-F001"' "$tmp/short-classified.json" >/dev/null
+        if [[ -n "$legacy" ]]; then
+            jq -e '.earlier_feedback[0].legacy_ids == ["RAVF007"]' "$tmp/short-classified.json" >/dev/null
+        fi
+    done
+
+    # Author closure suppresses a duplicate; explicit new evidence may reopen it.
+    jq '.data.repository.pullRequest |= (
+      .author = {"login":"pr-author"}
+      | .reviews.nodes = []
+      | .reviewThreads.nodes = [{
+        isResolved:true,isOutdated:false,resolvedBy:{login:"pr-author"},
+        path:"src/dialog.ts",line:12,
+        comments:{nodes:[{body:"Consider animating the visible surface.\n\n<!-- review-anvil: id=RAV-RUN1-R1-F001 severity=low area=animation -->",url:"https://example.invalid/closed"}]}
+      }]
+    )' "$fixture" >"$tmp/closed.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$tmp/closed.json" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$packet" >"$tmp/closed-classified.json"
+    jq -e '.findings == [] and .report_ids == [] and .earlier_feedback == [] and .decision == "APPROVE"' "$tmp/closed-classified.json" >/dev/null
+    jq '.findings[0].prior_feedback = "reintroduced" | .findings[0].severity = "high"' "$packet" >"$tmp/reintroduced.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$tmp/closed.json" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/reintroduced.json" >"$tmp/reintroduced-classified.json"
+    jq -e '.decision == "COMMENT" and .findings[0].prior_feedback == "reintroduced" and .findings[0].severity == "high" and .earlier_feedback == []' "$tmp/reintroduced-classified.json" >/dev/null
+    jq --slurpfile reported "$fixture" '
+      .data.repository.pullRequest.reviewThreads.nodes[0].comments.nodes[0].body |= sub("severity=low";"severity=high")
+      | .data.repository.pullRequest.reviews.nodes = $reported[0].data.repository.pullRequest.reviews.nodes
+      | .data.repository.pullRequest.reviews.nodes[0].body += "\n<!-- review-anvil: prior_feedback=reintroduced -->"
+    ' "$tmp/closed.json" >"$tmp/reintroduced-low-history.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$tmp/reintroduced-low-history.json" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$packet" >"$tmp/reintroduced-low.json"
+    jq -e '.decision == "APPROVE" and .earlier_feedback[0].severity == "low"' "$tmp/reintroduced-low.json" >/dev/null
+    jq --slurpfile published "$tmp/payload-low.json" '
+      .data.repository.pullRequest.reviews.nodes += [{
+        state:"APPROVED",body:$published[0].body,url:"https://example.invalid/carried-low"
+      }]
+    ' "$tmp/reintroduced-low-history.json" >"$tmp/reintroduced-low-reloaded.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$tmp/reintroduced-low-reloaded.json" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$packet" >"$tmp/reintroduced-low-again.json"
+    jq -e '.decision == "APPROVE" and .earlier_feedback[0].severity == "low"' "$tmp/reintroduced-low-again.json" >/dev/null
+}
+
 test_compact_post_fails_closed_when_refresh_changes_inventory() {
     local tmp bin fixture report inline
     tmp="$(mktemp -d)"
@@ -1981,6 +2131,15 @@ _Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvi
 REPORT
     printf '[{"path":"src/auth.ts","line":12,"side":"RIGHT","severity":"medium","body":"Refresh accepts missing state.\\n\\nValidate state before refresh.\\n\\n<!-- review-anvil: id=RAV-RUN3-R2-F001 severity=medium area=auth -->"}]\n' >"$inline"
     printf '{"event":"COMMENT","head_sha":"head-sha"}\n' >"$report.approval.json"
+    jq '.data.repository.pullRequest.reviewThreads.nodes = []' "$fixture" >"$tmp/before.json"
+    jq '{
+      decision:"COMMENT",earlier_feedback:[],report_ids:["RAV-RUN3-R2-F001"],
+      findings:[{id:"RAV-RUN3-R2-F001",severity:.[0].severity,
+                 path:.[0].path,line:.[0].line,title:"Refresh accepts missing state."}]
+    }' "$inline" >"$tmp/provisional.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$tmp/before.json" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/provisional.json" >"$tmp/frozen.json"
+    jq -e '.findings[0].id == "RAV-RUN3-R2-F001" and .earlier_feedback == []' "$tmp/frozen.json" >/dev/null
 
     if GH_MOCK_GRAPHQL_RESPONSE="$fixture" \
        GH_MOCK_REVIEW_PAYLOAD="$tmp/review-payload.json" \
@@ -3241,6 +3400,8 @@ EXAMPLE
 
 main() {
     command -v jq >/dev/null 2>&1 || fail "jq is required"
+    test_canonical_history_is_classified_before_rendering
+    [[ "${1:-}" != --history-classification-only ]] || return 0
     test_compact_post_preserves_nonactive_history_without_reraising
     test_author_comment_processing_preserves_nit_and_file_subject
     test_author_comment_rejects_malformed_file_anchors

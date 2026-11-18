@@ -48,7 +48,7 @@ You receive one JSON object named `FROZEN_CLARITY_PACKET`:
   "checks": "exact reproduction result",
   "second_check": "private frozen adversarial outcome",
   "earlier_feedback": [
-    {"id": "optional modern or legacy finding ID", "status": "open | still-present | fixed | stale | reported | author-resolved | author-explanation-accepted", "text": "frozen status fact", "url": "optional exact URL"}
+    {"id": "optional modern or legacy finding ID", "status": "open | resolved | still-present | fixed | stale | reported | deferred | outside | review-dismissed | suppressed | author-resolved | author-explanation-accepted", "severity": "optional retained critical | high | medium | low | nit", "text": "frozen status fact", "url": "optional exact URL"}
   ],
   "findings": [
     {
@@ -83,6 +83,12 @@ independent. `report_ids` is the unique union of active findings, identified
 earlier feedback and deferred/outside-scope items. One identity may have both
 its active/disposition surface and its earlier-feedback surface; retain both
 roles without inventing another ID. Duplicate rows within a role are invalid.
+Earlier feedback produced by pre-freeze classification retains severity in both
+its structured record and status text. Preserve it: moving an unresolved
+critical/high item out of active findings does not make approval safe. The
+classifier has already selected its history role; do not restore an active
+finding or duplicate inline comment during clarity.
+
 
 New packet builders must set `request_mode` explicitly from the accepted source
 on every active finding before rendering. Severity is impact, not obligation:

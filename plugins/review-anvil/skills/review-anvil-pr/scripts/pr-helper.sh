@@ -846,6 +846,21 @@ from pathlib import Path
 from urllib.parse import unquote
 
 mode, owner, repo, n = sys.argv[1:5]
+packet = None
+if mode == "classify":
+    packet = json.loads(Path(sys.argv[5]).read_text())
+    if not isinstance(packet, dict) or not all(
+        isinstance(packet.get(field), list)
+        for field in ("findings", "earlier_feedback", "report_ids")
+    ):
+        raise SystemExit("pr-helper: classify-feedback requires findings, earlier_feedback and report_ids arrays")
+    if os.environ.get("REVIEW_ANVIL_SKIP_DISMISSED") == "1":
+        print("warning: REVIEW_ANVIL_SKIP_DISMISSED=1 — skipping prior-feedback classification (degraded mode)", file=sys.stderr)
+        if packet.get("decision") == "APPROVE":
+            packet["decision"] = "COMMENT"
+            packet["decision_reason"] = "PR review history was not checked."
+        print(json.dumps(packet, ensure_ascii=False, indent=2))
+        raise SystemExit(0)
 
 QUERY = r'''
 query($owner:String!,$repo:String!,$number:Int!,$threadCursor:String,$reviewCursor:String,$commentCursor:String){
@@ -1022,7 +1037,7 @@ HUMAN_REPORT_TABLE_RE = re.compile(
     re.I,
 )
 EARLIER_FEEDBACK_RE = re.compile(
-    r"^\s*[-*]\s+\*\*(?P<status>open|still-present|fixed|stale|reported|author-resolved|author-explanation-accepted)\*\*"
+    r"^\s*[-*]\s+\*\*(?P<status>open|resolved|still-present|fixed|stale|reported|deferred|outside|review-dismissed|suppressed|author-resolved|author-explanation-accepted)\*\*"
     r"\s*[-—:]+\s*(?P<text>.+?)\s*$",
     re.I,
 )
@@ -1079,6 +1094,24 @@ def severity_name(value):
     if value in SEVERITY_NAMES:
         return value
     return SEVERITY_INITIALS.get(value)
+
+def does_not_reraise(item):
+    return item["status"] in {
+        "suppressed",
+        "author-resolved",
+        "author-explanation-accepted",
+        "outside",
+    }
+
+def highest_severity(*values):
+    levels = ["nit", "low", "medium", "high", "critical"]
+    return max((value for value in values if value in levels), key=levels.index, default=None)
+
+def merge_history_severity(target, other):
+    # A new reintroduction has its own severity; closed feedback must not
+    # promote it back to a historical severity that no longer applies.
+    if not does_not_reraise(target) and not does_not_reraise(other):
+        target["severity"] = highest_severity(target.get("severity"), other.get("severity"))
 
 def severity_from_body(body):
     metadata = terminal_finding_metadata(body)
@@ -1682,7 +1715,7 @@ def report_findings(node):
                             or "prior-review-anvil-report"
                         ),
                         "status": earlier_item["status"],
-                        "severity": None,
+                        "severity": severity_from_body(earlier_item["finding"]),
                         "prior_feedback": None,
                         "structured_history": True,
                         "outdated": False,
@@ -1747,6 +1780,10 @@ for node in reviews + issue_comments:
         if candidate.get("prior_feedback") == "reintroduced" or previous is None:
             history.append(candidate)
         elif candidate.get("structured_history"):
+            if does_not_reraise(previous) and not does_not_reraise(candidate):
+                previous["severity"] = candidate.get("severity")
+            else:
+                merge_history_severity(previous, candidate)
             previous["status"] = candidate["status"]
             previous["summary"] = candidate["summary"]
             previous["source"] = candidate["source"]
@@ -1813,9 +1850,11 @@ def coalesce_history(items):
         current = coalesced[match_index]
         if history_rank(item) > history_rank(current):
             merge_identity(item, current, item)
+            merge_history_severity(item, current)
             coalesced[match_index] = item
         else:
             merge_identity(current, current, item)
+            merge_history_severity(current, item)
     return coalesced
 
 history = coalesce_history(history)
@@ -1856,11 +1895,11 @@ if mode in {"history", "list"}:
             print(f'- [{flags}] {loc} — {d["summary"]} ({"; ".join(metadata)})')
     raise SystemExit(0)
 
-if mode != "suppress":
+if mode not in {"suppress", "classify"}:
     raise SystemExit(f"pr-helper: unknown dismissed-findings mode: {mode}")
 
-report = Path(sys.argv[5])
-inline = Path(sys.argv[6])
+report = Path(sys.argv[5]) if mode == "suppress" else None
+inline = Path(sys.argv[6]) if mode == "suppress" else None
 
 def display_status(item):
     status = {
@@ -1879,14 +1918,6 @@ suppressed = []
 matched_history = []
 categorically_removed = 0
 explicit_suppressions = []
-
-def does_not_reraise(item):
-    return item["status"] in {
-        "suppressed",
-        "author-resolved",
-        "author-explanation-accepted",
-        "outside",
-    }
 
 def location_range_from_block(block):
     for line in block:
@@ -1918,7 +1949,7 @@ def inline_candidate(item):
 inline_items = None
 delivery_candidates = []
 reintroduced_candidates = []
-if inline.exists() and inline.read_text().strip() not in {"", "[]"}:
+if inline is not None and inline.exists() and inline.read_text().strip() not in {"", "[]"}:
     inline_items = json.loads(inline.read_text())
     if not isinstance(inline_items, list):
         raise SystemExit(f"pr-helper: {inline} is not a JSON array of comment objects")
@@ -1929,7 +1960,7 @@ if inline.exists() and inline.read_text().strip() not in {"", "[]"}:
             if item.get("prior_feedback") == "reintroduced":
                 reintroduced_candidates.append(candidate)
 
-if report.exists():
+if report is not None and report.exists():
     report_lines = report.read_text().splitlines()
     in_fence = False
     for index, line in enumerate(report_lines):
@@ -1951,6 +1982,25 @@ if report.exists():
             if (index + 1 < len(report_lines)
                     and report_lines[index + 1].strip() == REINTRODUCED_MARKER):
                 reintroduced_candidates.append(candidate)
+
+def canonical_candidate(item):
+    diagnosis = item.get("title") or item.get("text") or item.get("source_context") or ""
+    return {
+        "path": item.get("report_path") or item.get("path") or "",
+        "start_line": str(item.get("report_start_line") or item.get("start_line")
+                          or item.get("report_line") or item.get("line") or "") or None,
+        "line": str(item.get("report_line") or item.get("line") or "") or None,
+        "sig": signature(f'[{item.get("severity")}] {item.get("area")} — {diagnosis}'),
+        "severity": severity_name(item.get("severity")),
+        **identity_metadata(item.get("id")),
+    }
+
+if packet is not None:
+    for item in packet["findings"]:
+        candidate = canonical_candidate(item)
+        delivery_candidates.append(candidate)
+        if item.get("prior_feedback") == "reintroduced":
+            reintroduced_candidates.append(candidate)
 
 def same_delivery_candidate_without_position(cand, candidate):
     if not same_finding(cand, candidate,
@@ -2014,6 +2064,86 @@ def matching_history(cand, require_path):
                 return exact
     return matches[0]
 
+def classify_candidate(cand, require_path, local_reintroduced=False):
+    reintroduced = explicitly_reintroduced(cand, local_reintroduced)
+    hit = matching_history(cand, require_path)
+    bypass_closed = bool(
+        hit and reintroduced
+        and hit["status"] in {"author-resolved", "author-explanation-accepted"}
+    )
+    disposition = (
+        "active" if not hit or bypass_closed
+        else "removed" if does_not_reraise(hit)
+        else "earlier"
+    )
+    return hit, reintroduced, bypass_closed, disposition
+
+def material_item_blocks(item, report_text):
+    if item.get("severity") not in {"critical", "high"} or does_not_reraise(item):
+        return False
+    source = item.get("source") or ""
+    assessment = next((line.lower() for line in report_text.splitlines()
+                       if source and source in line), "")
+    return not assessment or not any(clear in assessment for clear in ("fixed", "stale/outdated", "stale"))
+
+def material_match_blocks(matches):
+    return any(
+        severity in {"critical", "high"} and (reintroduced or not does_not_reraise(item))
+        for item, severity, reintroduced in matches
+    )
+
+if packet is not None:
+    kept = []
+    earlier = list(packet["earlier_feedback"])
+    for item in packet["findings"]:
+        cand = canonical_candidate(item)
+        hit, reintroduced, bypass_closed, disposition = classify_candidate(
+            cand, False, item.get("prior_feedback") == "reintroduced"
+        )
+        if hit:
+            matched_history.append((hit, cand["severity"], bypass_closed))
+        if disposition == "active":
+            kept.append({**item, "prior_feedback": "reintroduced"} if reintroduced else item)
+        elif disposition == "earlier":
+            identity = {}
+            merge_identity(identity, hit, cand)
+            finding_id = identity["finding_id"] or item["id"]
+            severity = highest_severity(cand["severity"], hit.get("severity"))
+            title = item.get("title") or hit["summary"]
+            status = hit["status"] if hit["status"] not in {"fixed", "stale"} else "still-present"
+            row = {
+                "id": finding_id, "status": status, "severity": severity,
+                "text": f'[{severity}] {item.get("area") or "history"} — {title} {display_status(hit)}',
+                "url": hit["source"],
+            }
+            if identity["legacy_ids"]:
+                row["legacy_ids"] = identity["legacy_ids"]
+            earlier = [old for old in earlier if old.get("id") not in {item["id"], finding_id}]
+            earlier.append(row)
+    packet["findings"] = kept
+    packet["earlier_feedback"] = earlier
+    identified = {
+        item["id"]
+        for group in ("findings", "earlier_feedback", "set_aside", "outside_scope")
+        for item in packet.get(group, [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    packet["report_ids"] = [finding_id for finding_id in packet["report_ids"] if finding_id in identified]
+    packet["report_ids"].extend(sorted(identified - set(packet["report_ids"])))
+    assessments = "\n".join(f'{item["status"]} {item["text"]} {item.get("url", "")}' for item in earlier)
+    earlier_material = [
+        {"status": item["status"], "severity": item.get("severity"), "source": item.get("url")}
+        for item in earlier
+    ]
+    if packet.get("decision") == "APPROVE" and (
+        any(material_item_blocks(item, assessments) for item in [*history, *earlier_material])
+        or material_match_blocks(matched_history)
+    ):
+        packet["decision"] = "COMMENT"
+        packet["decision_reason"] = "Prior critical/high PR feedback remains open or was matched as still present."
+    print(json.dumps(packet, ensure_ascii=False, indent=2))
+    raise SystemExit(0)
+
 inline_rewrite = None
 if inline_items is not None:
     items = inline_items
@@ -2024,29 +2154,21 @@ if inline_items is not None:
             kept.append(item)  # let posting fail loudly on malformed members
             continue
         cand = inline_candidate(item)
-        reintroduced = explicitly_reintroduced(
-            cand, item.get("prior_feedback") == "reintroduced"
+        hit, reintroduced, bypass_closed_feedback, disposition = classify_candidate(
+            cand, True, item.get("prior_feedback") == "reintroduced"
         )
         inline_reintroduced |= (
             reintroduced and item.get("prior_feedback") != "reintroduced"
         )
-        hit = matching_history(cand, require_path=True)
         if hit:
-            bypass_closed_feedback = (
-                hit["status"] in {
-                    "author-resolved",
-                    "author-explanation-accepted",
-                }
-                and reintroduced
-            )
             matched_history.append((hit, cand.get("severity"), bypass_closed_feedback))
-            if does_not_reraise(hit) and not bypass_closed_feedback:
+            if disposition == "removed":
                 categorically_removed += 1
                 if hit["status"] == "suppressed":
                     explicit_suppressions.append({"path": cand["path"],
                                                   "summary": summary(item.get("body") or ""),
                                                   "source": hit["source"], "sig": cand["sig"]})
-            elif does_not_reraise(hit):
+            elif disposition == "active":
                 kept.append(
                     {**item, "prior_feedback": "reintroduced"}
                     if reintroduced else item
@@ -2118,8 +2240,8 @@ if report.exists():
             cand = {"path": path_from_block(block), "start_line": start_line,
                     "line": end_line, "sig": signature(block_body),
                     **identity_from_body(block_body)}
-            reintroduced = explicitly_reintroduced(
-                cand,
+            hit, reintroduced, bypass_closed_feedback, disposition = classify_candidate(
+                cand, False,
                 len(block) > 1 and block[1].strip() == REINTRODUCED_MARKER,
             )
             marked_block = (
@@ -2127,23 +2249,15 @@ if report.exists():
                 else [block[0], REINTRODUCED_MARKER, *block[1:]]
             )
             report_reintroduced |= reintroduced and marked_block != block
-            hit = matching_history(cand, require_path=False)
             if hit:
-                bypass_closed_feedback = (
-                    hit["status"] in {
-                        "author-resolved",
-                        "author-explanation-accepted",
-                    }
-                    and reintroduced
-                )
                 matched_history.append((hit, severity_from_body("\n".join(block)), bypass_closed_feedback))
-                if does_not_reraise(hit) and not bypass_closed_feedback:
+                if disposition == "removed":
                     categorically_removed += 1
                     if hit["status"] == "suppressed":
                         explicit_suppressions.append({"path": cand["path"],
                                                       "summary": summary("\n".join(block)),
                                                       "source": hit["source"], "sig": cand["sig"]})
-                elif does_not_reraise(hit):
+                elif disposition == "active":
                     out.extend(marked_block if reintroduced else block)
                 else:
                     identity = {}
@@ -2244,19 +2358,15 @@ if report.exists():
 # still-present assessments block. This lets a validated fix approve even when
 # the author has not yet clicked Resolve in GitHub.
 report_text = report.read_text() if report.exists() else ""
-def material_item_blocks(item):
-    if item.get("severity") not in {"critical", "high"} or does_not_reraise(item):
-        return False
-    source = item.get("source") or ""
-    assessment = next((line.lower() for line in report_text.splitlines()
-                       if source and source in line), "")
-    return not assessment or not any(clear in assessment for clear in ("fixed", "stale/outdated", "stale"))
 
-blocking_prior = any(material_item_blocks(item) for item in history)
-blocking_match = any(
-    severity in {"critical", "high"} and (reintroduced or not does_not_reraise(item))
-    for item, severity, reintroduced in matched_history
-)
+report_history = [
+    {"status": item["status"], "source": item["url"],
+     "severity": severity_from_body(item["finding"])}
+    for _, line in iter_unfenced_lines(report_text)
+    if (item := earlier_feedback_finding(line))
+]
+blocking_prior = any(material_item_blocks(item, report_text) for item in [*history, *report_history])
+blocking_match = material_match_blocks(matched_history)
 approval = Path(str(report) + ".approval.json")
 if (blocking_prior or blocking_match) and approval.exists():
     try:
@@ -2319,6 +2429,15 @@ cmd_history() {
     fi
     export GH_HOST="$host"
     _review_history_py history "$owner" "$repo" "$n"
+}
+
+cmd_classify_feedback() {
+    local host="${1:-}" owner="${2:-}" repo="${3:-}" n="${4:-}" packet="${5:-}"
+    for v in host owner repo n packet; do
+        [[ -n "${!v}" ]] || die "classify-feedback: missing <$v>"
+    done
+    export GH_HOST="$host"
+    _review_history_py classify "$owner" "$repo" "$n" "$packet"
 }
 
 cmd_resolve() {
@@ -3036,6 +3155,7 @@ case "${1:-}" in
     post-start)       shift; cmd_post_start "$@" ;;
     post-update)      shift; cmd_post_update "$@" ;;
     history)          shift; cmd_history "$@" ;;
+    classify-feedback) shift; cmd_classify_feedback "$@" ;;
     resolve)          shift; cmd_resolve "$@" ;;
     dismissed)        shift; cmd_dismissed "$@" ;;
     dismiss)          shift; cmd_dismiss "$@" ;;
@@ -3043,6 +3163,6 @@ case "${1:-}" in
     process-inline)   shift; process_inline_comments_for_github "$@" ;;
     embed-context)    shift; embed_finding_context "$@" ;;
     check-pins)       shift; cmd_check_pins "$@" ;;
-    "")               die "usage: pr-helper.sh {init [<locator>] | next-run <host> <owner> <repo> <n> | post <host> <owner> <repo> <n> <marker> <report_path> | verify-checkout [<locator>] | post-start <host> <owner> <repo> <n> <marker> <author> | post-update <host> <owner> <repo> <n> <comment_id> <marker> <report_path> <author> <success|failure> [<started_at>] | history <host> <owner> <repo> <n> | resolve <host> <owner> <repo> <n> <resolutions_json> | dismissed <host> <owner> <repo> <n> | dismiss <host> <owner> <repo> <n> <path> <pattern> [<reason>] | compact-report <report_path> [<inline_json>] | process-inline <inline_json> | embed-context <report_path> <context_json> | check-pins <preset> <pins-csv> [<raw-args>]}" ;;
+    "")               die "usage: pr-helper.sh {init [<locator>] | next-run <host> <owner> <repo> <n> | post <host> <owner> <repo> <n> <marker> <report_path> | verify-checkout [<locator>] | post-start <host> <owner> <repo> <n> <marker> <author> | post-update <host> <owner> <repo> <n> <comment_id> <marker> <report_path> <author> <success|failure> [<started_at>] | history <host> <owner> <repo> <n> | classify-feedback <host> <owner> <repo> <n> <canonical_json> | resolve <host> <owner> <repo> <n> <resolutions_json> | dismissed <host> <owner> <repo> <n> | dismiss <host> <owner> <repo> <n> <path> <pattern> [<reason>] | compact-report <report_path> [<inline_json>] | process-inline <inline_json> | embed-context <report_path> <context_json> | check-pins <preset> <pins-csv> [<raw-args>]}" ;;
     *)                die "unknown subcommand: $1" ;;
 esac
