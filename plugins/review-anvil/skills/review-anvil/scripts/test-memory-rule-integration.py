@@ -52,7 +52,8 @@ class LocalIntegrationTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.memory = MemoryStore(REPOSITORY, self.root)
         self.memory.init(42)
-        self.memory.apply(self.memory.prepare(packet()), [{
+        self.prepared = self.memory.prepare(packet())
+        self.memory.apply(self.prepared, [{
             "claim": "Include a kitty in PR descriptions", "rationale": "Explicit standing preference",
             "paths": [], "sources": ["issue_comment:10"], "kind": "observation"}])
         cls = getattr(memory_rules, "LocalRules", None)
@@ -136,6 +137,179 @@ class LocalIntegrationTests(unittest.TestCase):
         self.assertEqual(saved[0]["text"], "Include a small kitty in PR descriptions.")
         self.memory.invalidate(current["observations"][0]["id"], "No longer supported")
         with self.assertRaises(MemoryError): self.rules.apply(current, value)
+
+    def test_incremental_repeated_collection_is_byte_identical_noop(self):
+        self.activate()
+        path = self.rules.directory / "local-rules.json"
+        before, stat = path.read_bytes(), path.stat()
+        prepared = self.memory.prepare(packet())
+        self.memory.apply(prepared, [])
+        context = self.rules.prepare_incremental(base(), prepared)
+        self.assertEqual(context["observations"], [])
+        self.assertEqual(context["active_rules"], [])
+        self.assertEqual(context["incremental"]["changed_observation_ids"], [])
+        self.assertEqual(context["incremental"]["affected_rule_keys"], [])
+        self.rules.apply(context, {"context_digest": context["digest"], "dispositions": [], "rules": []})
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns), (stat.st_ino, stat.st_mtime_ns))
+
+    def test_incremental_unchanged_pr_cannot_authorize_related_topic_reassessment(self):
+        self.activate()
+        path = self.rules.directory / "local-rules.json"
+        before, stat = path.read_bytes(), path.stat()
+        prepared = self.memory.prepare(packet())
+        self.memory.apply(prepared, [])
+        with self.assertRaises(MemoryError):
+            self.rules.prepare_incremental(base(), prepared, related_keys=["pr-description-kitty"])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns), (stat.st_ino, stat.st_mtime_ns))
+
+    def test_incremental_empty_first_collection_does_not_create_catalog(self):
+        store = MemoryStore(REPOSITORY, self.root / "empty")
+        store.init(42)
+        value = packet()
+        value["sources"] = []
+        prepared = store.prepare(value)
+        store.apply(prepared, [])
+        rules = memory_rules.LocalRules(REPOSITORY, self.root / "empty")
+        context = rules.prepare_incremental(base(), prepared)
+        rules.apply(context, {"context_digest": context["digest"], "dispositions": [], "rules": []})
+        self.assertFalse((rules.directory / "local-rules.json").exists())
+
+    def test_incremental_edited_then_deleted_evidence_preserves_unaffected_topic(self):
+        self.activate()
+        incoming = packet()
+        incoming["pr"].update(number=8, url="https://github.com/acme/widgets/pull/8")
+        incoming["sources"][0].update(
+            id="issue_comment:11", body="Keep public API names stable.",
+            url="https://github.com/acme/widgets/pull/8#issuecomment-11")
+        prepared = self.memory.prepare(incoming)
+        self.memory.apply(prepared, [{
+            "claim": "Keep public API names stable.", "rationale": "Public contract.",
+            "paths": [], "sources": ["issue_comment:11"], "kind": "observation"}])
+        context = self.rules.prepare_incremental(base(), prepared)
+        value = assessment(context)
+        value["rules"][0].update(key="stable-public-api", text="Keep public API names stable.")
+        saved = self.rules.apply(context, value)
+        untouched = next(rule for rule in saved["rules"] if rule["key"] == "stable-public-api")
+        untouched_disposition = next(item for item in saved["assessment"]["dispositions"]
+                                     if item["observation_id"] == context["observations"][0]["id"])
+        for deleted in (False, True):
+            changed = packet()
+            if deleted:
+                changed["sources"] = []
+            else:
+                changed["sources"][0]["body"] = "This preference no longer applies."
+            prepared = self.memory.prepare(changed)
+            self.memory.apply(prepared, [])
+            context = self.rules.prepare_incremental(base(), prepared)
+            if not deleted:
+                self.assertEqual(context["incremental"]["affected_rule_keys"], ["pr-description-kitty"])
+                self.assertEqual(context["observations"], [])
+                self.assertEqual(context["active_rules"], [])
+            saved = self.rules.apply(context, {
+                "context_digest": context["digest"], "dispositions": [], "rules": []})
+            self.assertEqual(saved["rules"], [untouched])
+            self.assertIn(untouched_disposition, saved["assessment"]["dispositions"])
+            self.assertIn("pr-description-kitty", saved["known_rules"])
+
+    def test_incremental_historical_topic_is_not_a_related_current_topic(self):
+        self.activate()
+        full = self.rules.prepare(base())
+        self.rules.apply(full, assessment(full, activate=False))
+        changed = packet()
+        changed["sources"][0]["body"] = "A changed explicit convention."
+        prepared = self.memory.prepare(changed)
+        self.memory.apply(prepared, [{
+            "claim": "A changed convention.", "rationale": "Explicit standing preference.",
+            "paths": [], "sources": ["issue_comment:10"], "kind": "observation"}])
+        context = self.rules.prepare_incremental(base(), prepared)
+        self.assertIn("pr-description-kitty", context["known_rules"])
+        self.assertEqual(context["current_rules"], {})
+        with self.assertRaises(MemoryError):
+            self.rules.prepare_incremental(base(), prepared, related_keys=["pr-description-kitty"])
+        saved = self.rules.apply(context, assessment(context))
+        self.assertEqual([rule["key"] for rule in saved["rules"]], ["pr-description-kitty"])
+
+    def test_incremental_new_observation_on_unchanged_source_is_delta(self):
+        self.activate()
+        prepared = self.memory.prepare(packet())
+        self.memory.apply(prepared, [{
+            "claim": "Keep the PR template concise.", "rationale": "A separate explicit constraint.",
+            "paths": [], "sources": ["issue_comment:10"], "kind": "observation"}])
+        context = self.rules.prepare_incremental(base(), prepared)
+        self.assertEqual([record["claim"] for record in context["observations"]],
+                         ["Keep the PR template concise."])
+        value = assessment(context)
+        value["rules"][0].update(key="concise-pr-template", text="Keep the PR template concise.")
+        self.rules.apply(context, value)
+        self.assertEqual(len(self.rules.inspect_rules()["rules"]), 2)
+
+    def test_incremental_deletion_reassesses_previously_inactive_supported_topic(self):
+        self.activate()
+        oid = next(iter(self.memory.inspect()["observations"]))
+        self.memory.invalidate(oid, "Inactive before this PR collection.")
+        changed = packet()
+        changed["sources"] = []
+        prepared = self.memory.prepare(changed)
+        self.memory.apply(prepared, [])
+        context = self.rules.prepare_incremental(base(), prepared)
+        self.assertEqual(context["incremental"]["changed_observation_ids"], [])
+        self.assertEqual(context["incremental"]["affected_rule_keys"], ["pr-description-kitty"])
+        saved = self.rules.apply(context, {
+            "context_digest": context["digest"], "dispositions": [], "rules": []})
+        self.assertEqual(saved["rules"], [])
+
+    def test_incremental_corrected_observation_keeps_related_topic_and_full_reassessment_replaces(self):
+        self.activate()
+        oid = next(iter(self.memory.inspect()["observations"]))
+        changed = packet()
+        changed["sources"][0]["body"] = "Only include a kitty for documentation changes."
+        prepared = self.memory.prepare(changed)
+        self.memory.apply(prepared, [{
+            "id": oid, "claim": "Include a kitty only for documentation changes.",
+            "rationale": "The maintainer narrowed the exception.", "paths": ["docs/**"],
+            "sources": ["issue_comment:10"], "kind": "observation"}])
+        context = self.rules.prepare_incremental(base(), prepared)
+        self.assertEqual(context["incremental"]["changed_observation_ids"], [oid])
+        self.assertEqual(context["incremental"]["affected_rule_keys"], ["pr-description-kitty"])
+        self.assertEqual(context["observations"][0]["claim"],
+                         "Include a kitty only for documentation changes.")
+        value = assessment(context)
+        value["rules"][0]["paths"] = ["docs/**"]
+        self.rules.apply(context, value)
+        self.assertEqual(self.memory.snapshot(["src/main.py"], "c" * 40)["local_rules"]["rules"], [])
+        self.assertEqual(len(self.memory.snapshot(["docs/guide.md"], "c" * 40)["local_rules"]["rules"]), 1)
+        full = self.rules.prepare(base())
+        self.assertNotIn("incremental", full)
+        self.rules.apply(full, assessment(full, activate=False))
+        self.assertEqual(self.rules.inspect_rules()["rules"], [])
+
+    def test_incremental_first_activation_reapply_is_byte_identical(self):
+        context = self.rules.prepare_incremental(base(), self.prepared)
+        value = assessment(context)
+        first = self.rules.apply(context, value)
+        path = self.rules.directory / "local-rules.json"
+        before, stat = path.read_bytes(), path.stat()
+        self.assertEqual(self.rules.apply(context, value), first)
+        self.assertEqual(len(first["rules"]), 1)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns), (stat.st_ino, stat.st_mtime_ns))
+
+    def test_incremental_deleted_active_source_lists_affected_key_without_support(self):
+        self.activate()
+        oid = next(iter(self.memory.inspect()["observations"]))
+        changed = packet()
+        changed["sources"] = []
+        prepared = self.memory.prepare(changed)
+        self.memory.apply(prepared, [])
+        context = self.rules.prepare_incremental(base(), prepared)
+        self.assertEqual(context["incremental"]["changed_observation_ids"], [oid])
+        self.assertEqual(context["incremental"]["affected_rule_keys"], ["pr-description-kitty"])
+        self.assertEqual(context["observations"], [])
+        saved = self.rules.apply(context, {
+            "context_digest": context["digest"], "dispositions": [], "rules": []})
+        self.assertEqual(saved["rules"], [])
 
     def test_legacy_signed_metadata_migrates_as_history_not_active_policy(self):
         oid = next(iter(self.memory.inspect()["observations"]))

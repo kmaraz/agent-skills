@@ -70,6 +70,31 @@ print(json.dumps(responses[endpoint]))
             self.assertNotEqual(result.returncode, 0)
         return result
 
+    def test_assembled_assessment_must_preserve_final_rule_prose(self):
+        context = self.root / "context.json"
+        final = self.root / "final.json"
+        assembled = self.root / "assembled.json"
+        output = self.root / "result.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--output", str(context))
+        value = fixture.assessment(json.loads(context.read_text()))
+        final.write_text(json.dumps(value))
+        self.run_cli("rules-apply", "--context", str(context), "--assessment", str(final),
+                     "--output", str(self.root / "baseline.json"))
+        catalog = self.memory.directory / "local-rules.json"
+        before = catalog.read_bytes()
+        value["rules"][0]["text"] = "I clude a ki  y i  PR descrip io s."
+        assembled.write_text(json.dumps(value))
+        args = ("rules-apply", "--context", str(context), "--assessment", str(assembled),
+                "--expected-assessment", str(final), "--output", str(output))
+        result = self.run_cli(*args, success=False)
+        self.assertIn("pr-description-kitty: text", result.stderr)
+        self.assertEqual(catalog.read_bytes(), before)
+        self.assertFalse(output.exists())
+        assembled.write_bytes(final.read_bytes())
+        self.run_cli(*args)
+        self.assertEqual(json.loads(output.read_text())["rules"][0]["text"],
+                         "Include a kitty in PR descriptions.")
+
     def test_no_post_local_activation_next_review_loading_and_remote_gets_only(self):
         context_path=self.root/"context.json"; assessment_path=self.root/"assessment.json"; output_path=self.root/"activated.json"
         self.run_cli("rules-prepare", "acme/widgets", "--output", str(context_path))
@@ -93,6 +118,335 @@ print(json.dumps(responses[endpoint]))
         calls=[json.loads(line) for line in (self.root/"gh-calls.jsonl").read_text().splitlines()]
         self.assertTrue(calls)
         self.assertTrue(all(call[call.index("--method")+1]=="GET" for call in calls))
+
+    def applied_learning_feedback(self, number, source_kind, mixed=False):
+        collected = fixture.packet()
+        collected["pr"].update(number=number, body="Keep dependency upgrade fixes together.",
+                               url=f"https://github.com/acme/widgets/pull/{number}")
+        source = collected["sources"][0]
+        source.update(body="Keep dependency upgrade fixes together.",
+                      url=collected["pr"]["url"])
+        if source_kind == "pr":
+            source.update(id=f"pr:{number}:body", kind="pr")
+        elif source_kind == "bot":
+            source.update(id=f"issue_comment:{number * 10}",
+                          author={"login": "review-bot[bot]", "type": "Bot"})
+        else:
+            source.update(id=f"issue_comment:{number * 10}",
+                          body="Keep dependency upgrade fixes together.\n"
+                               "<!-- review-anvil: id=RAV-RUN1-R1-F001 severity=low area=maintenance -->")
+        if mixed:
+            human = copy.deepcopy(source)
+            human.update(id=f"review_comment:{number * 10}", kind="review_comment",
+                         body="Prefer keeping dependency upgrades and required fixes together; unrelated cleanup stays separate.",
+                         url=f"{collected['pr']['url']}#discussion_r{number * 10}",
+                         author={"login": "maintainer", "type": "User"})
+            collected["sources"].append(human)
+        prepared_path = self.root / f"learning-prepared-{number}.json"
+        prepared_path.write_text(json.dumps(self.memory.prepare(collected)))
+        observations_path = self.root / f"learning-observations-{number}.json"
+        observations_path.write_text(json.dumps([{
+            "claim": "Keep dependency upgrades and required fixes together",
+            "rationale": "Standing preference; unrelated cleanup stays separate.",
+            "paths": ["package.json"], "sources": [item["id"] for item in collected["sources"]],
+            "kind": "observation"}]))
+        self.run_cli("apply", "--prepared", str(prepared_path), "--observations", str(observations_path))
+        return prepared_path
+
+    def assert_context_only_learning_rejected(self, source_kind):
+        self.activate_initial_rules()
+        for number, incremental in ((8, False), (9, True)):
+            with self.subTest(incremental=incremental):
+                prepared_path = self.applied_learning_feedback(number, source_kind)
+                context_path = self.root / f"unsupported-context-{number}.json"
+                scope = ["--prepared", str(prepared_path)] if incremental else []
+                self.run_cli("rules-prepare", "acme/widgets", *scope, "--output", str(context_path))
+                context = json.loads(context_path.read_text())
+                source_id = f"pr:{number}:body" if source_kind == "pr" else f"issue_comment:{number * 10}"
+                ids = [item["id"] for item in context["observations"] if source_id in item["sources"]]
+                self.assertEqual(len(ids), 1)
+                value = fixture.assessment(context, activate=False)
+                for disposition in value["dispositions"]:
+                    if disposition["observation_id"] in ids:
+                        disposition.update(disposition="activate", reason="Proposed standing preference.")
+                rule = fixture.assessment(context)["rules"][0]
+                rule.update(key="dependency-upgrade-fixes", title="Keep upgrade fixes together",
+                            text="Keep dependency upgrades and required fixes together.", observation_ids=ids)
+                value["rules"] = [rule]
+                assessment_path = self.root / f"unsupported-assessment-{number}.json"
+                assessment_path.write_text(json.dumps(value))
+                output_path = self.root / f"unsupported-result-{number}.json"
+                output_path.write_text("preserve existing output")
+                before = {path.name: path.read_bytes() for path in self.memory.directory.iterdir() if path.is_file()}
+                result = self.run_cli("rules-apply", "--context", str(context_path),
+                                      "--assessment", str(assessment_path), "--output", str(output_path), success=False)
+                self.assertEqual(json.loads(result.stderr)["status"], "unavailable")
+                self.assertEqual(output_path.read_text(), "preserve existing output")
+                self.assertEqual({path.name: path.read_bytes() for path in self.memory.directory.iterdir()
+                                  if path.is_file()}, before)
+        calls = [json.loads(line) for line in (self.root / "gh-calls.jsonl").read_text().splitlines()]
+        self.assertTrue(calls)
+        self.assertTrue(all(call[call.index("--method") + 1] == "GET" for call in calls))
+
+    def test_description_only_activation_rejected_without_state_changes(self):
+        self.assert_context_only_learning_rejected("pr")
+
+    def test_bot_only_activation_rejected_without_state_changes(self):
+        self.assert_context_only_learning_rejected("bot")
+
+    def test_generated_review_under_human_account_rejected_without_state_changes(self):
+        self.assert_context_only_learning_rejected("generated")
+
+    def assert_mixed_review_learning_activates(self, incremental):
+        self.activate_initial_rules()
+        prepared_path = self.applied_learning_feedback(8, "pr", mixed=True)
+        context_path = self.root / "mixed-context.json"
+        scope = ["--prepared", str(prepared_path)] if incremental else []
+        self.run_cli("rules-prepare", "acme/widgets", *scope, "--output", str(context_path))
+        context = json.loads(context_path.read_text())
+        value = fixture.assessment(context)
+        ids = [item["id"] for item in context["observations"] if "review_comment:80" in item["sources"]]
+        self.assertEqual(len(ids), 1)
+        rule = copy.deepcopy(value["rules"][0])
+        rule.update(key="dependency-upgrade-fixes", title="Keep upgrade fixes together",
+                    text="Prefer keeping dependency upgrades and required fixes together.",
+                    paths=["package.json"], exceptions=["Unrelated cleanup stays separate."], observation_ids=ids)
+        value["rules"][0]["observation_ids"] = [
+            item["id"] for item in context["observations"] if "issue_comment:10" in item["sources"]]
+        value["rules"] = ([value["rules"][0]] if value["rules"][0]["observation_ids"] else []) + [rule]
+        assessment_path = self.root / "mixed-assessment.json"
+        assessment_path.write_text(json.dumps(value))
+        output_path = self.root / "mixed-result.json"
+        self.run_cli("rules-apply", "--context", str(context_path),
+                     "--assessment", str(assessment_path), "--output", str(output_path))
+        saved = next(item for item in json.loads(output_path.read_text())["rules"]
+                     if item["key"] == "dependency-upgrade-fixes")
+        self.assertEqual(saved["observation_ids"], ids)
+        self.assertEqual(saved["type"], "preference")
+        self.assertEqual(saved["exceptions"], ["Unrelated cleanup stays separate."])
+        self.assertEqual(set(saved["source_urls"]), {
+            "https://github.com/acme/widgets/pull/8", "https://github.com/acme/widgets/pull/8#discussion_r80"})
+        snapshot_path = self.root / "mixed-snapshot.json"
+        self.run_cli("snapshot", "--repository", "acme/widgets", "--revision", "c" * 40,
+                     "--files", "package.json", "--output", str(snapshot_path))
+        self.assertIn("dependency-upgrade-fixes", {
+            item["key"] for item in json.loads(snapshot_path.read_text())["local_rules"]["rules"]})
+        calls = [json.loads(line) for line in (self.root / "gh-calls.jsonl").read_text().splitlines()]
+        self.assertTrue(calls)
+        self.assertTrue(all(call[call.index("--method") + 1] == "GET" for call in calls))
+
+    def test_full_mixed_description_and_human_review_activation(self):
+        self.assert_mixed_review_learning_activates(incremental=False)
+
+    def test_incremental_mixed_description_and_human_review_activation(self):
+        self.assert_mixed_review_learning_activates(incremental=True)
+
+    def activate_initial_rules(self, second_topic=False):
+        if second_topic:
+            self.applied_feedback(number=9)
+        context_path = self.root / "initial-context.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--output", str(context_path))
+        context = json.loads(context_path.read_text())
+        value = fixture.assessment(context)
+        if second_topic:
+            value["rules"][0]["observation_ids"] = [
+                item["id"] for item in context["observations"] if "issue_comment:10" in item["sources"]]
+            rule = copy.deepcopy(value["rules"][0])
+            rule.update(key="description-context", title="Describe the change",
+                        text="Describe the maintenance context in PR descriptions.")
+            rule["observation_ids"] = [
+                item["id"] for item in context["observations"] if "issue_comment:90" in item["sources"]]
+            value["rules"].append(rule)
+        assessment_path = self.root / "initial-assessment.json"
+        assessment_path.write_text(json.dumps(value))
+        output_path = self.root / "initial-rules.json"
+        self.run_cli("rules-apply", "--context", str(context_path),
+                     "--assessment", str(assessment_path), "--output", str(output_path))
+        return json.loads(output_path.read_text())
+
+    def applied_feedback(self, number=8):
+        collected = fixture.packet()
+        collected["pr"].update(number=number, url=f"https://github.com/acme/widgets/pull/{number}")
+        source = collected["sources"][0]
+        source.update(id=f"issue_comment:{number * 10}", body="Keep dependency upgrade fixes together.",
+                      url=f"https://github.com/acme/widgets/pull/{number}#issuecomment-{number * 10}")
+        prepared = self.memory.prepare(collected)
+        prepared_path = self.root / f"prepared-{number}.json"
+        prepared_path.write_text(json.dumps(prepared))
+        observations_path = self.root / f"observations-{number}.json"
+        observations_path.write_text(json.dumps([{
+            "claim": "Keep dependency upgrade fixes together", "rationale": "Explicit maintenance preference",
+            "paths": [], "sources": [source["id"]], "kind": "observation"}]))
+        self.run_cli("apply", "--prepared", str(prepared_path), "--observations", str(observations_path))
+        return prepared_path
+
+    def test_incremental_prepare_apply_preserves_unrelated_rule_and_snapshot(self):
+        initial = self.activate_initial_rules()
+        old_rule = initial["rules"][0]
+        prepared_path = self.applied_feedback()
+        context_path = self.root / "incremental-context.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--prepared", str(prepared_path),
+                     "--output", str(context_path))
+        context = json.loads(context_path.read_text())
+        self.assertEqual(len(context["observations"]), 1)
+        self.assertEqual(set(context["sources"]), {"issue_comment:80"})
+        self.assertEqual(context["incremental"]["affected_rule_keys"], [])
+        value = fixture.assessment(context)
+        value["rules"][0].update(key="dependency-upgrade-fixes", title="Keep upgrade fixes together",
+                                 text="Keep dependency upgrades and required fixes together.")
+        assessment_path = self.root / "incremental-assessment.json"
+        assessment_path.write_text(json.dumps(value))
+        output_path = self.root / "incremental-rules.json"
+        self.run_cli("rules-apply", "--context", str(context_path),
+                     "--assessment", str(assessment_path), "--output", str(output_path))
+        rules = json.loads(output_path.read_text())["rules"]
+        self.assertEqual(next(rule for rule in rules if rule["key"] == old_rule["key"]), old_rule)
+        self.assertEqual({rule["key"] for rule in rules}, {"pr-description-kitty", "dependency-upgrade-fixes"})
+        snapshot_path = self.root / "incremental-snapshot.json"
+        self.run_cli("snapshot", "--repository", "acme/widgets", "--revision", "c" * 40,
+                     "--output", str(snapshot_path))
+        snapshot = json.loads(snapshot_path.read_text())
+        self.assertEqual({rule["key"] for rule in snapshot["local_rules"]["rules"]},
+                         {"pr-description-kitty", "dependency-upgrade-fixes"})
+        calls = [json.loads(line) for line in (self.root / "gh-calls.jsonl").read_text().splitlines()]
+        self.assertTrue(calls)
+        self.assertTrue(all(call[call.index("--method") + 1] == "GET" for call in calls))
+
+    def test_incremental_repeated_related_keys_reuse_topics_with_complete_support(self):
+        initial = self.activate_initial_rules(second_topic=True)
+        prepared_path = self.applied_feedback()
+        context_path = self.root / "related-context.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--prepared", str(prepared_path),
+                     "--related-key", "pr-description-kitty", "--related-key", "description-context",
+                     "--output", str(context_path))
+        context = json.loads(context_path.read_text())
+        self.assertEqual(set(context["incremental"]["affected_rule_keys"]),
+                         {"pr-description-kitty", "description-context"})
+        self.assertEqual(set(context["sources"]), {"issue_comment:10", "issue_comment:80", "issue_comment:90"})
+        self.assertEqual(len(context["observations"]), 3)
+        value = fixture.assessment(context)
+        second_rule = copy.deepcopy(value["rules"][0])
+        second_rule.update(key="description-context", title="Describe the change",
+                           text="Describe the maintenance context in PR descriptions.")
+        value["rules"].append(second_rule)
+        assessment_path = self.root / "related-assessment.json"
+        assessment_path.write_text(json.dumps(value))
+        output_path = self.root / "related-rules.json"
+        self.run_cli("rules-apply", "--context", str(context_path),
+                     "--assessment", str(assessment_path), "--output", str(output_path))
+        rules = json.loads(output_path.read_text())["rules"]
+        self.assertEqual({rule["key"]: rule["id"] for rule in rules},
+                         {rule["key"]: rule["id"] for rule in initial["rules"]})
+        self.assertTrue(all(len(rule["observation_ids"]) == 3 for rule in rules))
+
+    def test_incremental_unchanged_collection_is_byte_identical_noop(self):
+        self.activate_initial_rules()
+        prepared_path = self.root / "unchanged-prepared.json"
+        prepared_path.write_text(json.dumps(self.memory.prepare(fixture.packet())))
+        observations_path = self.root / "empty-observations.json"
+        observations_path.write_text("[]")
+        self.run_cli("apply", "--prepared", str(prepared_path), "--observations", str(observations_path))
+        catalog_path = self.memory.directory / "local-rules.json"
+        before = catalog_path.read_bytes()
+        context_path = self.root / "noop-context.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--prepared", str(prepared_path),
+                     "--output", str(context_path))
+        context = json.loads(context_path.read_text())
+        self.assertEqual(context["observations"], [])
+        self.assertEqual(context["incremental"]["changed_observation_ids"], [])
+        self.assertEqual(context["incremental"]["affected_rule_keys"], [])
+        self.assertEqual(catalog_path.read_bytes(), before)
+        assessment_path = self.root / "noop-assessment.json"
+        assessment_path.write_text(json.dumps(fixture.assessment(context, activate=False)))
+        self.run_cli("rules-apply", "--context", str(context_path),
+                     "--assessment", str(assessment_path), "--output", str(self.root / "noop-result.json"))
+        self.assertEqual(catalog_path.read_bytes(), before)
+
+    def test_rules_prepare_rejects_related_key_without_prepared_before_side_effects(self):
+        before = {path.name: path.read_bytes() for path in self.memory.directory.iterdir() if path.is_file()}
+        output_path = self.root / "forbidden-context.json"
+        result = self.run_cli("rules-prepare", "acme/widgets", "--related-key", "pr-description-kitty",
+                              "--output", str(output_path), success=False)
+        self.assertIn("--prepared", result.stderr)
+        self.assertFalse(output_path.exists())
+        self.assertFalse((self.root / "gh-calls.jsonl").exists())
+        self.assertEqual({path.name: path.read_bytes() for path in self.memory.directory.iterdir() if path.is_file()}, before)
+
+    def test_incremental_prepare_rejects_unapplied_and_tampered_transactions(self):
+        self.activate_initial_rules()
+        collected = fixture.packet()
+        collected["sources"][0]["body"] = "Changed feedback not yet applied."
+        unapplied = self.memory.prepare(collected)
+        applied_path = self.applied_feedback()
+        tampered = json.loads(applied_path.read_text())
+        tampered["packet"]["pr"]["number"] = 9
+        before = {path.name: path.read_bytes() for path in self.memory.directory.iterdir() if path.is_file()}
+        for name, prepared in (("unapplied", unapplied), ("tampered", tampered)):
+            with self.subTest(name=name):
+                prepared_path = self.root / f"{name}.json"
+                prepared_path.write_text(json.dumps(prepared))
+                output_path = self.root / f"{name}-context.json"
+                self.run_cli("rules-prepare", "acme/widgets", "--prepared", str(prepared_path),
+                             "--output", str(output_path), success=False)
+                self.assertFalse(output_path.exists())
+                self.assertEqual({path.name: path.read_bytes() for path in self.memory.directory.iterdir() if path.is_file()}, before)
+
+    def test_explicit_full_prepare_empty_assessment_replaces_native_catalog(self):
+        self.activate_initial_rules()
+        self.applied_feedback()
+        context_path = self.root / "full-context.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--output", str(context_path))
+        context = json.loads(context_path.read_text())
+        self.assertNotIn("incremental", context)
+        self.assertEqual(len(context["observations"]), 2)
+        assessment_path = self.root / "full-assessment.json"
+        assessment_path.write_text(json.dumps(fixture.assessment(context, activate=False)))
+        output_path = self.root / "full-result.json"
+        self.run_cli("rules-apply", "--context", str(context_path),
+                     "--assessment", str(assessment_path), "--output", str(output_path))
+        result = json.loads(output_path.read_text())
+        self.assertEqual(result["rules"], [])
+        self.assertEqual(len(result["assessment"]["dispositions"]), 2)
+
+    def test_incremental_current_topic_index_excludes_historical_keys_but_preserves_identity(self):
+        initial = self.activate_initial_rules()
+        old_rule = initial["rules"][0]
+        full_context_path = self.root / "retirement-context.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--output", str(full_context_path))
+        full_context = json.loads(full_context_path.read_text())
+        retirement_path = self.root / "retirement-assessment.json"
+        retirement_path.write_text(json.dumps(fixture.assessment(full_context, activate=False)))
+        self.run_cli("rules-apply", "--context", str(full_context_path),
+                     "--assessment", str(retirement_path), "--output", str(self.root / "retired.json"))
+        prepared_path = self.applied_feedback()
+        context_path = self.root / "historical-context.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--prepared", str(prepared_path),
+                     "--output", str(context_path))
+        context = json.loads(context_path.read_text())
+        self.assertEqual(context["current_rules"], {})
+        self.assertIn("pr-description-kitty", context["known_rules"])
+        self.assertEqual(context["incremental"]["affected_rule_keys"], [])
+        catalog_path = self.memory.directory / "local-rules.json"
+        before = catalog_path.read_bytes()
+        rejected_path = self.root / "historical-related.json"
+        self.run_cli("rules-prepare", "acme/widgets", "--prepared", str(prepared_path),
+                     "--related-key", "pr-description-kitty", "--output", str(rejected_path), success=False)
+        self.assertFalse(rejected_path.exists())
+        self.assertEqual(catalog_path.read_bytes(), before)
+        # Reusing an identity is allowed only for a genuinely delta-backed rule.
+        value = fixture.assessment(context)
+        value["rules"][0].update(title="Keep upgrade fixes together",
+                                 text="Keep dependency upgrades and required fixes together.")
+        assessment_path = self.root / "new-topic-assessment.json"
+        assessment_path.write_text(json.dumps(value))
+        output_path = self.root / "new-topic-result.json"
+        self.run_cli("rules-apply", "--context", str(context_path),
+                     "--assessment", str(assessment_path), "--output", str(output_path))
+        rules = json.loads(output_path.read_text())["rules"]
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["id"], old_rule["id"])
+        self.assertEqual(rules[0]["text"], "Keep dependency upgrades and required fixes together.")
+        self.assertNotEqual(rules[0]["observation_ids"], old_rule["observation_ids"])
 
     def test_resolve_pr_uses_canonical_identity_without_discussion_or_memory(self):
         responses = {

@@ -121,10 +121,14 @@ def parser():
     verify.add_argument("--snapshot", required=True)
     rules_prepare = sub.add_parser("rules-prepare", help="Capture active knowledge and base policy for assessment")
     rules_prepare.add_argument("repository")
+    rules_prepare.add_argument("--prepared", help="Limit learning to an applied PR feedback transaction")
+    rules_prepare.add_argument("--related-key", action="append", default=[],
+                               help="Include an existing native topic in incremental assessment (repeatable)")
     rules_prepare.add_argument("--output", required=True)
     rules_apply = sub.add_parser("rules-apply", help="Validate assessment and activate local source-backed rules")
     rules_apply.add_argument("--context", required=True)
     rules_apply.add_argument("--assessment", required=True)
+    rules_apply.add_argument("--expected-assessment", help="Check against the retained final assessment before saving")
     rules_apply.add_argument("--output", required=True)
     rules_inspect = sub.add_parser("rules-inspect", help="Inspect saved local rules and historical migration provenance")
     rules_inspect.add_argument("repository")
@@ -387,14 +391,28 @@ def main(argv=None):
                 rules.init(target_repo["id"])
                 output(rules.import_rules(source, selections), args.output)
             elif args.command == "rules-prepare":
+                if args.related_key and not args.prepared:
+                    raise ValueError("--related-key requires --prepared")
                 base = read_policy(args.repository)
                 rules = LocalRules(base["repository"])
                 rules.init(base["repository_id"])
-                output(rules.prepare(base), args.output)
+                context = (rules.prepare_incremental(base, read_json(args.prepared), related_keys=args.related_key)
+                           if args.prepared else rules.prepare(base))
+                output(context, args.output)
             elif args.command == "rules-apply":
                 context = read_json(args.context)
                 rules = LocalRules(context["repository"])
-                output(rules.apply(context, read_json(args.assessment)), args.output)
+                assessment = read_json(args.assessment)
+                if args.expected_assessment:
+                    expected = read_json(args.expected_assessment)
+                    if assessment != expected:
+                        for actual, original in zip(assessment.get("rules", []), expected.get("rules", [])):
+                            if isinstance(actual, dict) and isinstance(original, dict):
+                                for field in sorted(actual.keys() | original.keys()):
+                                    if actual.get(field) != original.get(field):
+                                        raise MemoryError(f"Final assessment differs for {original.get('key')}: {field}")
+                        raise MemoryError("Assessment differs from the retained final assessment")
+                output(rules.apply(context, assessment), args.output)
             else:
                 repo = resolve_repository(args.repository)
                 rules = LocalRules(repository_key(repo))

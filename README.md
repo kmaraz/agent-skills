@@ -173,9 +173,12 @@ new skills. The native invocation is `/skill:<name>`:
 /skill:review-anvil-pr sli-do/slido-frontend#12345, memory: off, post: false
 ```
 
-The default PR review initializes memory automatically. Each run processes
-complete current PR discussion, asks the invoking model for source-backed
-advisory observations, and freezes the selected knowledge for all review stages.
+The default PR review initializes memory automatically. Each run reads complete
+current human PR discussion, asks the invoking model for source-backed advisory
+observations, and freezes selected knowledge for all review stages. Proposals,
+author replies, objections and accepted qualifications supply learning evidence.
+PR descriptions/code are context only; bot/generated reviews (even under a
+human account), merge/approval state and praise alone do not establish criteria.
 It needs existing `gh` and reviewer authentication, not a new API service.
 An empty first run is normal. Initialization alone does not scan PR history;
 explicit seed PRs use the same learning workflow without reviewing or posting.
@@ -208,12 +211,22 @@ backend selections still require their actual CLIs.
 
 #### Automatic local rules
 
-Successful memory-enabled PR reviews assess project knowledge and save reusable
-rules to private `local-rules.json` by default. The next review loads supported,
-path-scoped rules into its frozen memory snapshot. An explicit standing-rule
-assertion can justify a rule from one PR; a playful topic does not negate it.
-The model checks original sources, scope, exceptions, conflicts and current
-base-side project policy before activation.
+Successful memory-enabled PR reviews incrementally learn reusable rules into
+private `local-rules.json` by default. Learning uses the review's original
+applied PR preparation and only its changed observations plus affected/related
+native topics; unrelated rules stay unchanged. No delta skips model learning
+and catalog mutation. The existing invoking model selects related topics from
+the compact current-native-topic index and compares complete candidate criteria,
+not just keys. It reads complete original human support, merges equivalent
+recommendations under the supported canonical stable key/ID and unions genuine
+support while preserving author qualifications, exceptions and optional wording.
+Historical-only topic IDs are identity metadata, not criteria to resurrect.
+Every activated observation needs its own substantive human-discussion support;
+missing/insufficient evidence stays context-only or triage. One clear standing
+human convention can suffice, but discussion existence is not endorsement.
+The model checks scope, authority, conflicts and current base-side policy.
+There is no extra model cohort or automatic full-history fallback. The next
+review loads supported, path-scoped rules into its frozen snapshot.
 
 The private rule catalog and CLI JSON artifacts share the memory store's
 64 MiB per-file safety limit. Oversized outputs fail before creating an artifact;
@@ -228,15 +241,32 @@ not the catalog. Pretty-printed snapshots can exceed their canonical size;
 selection is measured before display formatting.
 
 ```text
-/skill:review-anvil-rules sli-do/slido-frontend
+/skill:review-anvil-rules reassess: sli-do/slido-frontend
 /skill:review-anvil-rules inspect: sli-do/slido-frontend
 ```
 
-This command always learns locally. It creates no branches, commits, proposal
-PRs or changes in the reviewed repository. Ordinary PR review comments remain
-independently controlled by `post`: `post: false` still learns and applies local
-rules. `rules: off` skips new rule generation but loads supported saved rules;
-`memory: off` disables both observations and learned rules.
+`reassess:` explicitly assesses the full retained active history and replaces
+the native learned-rule catalog; back up private `local-rules.json` first.
+It reads locally retained complete original human discussions, not a fresh
+GitHub collection or rules inferred from descriptions/code. Bounded reading
+batches must feed a global semantic integration of **all complete candidates**
+before activation: compare text, scope, conditions, type, exceptions and support
+IDs, not just key collisions. Reuse currently supported canonical topics over
+historical aliases, union genuine support, retain author qualifications and
+optional obligations, and triage contradictions. Read full originals for every
+merged/ambiguous group; keep compact integration decisions and an accurate
+change digest outside Git. This uses the existing model/orchestrator, without
+hidden provider calls, extra cohorts, approval gates or automatic retries.
+A bare repository invocation remains a compatible explicit manual full
+reassessment, never an automatic PR-learning command. `inspect:` only inspects.
+Explicit init seed finalization is deliberately full so it covers historical
+learning across the selected seeds, not just the final PR.
+
+Learning creates no branches, commits, proposal PRs or reviewed-repository
+changes. Ordinary review comments remain independently controlled by `post`:
+`post: false` still learns and applies local rules. `rules: off` skips new
+generation but loads supported saved rules; `memory: off` disables both
+observations and learned rules.
 
 Changed or invalidated native supporting evidence excludes affected rules.
 Unrelated memory updates do not discard them. Base-side project policy takes precedence

@@ -12,6 +12,50 @@ _LEGACY = "rule-proposals.json"
 _RULE_FIELDS = {"key", "title", "text", "paths", "exceptions", "examples", "rationale", "observation_ids", "type"}
 _DISPOSITIONS = {"activate", "context-only", "already-covered", "needs-triage"}
 _METADATA_FIELDS = {"schema_version", "repository", "repository_id", "rules", "known_rules", "assessment", "legacy_publication", "signature", "digest"}
+_GENERATED_DISCUSSION = re.compile(
+    r"<!--\s*review-anvil(?:-marker)?:"
+    r"|Reviewed with \[review-anvil\]\(https://github\.com/mrshu/agent-skills/#review-anvil\)",
+    re.IGNORECASE)
+
+
+def _human_discussion(source):
+    author = source["author"]
+    login = author["login"]
+    body = source["body"]
+    if (source["kind"] not in {"review_comment", "issue_comment", "review"}
+            or not body.strip() or _GENERATED_DISCUSSION.search(body)
+            or author["type"] != "User" or not isinstance(login, str) or not login.strip()
+            or login != login.strip()):
+        return False
+    identity = login.lower()
+    return (identity not in {"ghost", "deleted", "deleted-user", "[deleted]", "unknown", "bot",
+                             "github-actions", "dependabot", "renovate"}
+            and not identity.endswith(("[bot]", "-bot", "_bot")))
+
+
+def _criterion(rule):
+    # Canonical prose is already outer-trimmed by _assessment. Preserve case and
+    # internal whitespace: they can be significant in symbols and code examples.
+    return rule["text"], tuple(rule["paths"]), tuple(sorted(set(rule["exceptions"])))
+
+
+def _learning_policy(context, rules, untouched):
+    """New activation policy, deliberately separate from historical validation."""
+    if not rules:
+        return
+    eligible = {sid for sid, saved in context["sources"].items() if _human_discussion(saved["source"])}
+    supporting = {oid for rule in rules for oid in rule["observation_ids"]}
+    for record in context["observations"]:
+        if record["id"] in supporting and not eligible.intersection(record["sources"]):
+            raise MemoryError("Activated rule observations require nonempty human review or PR discussion evidence")
+    # Existing duplicates are historical data, not grounds to fail unrelated
+    # incremental learning. Only newly assessed criteria must be unique.
+    topics = {_criterion(rule): rule["key"] for rule in untouched}
+    for rule in rules:
+        criterion = _criterion(rule)
+        if criterion in topics and topics[criterion] != rule["key"]:
+            raise MemoryError("Identical rule text, scope and exceptions require one stable topic key")
+        topics[criterion] = rule["key"]
 
 
 def _fields(value, expected, label):
@@ -110,10 +154,12 @@ class LocalRules(MemoryStore):
         self._write_json(directory, _METADATA, signed)
         return signed
 
-    def _evidence(self, state):
+    def _evidence(self, state, observation_ids=None):
         observations, sources = [], {}
-        for oid in sorted(state["observations"]):
-            record = state["observations"][oid]
+        for oid in sorted(state["observations"] if observation_ids is None else observation_ids):
+            record = state["observations"].get(oid)
+            if record is None:
+                continue
             if record["status"] != "active" or not record["sources"]:
                 continue
             for sid in record["sources"]:
@@ -141,6 +187,87 @@ class LocalRules(MemoryStore):
                 "sources": sources, "rules_digest": metadata["digest"],
                 "known_rules": copy.deepcopy(metadata["known_rules"]),
                 "active_rules": self._selected(directory, state, None, metadata)["rules"]})
+
+    def _applied_delta(self, state, prepared):
+        packet = self._packet(prepared["packet"], state)
+        number = packet["pr"]["number"]
+        # Every generation increment has exactly one terminal audit event.
+        # Locate this preparation's transaction, not a later matching PR packet.
+        terminals = [(index, event) for index, event in enumerate(state["audit"])
+                     if event.get("action") in {"checkpoint", "bind-repository", "correct", "invalidate"}]
+        generation = prepared["generation"]
+        if len(terminals) != state["generation"] or generation >= len(terminals):
+            raise MemoryError("PR preparation has not been applied")
+        index, checkpoint = terminals[generation]
+        expected = {"action": "checkpoint", "pr": number, "head_sha": packet["pr"]["head_sha"],
+                    "changed_sources": [source["id"] for source in prepared["changed_sources"]],
+                    "deleted_sources": prepared["deleted_sources"]}
+        if {key: value for key, value in checkpoint.items() if key != "at"} != expected:
+            raise MemoryError("PR preparation does not identify the applied transaction")
+        incoming = {source["id"]: source for source in packet["sources"]}
+        target = {key: packet["pr"][key] for key in ("head_sha", "base_sha", "files")}
+        target["source_ids"] = sorted(incoming)
+        if (state["prs"].get(str(number)) != target
+                or any(state["sources"].get(sid) != {
+                    "source": source, "pr_number": number, "version": _digest(source)}
+                       for sid, source in incoming.items())
+                or any(event.get("action") == "checkpoint" and event.get("pr") == number
+                       for event in state["audit"][index + 1:])):
+            raise MemoryError("PR preparation source or target checkpoint is stale")
+        start = terminals[generation - 1][0] + 1 if generation else 0
+        changed = {event["observation_id"] for event in state["audit"][start:index]
+                   if event.get("action") in {"learn", "correct-extraction", "invalidate-evidence"}}
+        if any(event.get("observation_id") in changed for event in state["audit"][index + 1:]):
+            raise MemoryError("Applied PR observations changed after collection")
+        before = {record["id"]: record for record in prepared["existing_observations"]}
+        return sorted(oid for oid in changed
+                      if oid in state["observations"]
+                      and (oid not in before or _record(before[oid]) != _record(state["observations"][oid])))
+
+    def prepare_incremental(self, base, prepared, related_keys=()):
+        self.verify_prepared(prepared)
+        if not isinstance(related_keys, (list, tuple)) or any(not isinstance(key, str) for key in related_keys):
+            raise MemoryError("Related rule keys must be a list of current native topics")
+        with self._locked(exclusive=True) as directory:
+            state = self._state(directory)
+            base = self._base(base, state)
+            metadata = self._metadata(directory, state)
+            changed = self._applied_delta(state, prepared)
+            if related_keys and not changed:
+                raise MemoryError("Related topics require changed PR observations")
+            current = {rule["key"]: {"id": rule["id"], "title": rule["title"]}
+                       for rule in metadata["rules"]}
+            if any(key not in current for key in related_keys):
+                raise MemoryError("Related rule key is not a current native topic")
+            affected, support = set(related_keys), set(changed)
+            stale_sources = set(prepared["deleted_sources"]) | {
+                source["id"] for source in prepared["changed_sources"]}
+            before = {record["id"]: record for record in prepared["existing_observations"]}
+            affected.update(
+                rule["key"] for rule in metadata["rules"]
+                if any(stale_sources.intersection(before.get(oid, {}).get("sources", []))
+                       for oid in rule["observation_ids"]))
+            # Shared support is indivisible: closing over it prevents a partial
+            # assessment from silently changing another topic's disposition.
+            while True:
+                previous = len(affected), len(support)
+                for rule in metadata["rules"]:
+                    if rule["key"] in affected or support.intersection(rule["observation_ids"]):
+                        affected.add(rule["key"])
+                        support.update(rule["observation_ids"])
+                if previous == (len(affected), len(support)):
+                    break
+            observations, sources = self._evidence(state, support)
+            scoped = {**metadata, "rules": [rule for rule in metadata["rules"] if rule["key"] in affected],
+                      "imports": []}
+            return self._seal(directory, "local-rule-context", {
+                "schema_version": 2, "repository": self.repository, "repository_id": state["repository_id"],
+                "generation": state["generation"], "base": base, "observations": observations,
+                "sources": sources, "rules_digest": metadata.get("digest"),
+                "known_rules": copy.deepcopy(metadata["known_rules"]), "current_rules": current,
+                "active_rules": self._selected(directory, state, None, scoped)["rules"],
+                "incremental": {"prepared_digest": prepared["digest"], "pr_number": prepared["packet"]["pr"]["number"],
+                                "changed_observation_ids": changed, "affected_rule_keys": sorted(affected)}})
 
     def _assessment(self, context, assessment):
         _fields(assessment, {"context_digest", "dispositions", "rules"}, "rule assessment")
@@ -201,17 +328,50 @@ class LocalRules(MemoryStore):
     def apply(self, context, assessment):
         with self._locked(exclusive=True) as directory:
             state = self._state(directory)
-            _fields(context, {"schema_version", "repository", "repository_id", "generation", "base", "observations", "sources", "rules_digest", "known_rules", "active_rules", "signature", "digest"}, "local rule context")
+            fields = {"schema_version", "repository", "repository_id", "generation", "base", "observations",
+                      "sources", "rules_digest", "known_rules", "active_rules", "signature", "digest"}
+            incremental = isinstance(context, dict) and "incremental" in context
+            _fields(context, fields | ({"incremental", "current_rules"} if incremental else set()), "local rule context")
             self._authenticate(directory, "local-rule-context", context)
             if (context["schema_version"] != 2 or context["repository"] != self.repository
                     or context["repository_id"] != state["repository_id"] or context["generation"] != state["generation"]):
                 raise MemoryError("Rule context identity mismatch or stale generation; prepare again")
             self._base(context["base"], state)
-            observations, sources = self._evidence(state)
+            if incremental:
+                _fields(context["incremental"], {"prepared_digest", "pr_number", "changed_observation_ids",
+                                                "affected_rule_keys"}, "incremental rule scope")
+            observations, sources = self._evidence(
+                state, {record["id"] for record in context["observations"]} if incremental else None)
             if context["observations"] != observations or context["sources"] != sources:
                 raise MemoryError("Rule context no longer matches current memory evidence")
             metadata = self._metadata(directory, state)
             rules, dispositions = self._assessment(context, assessment)
+            assessed_rules = rules
+            untouched = []
+            if incremental:
+                affected = set(context["incremental"]["affected_rule_keys"])
+                changed = set(context["incremental"]["changed_observation_ids"])
+                for rule in rules:
+                    if rule["key"] in context["current_rules"]:
+                        if rule["key"] not in affected:
+                            raise MemoryError("Existing rule topic is outside the incremental scope")
+                    elif not changed.intersection(rule["observation_ids"]):
+                        raise MemoryError("New rule topics must cite changed active observations")
+                replacement_keys = affected | {rule["key"] for rule in rules}
+                untouched = [rule for rule in metadata["rules"] if rule["key"] not in replacement_keys]
+                rules = sorted(untouched + rules, key=lambda rule: rule["id"])
+                scope = changed | {oid for rule in metadata["rules"] if rule["key"] in affected
+                                   for oid in rule["observation_ids"]}
+                previous = (metadata["assessment"] or {}).get("dispositions", [])
+                dispositions = {item["observation_id"]: item for item in previous
+                                if item["observation_id"] not in scope} | {
+                    item["observation_id"]: item for item in dispositions}
+                dispositions = [dispositions[oid] for oid in sorted(dispositions)]
+                if not changed and not affected:
+                    if context["rules_digest"] != metadata.get("digest"):
+                        raise MemoryError("Local rules changed concurrently; prepare again")
+                    return copy.deepcopy(metadata)
+            _learning_policy(context, assessed_rules, untouched)
             saved_assessment = {"generation": state["generation"],
                                 "policy": {key: value for key, value in context["base"].items() if key != "content"},
                                 "policy_digest": _digest(context["base"]["content"]), "dispositions": dispositions}
@@ -223,7 +383,7 @@ class LocalRules(MemoryStore):
                 raise MemoryError("Local rules changed concurrently; prepare again")
             metadata["rules"] = rules
             metadata["assessment"] = saved_assessment
-            for rule in rules:
+            for rule in assessed_rules:
                 metadata["known_rules"][rule["key"]] = {"id": rule["id"], "title": rule["title"]}
             self._imports(metadata, state)
             return copy.deepcopy(self._save(directory, metadata))

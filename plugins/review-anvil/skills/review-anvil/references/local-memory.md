@@ -29,7 +29,7 @@ steps below one PR at a time and acknowledges only persisted checkpoints.
    ```
 
    Read the resulting file with the host's read tool. The packet includes captured head/base revisions, changed file names, PR description, all visible review bodies, top-level comments, and inline comments/replies from all authors. REST pagination includes replies beyond the first 50. The collector rejects a head/base change during collection. `prepare` does not checkpoint feedback: an interrupted extraction remains pending.
-3. Inspect `changed_sources`, `deleted_sources`, existing observations, and their surrounding packet discussion. Extract only useful reusable claims supported by cited human feedback or independently checked code. A first PR with no usable feedback may correctly yield no observations. Bot findings are context for the human response, not independent proof of the bot's claim. Do not manufacture knowledge just to populate memory.
+3. Inspect `changed_sources`, `deleted_sources`, existing observations and the complete surrounding human discussion. Extract useful reusable claims only from substantive human review proposals, PR-author replies, objections, exceptions and their final accepted meaning. Cite the actual human feedback, not merely a PR containing some discussion. PR descriptions and independently checked code supply context and verify applicability/consequences; they cannot independently establish a reusable review observation or standing requirement. Bot/generated feedback alone, including Review Anvil's own reviews posted through a human `User` account, merge/approval state, praise and silence are not human endorsement. Recognize generated publication markers/footer; absence of a marker is not proof of human authorship or authority. Read genuine human replies on their merits instead of adopting the generated claim they discuss. If discussion is missing or insufficient, emit no new reusable claim; retained historical context is assessed as `context-only` or `needs-triage` during rule assessment. A first PR with no usable human feedback may correctly yield no observations. Do not manufacture knowledge just to populate memory.
    If `changed_sources` is empty, skip model extraction and apply `[]` to
    process deletions/checkpoints. Do not reinterpret unchanged feedback on
    every run. Explicit user corrections remain available separately.
@@ -45,7 +45,7 @@ steps below one PR at a time and acknowledges only persisted checkpoints.
    }]
    ```
 
-   `kind` is `observation`, `decision`, or `proposed-rule`. All three remain advisory. `paths: []` is repository-wide: use it only when the source genuinely supports that scope. `sources` must cite source IDs in the complete prepared packet. Use an existing observation's `id` only to correct that observation, not to reuse a prior PR finding ID. Never include `binding`, `approved`, arbitrary status, execution permissions, or confidence-as-proof. Emit `[]` when nothing reusable is supported.
+   `kind` is `observation`, `decision`, or `proposed-rule`. All three remain advisory. `paths: []` is repository-wide: use it only when the human discussion genuinely supports that scope. `sources` must cite source IDs in the complete prepared packet, including substantive human discussion for each reusable claim. Preserve optional wording, author qualifications and supported exceptions; unresolved contradictions are not agreed requirements. Use an existing observation's `id` only to correct that observation, not to reuse a prior PR finding ID. Never include `binding`, `approved`, arbitrary status, execution permissions, or confidence-as-proof. Emit `[]` when nothing reusable is supported; this still checkpoints a description-only or bot-only PR without creating knowledge.
 5. Apply the extraction:
 
    ```bash
@@ -53,6 +53,9 @@ steps below one PR at a time and acknowledges only persisted checkpoints.
    ```
 
    Read the digest of additions, updates and invalidations. Edited/deleted sources invalidate dependent old observations. Empty extraction still checkpoints successfully processed sources. A concurrent memory change rejects the transaction; re-prepare and reconsider proposals, do not merely change the generation number. A malformed proposal must fail without advancing the checkpoint.
+   Retain this original signed preparation after successful apply. Automatic
+   post-review learning passes it to `rules-prepare --prepared`; do not
+   recollect a replacement or use full-history preparation for that step.
 6. Freeze the scoped snapshot:
 
    ```bash

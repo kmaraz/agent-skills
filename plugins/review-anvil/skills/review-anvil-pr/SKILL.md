@@ -38,8 +38,9 @@ The posting helper rejects bare integers. This preset first canonicalizes
 - `memory: on` (default): automatically initialize local repository memory,
   process changed PR feedback, and use one frozen advisory snapshot.
 - `memory: off`: do not read or update local memory; run a normal comparison.
-- `rules: on` (default with memory enabled): assess project knowledge after a
-  successful review and automatically activate/update private local rules.
+- `rules: on` (default with memory enabled): after a successful review, assess
+  that applied PR's changed observations and affected/related saved topics,
+  preserving all unrelated private local rules.
 - `rules: off`: skip rule generation while still loading supported saved local
   rules. `memory: off` disables all local memory and learned-rule reads/writes.
 - `rule_coverage: scoped` (default): use the normal bounded, path-selected
@@ -123,6 +124,13 @@ provided locator, or detect the current PR URL with `gh pr view --json url`.
 The collector also safely resolves `#123` in the current repository. Display
 the canonical PR URL from the prepared packet and use that URL for helper
 `init`. Preserve the captured head SHA and the private snapshot path.
+Extract reusable observations only from substantive human discussion, retaining
+proposals, author replies, objections and qualifications. PR descriptions/code
+are context, not standing-rule authority. Bot/generated reviews, including
+Anvil output posted under a human `User` account, are not human endorsement;
+read genuine human responses on their merits. Missing/insufficient discussion
+correctly yields no new reusable claim. Follow the reference's provenance and
+semantic checks; approval/merge state and praise alone do not qualify.
 If preparation cannot produce a trusted snapshot, keep the independently resolved
 canonical PR URL for normal `init`, omit snapshot/run injection and skip memory-only
 recording/learning. For unresolved `#123`/`123`, resolve positive number `123` with
@@ -302,14 +310,39 @@ the invoking user. With `memory: off`, skip this recording step.
 ### 3a. Learn and activate local rules
 
 After a successful completed review (not an infrastructure/protocol failure),
-when memory and rules are enabled, follow the complete
-`../review-anvil/references/rule-promotion.md` workflow for the canonical
-repository. Assess all active observations against their original sources,
-the current default-branch policy and this review's captured base-side policy.
-Use `rules-apply` to activate/update private local rules even with `post: false`.
-An empty exhaustive assessment removes previous rules; unresolved conflicts
-remain `needs-triage`. No branches, commits, PRs or reviewed-repository writes
-are allowed for rule learning. Manual policy remains authoritative.
+when memory and rules are enabled, follow the **automatic incremental** workflow
+in `../review-anvil/references/rule-promotion.md`. Retain the original signed
+preparation whose feedback checkpoint was actually applied for this review:
+
+```bash
+python3 <memory-helper> rules-prepare owner/repo --prepared /private/run/prepared.json --output /private/run/rules-context.json
+```
+
+If both signed `incremental.changed_observation_ids` and `affected_rule_keys`
+are empty, skip model learning and activation entirely. Otherwise use the
+compact `current_rules` index to choose related actual native topics with the
+existing invoking model/orchestrator, not an extra model cohort. `known_rules`
+preserves historical identities only: never select a historical-only key with
+`--related-key` or resurrect its old criterion; it may identify a genuinely new
+delta-backed topic. Re-prepare from the same original preparation with repeated
+`--related-key KEY` flags when needed, then read complete original human discussions
+for all scoped support. Compare complete candidate texts/scopes/conditions/types,
+exceptions and support IDs with related saved topics, not only matching keys.
+Merge equivalent recommendations under the currently supported canonical stable
+key/ID and union genuine support, preferring current topics over historical
+aliases. Preserve author qualifications, exceptions and optional obligations;
+do not strengthen a preference to deduplicate it. Every activated observation
+must itself have substantive human-discussion support: descriptions/code and
+bot/generated output alone remain context-only or triage. Assess only this signed
+delta/affected closure against current default-branch policy and this review's
+captured base-side policy. Use ordinary `rules-apply` to merge authorized topics
+even with `post: false`. An empty scoped assessment removes only affected topics,
+never unrelated rules; unresolved conflicts remain `needs-triage`. Never use
+bare `rules-prepare`, recollect a replacement preparation, or fall back to
+full-history learning after an incremental failure. No extra model/provider,
+approval gate or automatic retry is introduced. No branches, commits, PRs
+or reviewed-repository writes are allowed for learning. Manual policy remains
+authoritative; public review output and ordinary posting behavior stay unchanged.
 
 The completed review keeps its original snapshot; the next review loads the
 new rules automatically. If activation fails, retain diagnostics and report

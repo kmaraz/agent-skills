@@ -49,7 +49,7 @@ Confirmed ordinary issues and missing numbers are recorded as explicit skips, no
 
 ## 3. Learn and persist before advancing
 
-For the single prepared PR, follow the extraction rules in `local-memory.md`: read original source feedback, consider existing relevant knowledge, write a real JSON array of source-backed observations, and apply it through the trusted helper:
+For the single prepared PR, follow `local-memory.md`: read complete original human review proposals, author replies, objections, exceptions and their accepted meaning; consider relevant existing knowledge, write a real JSON array of supported observations, and apply it through the trusted helper. PR descriptions/code and bot/generated reviews (even under a human account) are context, not independent reusable claims. Missing/insufficient human discussion correctly yields `[]`, not a criterion inferred from the change:
 
 ```bash
 python3 <memory-helper> apply --prepared /private/run/seed-step-unique.json --observations /private/run/seed-observations-unique.json
@@ -81,7 +81,7 @@ Preserve the verified memory root and environment through all host runtimes and 
 
 ## 4. Assess local rules and complete the run
 
-After `rules-pending`, follow the complete `rule-promotion.md` workflow: capture current project knowledge/policy, assess every active observation and run `rules-apply` to save supported local criteria. For a large knowledge base, read bounded observation/source groups and assemble one exhaustive assessment in private artifacts. Group overlapping topics, reuse stable keys, and do not omit observations or invent rules to fit a count target.
+After `rules-pending`, follow the explicit full-history form in `rule-promotion.md`: run `rules-prepare owner/repo --output CONTEXT.json` **without `--prepared`**, assess every retained active observation against locally retained complete original human discussions/current policy, then run ordinary `rules-apply`. This does not imply fresh GitHub collection. The deliberate full reassessment covers all selected historical learning, not just the final seed. Back up private `local-rules.json` first because it replaces the native catalog. Read bounded source/observation batches, persist complete candidates privately, then perform the reference's global semantic integration across all candidate texts/scopes/conditions/types/exceptions/support IDs before assembling one exhaustive assessment. Merge equivalent recommendations across differently keyed batches under the currently supported canonical stable key/ID, union genuine support and prefer current topics over historical-only aliases. Read full originals for merged/ambiguous groups, preserve author qualifications and optional obligations, and triage contradictions or missing discussion; descriptions/code alone remain context. Save compact integration decisions and a truthful change digest outside Git. Do not omit candidates or invent rules to fit a count target. Use the existing model/orchestration without extra providers, cohorts, approval gates or automatic retries. Ordinary completed PR reviews instead use incremental learning and never invoke this full-history step automatically.
 
 Then finish:
 

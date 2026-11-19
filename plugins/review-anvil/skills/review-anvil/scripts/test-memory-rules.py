@@ -5,7 +5,7 @@ import importlib.util
 from pathlib import Path
 import unittest
 
-from memory_store import MemoryError
+from memory_store import MemoryError, MemoryStore, _digest
 
 spec = importlib.util.spec_from_file_location("local_rule_fixture", Path(__file__).with_name("test-memory-rule-integration.py"))
 fixture = importlib.util.module_from_spec(spec)
@@ -13,6 +13,451 @@ spec.loader.exec_module(fixture)
 
 class AssessmentTests(unittest.TestCase):
     setUp = fixture.LocalIntegrationTests.setUp
+    def test_learning_rejects_pr_description_only_rule_support(self):
+        incoming = fixture.packet()
+        incoming["pr"].update(number=8, url="https://github.com/acme/widgets/pull/8")
+        incoming["sources"][0].update(
+            id="pr:8:body", kind="pr", body="The current implementation uses a cache.",
+            url="https://github.com/acme/widgets/pull/8")
+        prepared = self.memory.prepare(incoming)
+        self.memory.apply(prepared, [{
+            "claim": "Always use a cache.", "rationale": "Inferred from the description.",
+            "paths": [], "sources": ["pr:8:body"], "kind": "observation"}])
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        value = fixture.assessment(context)
+        value["rules"][0].update(key="use-cache", title="Use a cache", text="Always use a cache.")
+        with self.assertRaises(MemoryError):
+            self.rules.apply(context, value)
+
+    def _learning_context(self, sources, incremental=False, support_groups=None):
+        import tempfile
+        temporary = tempfile.TemporaryDirectory(dir=self.root)
+        self.addCleanup(temporary.cleanup)
+        memory = MemoryStore(fixture.REPOSITORY, Path(temporary.name))
+        memory.init(42)
+        packet = fixture.packet()
+        packet["sources"] = copy.deepcopy(sources)
+        prepared = memory.prepare(packet)
+        groups = support_groups if support_groups is not None else [[source["id"]] for source in sources]
+        memory.apply(prepared, [{
+            "claim": f"Preserve independently discussed convention {index}.",
+            "rationale": "Interpret the retained original discussion.", "paths": [],
+            "sources": group, "kind": "observation"} for index, group in enumerate(groups)])
+        rules = fixture.memory_rules.LocalRules(fixture.REPOSITORY, Path(temporary.name))
+        context = (rules.prepare_incremental(fixture.base(), prepared) if incremental
+                   else rules.prepare(fixture.base()))
+        return rules, context
+
+    def _save_historical(self, rules, context, value):
+        # Model the signed storage format predating the new learning policy.
+        # Do not weaken or mock the activation boundary to manufacture history.
+        native, dispositions = rules._assessment(context, value)
+        with rules._locked(exclusive=True) as directory:
+            metadata = rules._metadata(directory, rules._state(directory))
+            metadata["rules"] = native
+            metadata["known_rules"] = {rule["key"]: {"id": rule["id"], "title": rule["title"]}
+                                       for rule in native}
+            metadata["assessment"] = {
+                "generation": context["generation"],
+                "policy": {key: item for key, item in context["base"].items() if key != "content"},
+                "policy_digest": _digest(context["base"]["content"]), "dispositions": dispositions}
+            return rules._save(directory, metadata)
+
+    def _catalog_bytes(self, rules):
+        return {name: (rules.directory / name).read_bytes() if (rules.directory / name).exists() else None
+                for name in ("state.json", "local-rules.json")}
+
+    def test_learning_rejects_nonhuman_empty_and_description_sources_atomically(self):
+        human = fixture.packet()["sources"][0]
+        cases = [
+            {"id": "pr:7:body", "kind": "pr", "url": fixture.packet()["pr"]["url"]},
+            {"body": ""},
+            {"body": " \n\t "},
+            {"author": {"login": "automation", "type": "Bot"}},
+            {"author": {"login": "maintainer", "type": "Unknown"}},
+            {"author": {"login": "maintainer", "type": "user"}},
+            {"author": {"login": None, "type": "User"}},
+            {"author": {"login": "ghost", "type": "User"}},
+            {"author": {"login": "deleted-user", "type": "User"}},
+            {"author": {"login": "unknown", "type": "User"}},
+            {"author": {"login": " maintainer ", "type": "User"}},
+            {"author": {"login": "dependabot[bot]", "type": "User"}},
+            {"author": {"login": "custom-bot", "type": "User"}},
+            {"author": {"login": "github-actions", "type": "User"}},
+        ]
+        for incremental in (False, True):
+            for changes in cases:
+                with self.subTest(incremental=incremental, changes=changes):
+                    rules, context = self._learning_context([{**human, **changes}], incremental)
+                    before = self._catalog_bytes(rules)
+                    with self.assertRaises(MemoryError):
+                        rules.apply(context, fixture.assessment(context))
+                    self.assertEqual(self._catalog_bytes(rules), before)
+
+    def test_learning_accepts_human_review_discussion_and_author_replies_with_context(self):
+        for incremental in (False, True):
+            for kind, sid in (("issue_comment", "issue_comment:10"),
+                              ("review_comment", "review_comment:10"), ("review", "review:10")):
+                with self.subTest(incremental=incremental, kind=kind):
+                    human = {**fixture.packet()["sources"][0], "kind": kind, "id": sid,
+                             "author": {"login": "pr-author", "type": "User"},
+                             "body": "Yes, keep this optional convention, except generated code."}
+                    description = {**human, "id": "pr:7:body", "kind": "pr",
+                                   "url": fixture.packet()["pr"]["url"], "body": "Implementation context."}
+                    rules, context = self._learning_context(
+                        [description, human], incremental, [[description["id"], sid]])
+                    saved = rules.apply(context, fixture.assessment(context))
+                    self.assertEqual(len(saved["rules"]), 1)
+                    self.assertEqual(set(saved["rules"][0]["source_urls"]),
+                                     {description["url"], human["url"]})
+                    rules.verify_snapshot(rules.snapshot([], "c" * 40))
+
+    def test_learning_rejects_anvil_generated_feedback_under_user_identity(self):
+        bodies = [
+            "<!-- review-anvil-marker: 5c988c57-cc98-47b5-8952-d1d313d5659b -->\nKeep API names stable.",
+            "Keep API names stable.\n<!-- review-anvil: id=RAV-RUN1-R1-F001 severity=low area=api -->",
+            "Keep API names stable.\n_Reviewed with [review-anvil]"
+            "(https://github.com/mrshu/agent-skills/#review-anvil)._",
+            "> Keep API names stable.\n> <!-- review-anvil: id=RAV-RUN1-R1-F001 -->\nThanks.",
+        ]
+        for incremental in (False, True):
+            for kind, sid in (("issue_comment", "issue_comment:10"),
+                              ("review_comment", "review_comment:10"), ("review", "review:10")):
+                for body in bodies:
+                    with self.subTest(incremental=incremental, kind=kind, body=body):
+                        generated = {**fixture.packet()["sources"][0], "kind": kind, "id": sid,
+                                     "body": body}
+                        rules, context = self._learning_context([generated], incremental)
+                        before = self._catalog_bytes(rules)
+                        with self.assertRaises(MemoryError):
+                            rules.apply(context, fixture.assessment(context))
+                        self.assertEqual(self._catalog_bytes(rules), before)
+
+    def test_learning_accepts_separate_human_reply_to_generated_feedback(self):
+        generated = {**fixture.packet()["sources"][0],
+                     "body": "Keep API names stable.\n<!-- review-anvil: id=RAV-RUN1-R1-F001 -->"}
+        human = {**generated, "id": "issue_comment:11",
+                 "url": "https://github.com/acme/widgets/pull/7#issuecomment-11",
+                 "body": "I confirm this API compatibility convention, except generated clients."}
+        for incremental in (False, True):
+            with self.subTest(incremental=incremental):
+                rules, context = self._learning_context(
+                    [generated, human], incremental, [[generated["id"], human["id"]]])
+                saved = rules.apply(context, fixture.assessment(context))
+                self.assertEqual(len(saved["rules"]), 1)
+                self.assertEqual(len(saved["rules"][0]["source_urls"]), 2)
+
+    def test_learning_rejects_human_source_laundering_across_supporting_observations(self):
+        human = fixture.packet()["sources"][0]
+        description = {**human, "id": "pr:7:body", "kind": "pr",
+                       "url": fixture.packet()["pr"]["url"], "body": "A cache implementation."}
+        for incremental in (False, True):
+            with self.subTest(incremental=incremental):
+                rules, context = self._learning_context([human, description], incremental)
+                before = self._catalog_bytes(rules)
+                value = fixture.assessment(context)
+                with self.assertRaises(MemoryError):
+                    rules.apply(context, value)
+                self.assertEqual(self._catalog_bytes(rules), before)
+                context_only = next(record["id"] for record in context["observations"]
+                                    if record["sources"] == ["pr:7:body"])
+                next(item for item in value["dispositions"] if item["observation_id"] == context_only).update(
+                    disposition="context-only")
+                value["rules"][0]["observation_ids"].remove(context_only)
+                saved = rules.apply(context, value)
+                self.assertEqual(len(saved["rules"][0]["observation_ids"]), 1)
+
+    def test_description_only_history_remains_inspectable_importable_and_snapshot_valid(self):
+        description = {**fixture.packet()["sources"][0], "id": "pr:7:body", "kind": "pr",
+                       "url": fixture.packet()["pr"]["url"]}
+        rules, context = self._learning_context([description])
+        historical = self._save_historical(rules, context, fixture.assessment(context))
+        before = self._catalog_bytes(rules)
+        self.assertEqual(rules.inspect_rules()["rules"], historical["rules"])
+        snapshot = rules.snapshot([], "c" * 40)
+        rules.verify_snapshot(snapshot)
+        target = fixture.memory_rules.LocalRules("github.com/acme/history-consumer", self.root)
+        target.init(43)
+        target.import_rules(rules, [{"rule_id": historical["rules"][0]["id"], "paths": [],
+                                     "reason": "Explicit historical adoption without reassessment."}])
+        target.verify_snapshot(target.snapshot([], "c" * 40))
+        self.assertEqual(len(target.inspect_rules()["current"]["rules"]), 1)
+        self.assertEqual(self._catalog_bytes(rules), before)
+        # Reassessment, unlike reading or importing history, must enforce the
+        # current learning contract and leave the old signed catalog untouched.
+        current = rules.prepare(fixture.base())
+        with self.assertRaises(MemoryError):
+            rules.apply(current, fixture.assessment(current))
+        self.assertEqual(self._catalog_bytes(rules), before)
+        for disposition in ("context-only", "needs-triage"):
+            value = fixture.assessment(current, activate=False)
+            value["dispositions"][0]["disposition"] = disposition
+            self.assertEqual(rules.apply(current, value)["rules"], [])
+            current = rules.prepare(fixture.base())
+
+    def test_learning_rejects_duplicate_text_scope_and_exceptions_under_distinct_keys(self):
+        for incremental in (False, True):
+            with self.subTest(incremental=incremental):
+                rules, context = self._learning_context(fixture.packet()["sources"], incremental)
+                value = fixture.assessment(context)
+                first = value["rules"][0]
+                first.update(text="Keep API names stable.", paths=["src/**", "lib/**"],
+                             exceptions=["Except generated code.", "Except legacy adapters."])
+                value["rules"].append({
+                    **copy.deepcopy(first), "key": "duplicate-api-topic", "type": "contract",
+                    "text": "  Keep API names stable.  ", "paths": ["lib/**", "src/**"],
+                    "exceptions": ["Except legacy adapters.", "Except generated code."]})
+                before = self._catalog_bytes(rules)
+                with self.assertRaises(MemoryError):
+                    rules.apply(context, value)
+                self.assertEqual(self._catalog_bytes(rules), before)
+
+    def test_learning_preserves_distinct_scope_exceptions_and_nonidentical_conditions(self):
+        for changes in ({"paths": ["lib/**"]}, {"paths": ["SRC/**"]},
+                        {"exceptions": ["Except generated code."]},
+                        {"text": "Keep API names stable only for public exports."},
+                        {"text": "Keep API Names stable."},
+                        {"text": "Keep API  names stable."},
+                        {"text": "Keep API names\nstable."}):
+            with self.subTest(changes=changes):
+                rules, context = self._learning_context(fixture.packet()["sources"])
+                value = fixture.assessment(context)
+                value["rules"][0].update(text="Keep API names stable.", paths=["src/**"])
+                value["rules"].append({**copy.deepcopy(value["rules"][0]),
+                                       "key": "separate-api-topic", **changes})
+                saved = rules.apply(context, value)
+                self.assertEqual(len(saved["rules"]), 2)
+
+    def test_incremental_rejects_duplicate_against_untouched_native_rule(self):
+        initial = self.rules.prepare(fixture.base())
+        self.rules.apply(initial, fixture.assessment(initial))
+        prepared, _ = self.collect_pr()
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        self.assertEqual(context["incremental"]["affected_rule_keys"], [])
+        value = fixture.assessment(context)
+        value["rules"][0].update(key="duplicate-untouched-topic",
+                                 text="  Include a kitty in PR descriptions. ")
+        before = self._catalog_bytes(self.rules)
+        with self.assertRaises(MemoryError):
+            self.rules.apply(context, value)
+        self.assertEqual(self._catalog_bytes(self.rules), before)
+
+    def test_incremental_preserves_untouched_historical_duplicates_and_empty_noop(self):
+        initial = self.rules.prepare(fixture.base())
+        value = fixture.assessment(initial)
+        value["rules"].append({**copy.deepcopy(value["rules"][0]), "key": "historical-duplicate"})
+        historical = self._save_historical(self.rules, initial, value)
+        self.memory.verify_snapshot(self.memory.snapshot([], "c" * 40))
+        prepared, _ = self.collect_pr()
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        value = fixture.assessment(context)
+        value["rules"][0].update(key="stable-public-api", text="Keep public API names stable.")
+        saved = self.rules.apply(context, value)
+        self.assertTrue(all(rule in saved["rules"] for rule in historical["rules"]))
+        prepared = self.memory.prepare(prepared["packet"])
+        self.memory.apply(prepared, [])
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        before = self._catalog_bytes(self.rules)
+        path = self.rules.directory / "local-rules.json"
+        stat = path.stat()
+        self.rules.apply(context, {"context_digest": context["digest"], "dispositions": [], "rules": []})
+        self.assertEqual(self._catalog_bytes(self.rules), before)
+        self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns), (stat.st_ino, stat.st_mtime_ns))
+
+    def test_incremental_new_pr_preserves_unrelated_rule_exactly(self):
+        initial = self.rules.prepare(fixture.base())
+        original = self.rules.apply(initial, fixture.assessment(initial))["rules"][0]
+        incoming = fixture.packet()
+        incoming["pr"].update(number=8, url="https://github.com/acme/widgets/pull/8")
+        incoming["sources"][0].update(
+            id="issue_comment:11", body="Keep public API names stable.",
+            url="https://github.com/acme/widgets/pull/8#issuecomment-11")
+        prepared = self.memory.prepare(incoming)
+        self.memory.apply(prepared, [{
+            "claim": "Keep public API names stable.", "rationale": "Explicit API convention.",
+            "paths": ["src/api/**"], "sources": ["issue_comment:11"], "kind": "observation"}])
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        self.assertEqual([o["claim"] for o in context["observations"]], ["Keep public API names stable."])
+        value = fixture.assessment(context)
+        value["rules"][0].update(key="stable-public-api", title="Keep API names stable",
+                                 text="Keep public API names stable.", paths=["src/api/**"])
+        saved = self.rules.apply(context, value)
+        by_key = {r["key"]: r for r in saved["rules"]}
+        self.assertEqual(by_key["pr-description-kitty"], original)
+        self.assertEqual(by_key["stable-public-api"]["text"], "Keep public API names stable.")
+
+    def collect_pr(self, number=8, claim="Keep public API names stable."):
+        packet = fixture.packet()
+        packet["pr"].update(number=number, url=f"https://github.com/acme/widgets/pull/{number}")
+        packet["sources"][0].update(
+            id=f"issue_comment:{number + 10}", body=claim,
+            url=f"https://github.com/acme/widgets/pull/{number}#issuecomment-{number + 10}")
+        prepared = self.memory.prepare(packet)
+        result = self.memory.apply(prepared, [{
+            "claim": claim, "rationale": "Explicit standing convention.", "paths": [],
+            "sources": [packet["sources"][0]["id"]], "kind": "observation"}])
+        return prepared, result["added"][0]
+
+    def test_incremental_rejects_unapplied_foreign_tampered_and_stale_preparations(self):
+        pending = self.memory.prepare(fixture.packet())
+        with self.assertRaises(MemoryError):
+            self.rules.prepare_incremental(fixture.base(), pending)
+        prepared, _ = self.collect_pr()
+        with self.assertRaises(MemoryError):
+            self.rules.prepare_incremental(fixture.base(), pending)
+        tampered = copy.deepcopy(prepared)
+        tampered["packet"]["pr"]["title"] = "Forged"
+        with self.assertRaises(MemoryError):
+            self.rules.prepare_incremental(fixture.base(), tampered)
+        other = self._native_store("github.com/acme/foreign", 43)
+        with self.assertRaises(MemoryError):
+            other.prepare_incremental(
+                {**fixture.base(), "repository": other.repository, "repository_id": 43}, prepared)
+        changed = copy.deepcopy(prepared["packet"])
+        changed["pr"]["base_sha"] = "d" * 40
+        self.memory.apply(self.memory.prepare(changed), [])
+        with self.assertRaises(MemoryError):
+            self.rules.prepare_incremental(fixture.base(), prepared)
+
+    def test_incremental_delta_excludes_unrelated_concurrent_pr_and_old_unassessed_evidence(self):
+        self.collect_pr(9, "Keep an older unassessed convention.")
+        prepared, oid = self.collect_pr()
+        self.collect_pr(10, "Another PR was collected concurrently.")
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        self.assertEqual([record["id"] for record in context["observations"]], [oid])
+        self.assertEqual(set(context["sources"]), {"issue_comment:18"})
+        self.assertEqual(context["incremental"]["changed_observation_ids"], [oid])
+        self.assertEqual(context["incremental"]["affected_rule_keys"], [])
+
+    def test_incremental_rejects_existing_out_of_scope_key_and_historical_only_new_topic(self):
+        initial = self.rules.prepare(fixture.base())
+        self.rules.apply(initial, fixture.assessment(initial))
+        prepared, oid = self.collect_pr()
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        before = (self.rules.directory / "local-rules.json").read_bytes()
+        with self.assertRaises(MemoryError):
+            self.rules.apply(context, fixture.assessment(context))
+        context = self.rules.prepare_incremental(
+            fixture.base(), prepared, related_keys=["pr-description-kitty"])
+        value = fixture.assessment(context)
+        old = next(record["id"] for record in context["observations"] if record["id"] != oid)
+        value["rules"][0].update(key="renamed-historical-topic", observation_ids=[old])
+        next(item for item in value["dispositions"] if item["observation_id"] == oid).update(
+            disposition="context-only")
+        with self.assertRaises(MemoryError):
+            self.rules.apply(context, value)
+        self.assertEqual((self.rules.directory / "local-rules.json").read_bytes(), before)
+
+    def test_incremental_related_topic_updates_same_id_and_is_idempotent(self):
+        initial = self.rules.prepare(fixture.base())
+        original = self.rules.apply(initial, fixture.assessment(initial))
+        prepared, oid = self.collect_pr()
+        context = self.rules.prepare_incremental(
+            fixture.base(), prepared, related_keys=["pr-description-kitty"])
+        self.assertEqual(context["incremental"]["affected_rule_keys"], ["pr-description-kitty"])
+        value = fixture.assessment(context)
+        value["rules"][0]["text"] = "Keep the established PR convention with its API exception."
+        saved = self.rules.apply(context, value)
+        self.assertEqual(len(saved["rules"]), 1)
+        self.assertEqual(saved["rules"][0]["id"], original["rules"][0]["id"])
+        self.assertIn(oid, saved["rules"][0]["observation_ids"])
+        self.assertEqual(self.rules.apply(context, value), saved)
+
+    def test_incremental_shared_support_closure_is_transitive(self):
+        _, second = self.collect_pr(9, "Preserve API compatibility.")
+        _, third = self.collect_pr(10, "Preserve migration compatibility.")
+        initial = self.rules.prepare(fixture.base())
+        first = next(record["id"] for record in initial["observations"]
+                     if record["id"] not in {second, third})
+        value = fixture.assessment(initial)
+        template = value["rules"][0]
+        value["rules"] = [
+            {**copy.deepcopy(template), "key": key, "text": f"Preserve {key} compatibility.",
+             "observation_ids": ids}
+            for key, ids in (("first-topic", [first, second]), ("second-topic", [second, third]),
+                             ("third-topic", [third]))]
+        self.rules.apply(initial, value)
+        prepared, changed = self.collect_pr(8, "Extend the compatibility convention.")
+        context = self.rules.prepare_incremental(fixture.base(), prepared, related_keys=["first-topic"])
+        self.assertEqual(context["incremental"]["affected_rule_keys"],
+                         ["first-topic", "second-topic", "third-topic"])
+        self.assertEqual({record["id"] for record in context["observations"]},
+                         {first, second, third, changed})
+        self.assertEqual({rule["key"] for rule in context["active_rules"]},
+                         {"first-topic", "second-topic", "third-topic"})
+
+    def test_incremental_unknown_and_imported_related_keys_rejected(self):
+        donor = self._native_store("github.com/acme/imported", 43)
+        original = donor.inspect_rules()["rules"][0]
+        self.rules.import_rules(donor, [{
+            "rule_id": original["id"], "paths": [], "reason": "Adopt a portable convention."}])
+        imported = next(rule["key"] for rule in self.rules.inspect_rules()["current"]["rules"]
+                        if "origin" in rule)
+        prepared, _ = self.collect_pr()
+        for related in (["unknown-topic"], [imported], "pr-description-kitty", [None]):
+            with self.subTest(related=related), self.assertRaises(MemoryError):
+                self.rules.prepare_incremental(fixture.base(), prepared, related_keys=related)
+
+    def test_incremental_preserves_inactive_raw_rules_imports_known_ids_and_dispositions(self):
+        initial = self.rules.prepare(fixture.base())
+        self.rules.apply(initial, fixture.assessment(initial))
+        self.memory.invalidate(initial["observations"][0]["id"], "Old preference is inactive.")
+        donor = self._native_store("github.com/acme/imported", 43)
+        original = donor.inspect_rules()["rules"][0]
+        self.rules.import_rules(donor, [{
+            "rule_id": original["id"], "paths": [], "reason": "Adopt a portable convention."}])
+        # Restored catalogs may retain a different historical title in the ID
+        # index. Incremental learning must not normalize that unrelated entry.
+        with self.rules._locked(exclusive=True) as directory:
+            metadata = self.rules._metadata(directory, self.rules._state(directory))
+            metadata["known_rules"]["pr-description-kitty"]["title"] = "Preserved historical title"
+            self.rules._save(directory, metadata)
+        before = self.rules.inspect_rules()
+        prepared, _ = self.collect_pr()
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        self.assertEqual(context["incremental"]["affected_rule_keys"], [])
+        value = fixture.assessment(context)
+        value["rules"][0].update(key="stable-public-api", text="Keep public API names stable.")
+        saved = self.rules.apply(context, value)
+        self.assertIn(before["rules"][0], saved["rules"])
+        self.assertEqual(saved["imports"], before["imports"])
+        self.assertEqual(saved["known_rules"]["pr-description-kitty"],
+                         before["known_rules"]["pr-description-kitty"])
+        self.assertIn(before["assessment"]["dispositions"][0], saved["assessment"]["dispositions"])
+
+    def test_incremental_context_rejects_concurrent_rules_and_evidence_changes(self):
+        initial = self.rules.prepare(fixture.base())
+        self.rules.apply(initial, fixture.assessment(initial))
+        prepared, _ = self.collect_pr()
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        value = fixture.assessment(context)
+        value["rules"][0]["key"] = "stable-public-api"
+        full = self.rules.prepare(fixture.base())
+        changed = fixture.assessment(full)
+        changed["rules"][0]["text"] = "A concurrent reassessment changed this topic."
+        self.rules.apply(full, changed)
+        with self.assertRaises(MemoryError):
+            self.rules.apply(context, value)
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        self.collect_pr(9)
+        value["context_digest"] = context["digest"]
+        with self.assertRaises(MemoryError):
+            self.rules.apply(context, value)
+
+    def test_incremental_authorized_scope_and_current_topic_index_are_authenticated(self):
+        initial = self.rules.prepare(fixture.base())
+        self.rules.apply(initial, fixture.assessment(initial))
+        prepared, _ = self.collect_pr()
+        context = self.rules.prepare_incremental(fixture.base(), prepared)
+        for field in ("affected_rule_keys", "current_rules"):
+            forged = copy.deepcopy(context)
+            if field == "affected_rule_keys":
+                forged["incremental"][field] = ["pr-description-kitty"]
+            else:
+                forged[field] = {}
+            with self.subTest(field=field), self.assertRaises(MemoryError):
+                self.rules.apply(forged, fixture.assessment(forged))
+
     def test_assessment_must_account_for_every_observation_and_current_source(self):
         context = self.rules.prepare(fixture.base())
         for field in ("context_digest", "dispositions", "rules"):
