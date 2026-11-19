@@ -7,9 +7,9 @@ material for a new review.
 
 ## Purpose
 
-The top-level report is one natural visible summary sentence followed by
-collapsed issues and review context. Inline comments carry the detailed
-anchor-backed diagnosis and requested work.
+The final top-level report is one natural visible summary sentence followed by
+collapsed issues and program-owned review context/history. You edit only the
+summary, findings, dispositions and inline prose, not those reserved blocks.
 
 Simplify the contents, not only the formatting. Rewrite dense technical prose
 into ordinary language while preserving the minimum facts and exact actions a
@@ -31,11 +31,16 @@ profile in `asd-ste100-inspired.md` while preserving every frozen predicate.
 | Inline comment | Unlabeled diagnosis and labeled requested work | ID, severity, area, anchor JSON |
 | Unanchored material finding | Short self-contained problem and request | Finding marker |
 | Deferred/outside item | One plain reason in a collapsed section | Optional ID and disposition marker |
-| Review details | Concrete scope/checks and useful code limitations only | Complete private metadata inventory |
+| Review context and Earlier feedback | Inserted by code after rendering; never emit these blocks | Frozen metadata inventory copied unchanged |
 
 ## Input
 
-You receive one JSON object named `FROZEN_CLARITY_PACKET`:
+You receive `FROZEN_CLARITY_PACKET` for immutable facts and
+`EDITABLE_CLARITY_BUNDLE`, produced by the trusted `--renderer-input` command
+only after validating the full retained source. The latter has the same bundle
+fields and inventories, but its report Markdown omits the program-owned
+`Review context` and `Earlier feedback` sections. Return an edited copy of that
+bundle, not a reconstruction from this packet example:
 
 ```json
 {
@@ -100,18 +105,24 @@ fallback: low/nit suggested, otherwise required.
 
 Do not receive or render knowledge coverage/signature notices, reviewer counts,
 worker failures or orchestration logs. They belong in private local diagnostics.
-Keep author-relevant checks and concrete code-risk limitations in Review context;
-omit vague statements that an internal assessment or question remains incomplete.
+Author-relevant checks and concrete code-risk limitations are inserted into
+Review context by code. Do not generate either reserved context/history block.
 
 ## Output
 
-Return one JSON object and no surrounding prose or Markdown fence:
+Return one draft JSON object and no surrounding prose or Markdown fence.
+Keep `Review context` and `Earlier feedback` absent from `report_markdown`,
+including empty blocks. The coordinator retains this raw draft separately and
+calls `--assemble-rendered` once to insert exact frozen sections and validate the
+complete result before auditors, selection or publication. This is mandatory
+assembly, not a repair pass or permission for a second rendering attempt.
 
 Native OMP dispatch uses the trusted `validate-clarity-output.py --renderer-schema`
-projection of the validated source. Preserve its object field sets, including
-nested metadata and optional anchor/suggestion fields. The transport schema
-constrains types; the existing validator separately checks exact frozen values.
-Do not add fields or reconstruct missing metadata.
+type projection of the validated full source. Preserve the editable bundle's
+object field sets, including nested metadata and optional anchor/suggestion
+fields. The transport schema constrains types; the existing complete validator
+checks exact frozen values after assembly. Do not add fields or reconstruct
+missing metadata.
 
 ```json
 {
@@ -127,7 +138,7 @@ Do not add fields or reconstruct missing metadata.
     "outside_scope": [],
     "run_details": []
   },
-  "report_markdown": "complete human-facing report",
+  "report_markdown": "editable report with summary, finding/disposition sections and footer, without reserved context/history blocks",
   "report_items": [
     {"id": "RAV-RUN3-R2-F001", "prior_feedback": "reintroduced", "rendered_body": "byte-identical human summary line copied from report_markdown"}
   ],
@@ -163,8 +174,8 @@ An approval-disabled policy and a second review's mechanics are not code finding
 Write the headline directly from useful code outcomes. Do not append generic
 sentences that earlier suggestions or deferred questions remain. Mention history
 only when a concrete changed/fixed/still-present code concern helps its author.
-Public Review context contains scope, actual checks and concrete limitations;
-it need not repeat an internal status or the headline.
+Code composes public Review context from canonical scope, actual checks and
+concrete limitations; it does not repeat internal status or the headline.
 
 ## Hidden report metadata
 
@@ -280,7 +291,7 @@ short bullet.
 The top-level report has no Markdown heading. Write one or two natural visible
 summary sentences under the neutral detection guidance above.
 
-Use this shape:
+Use this draft shape. Code inserts the frozen context/history blocks before the footer:
 
 ```md
 <One or two neutral detection sentences.>
@@ -300,13 +311,6 @@ Use this shape:
 | Severity | Location | Suggestion | Suggested change |
 |---|---|---|---|
 | Low | `docs/cli.md:7` | <Complete optional observation.> | Consider <optional change>. <!-- review-anvil-report: ... --> |
-
-</details>
-
-<details>
-<summary>Review context</summary>
-
-<exact author-relevant scope/checks and concrete verification limitations>
 
 </details>
 
@@ -339,16 +343,11 @@ The review-anvil footer appears exactly once as the absolute final nonblank
 line. Every collapsed section and helper-only idempotency marker must come
 before it.
 
-Keep metadata in separate collapsed sections using only these exact labels:
-`Issues and fixes`, `Optional suggestions`, `Earlier feedback`, `Changes made`,
-`Set aside`, `Outside this change`, and `Review context`. Omit empty sections;
-do not rename labels to synonyms such as `Deferred concern`. Each identified
-earlier-feedback line uses the existing exact tuple format so history remains
-lossless.
-
-```md
-- **<status>** — <exact text> <exact URL> (`<finding ID>`)
-```
+Use only these editable collapsed-section labels: `Issues and fixes`,
+`Optional suggestions`, `Changes made`, `Set aside`, and `Outside this change`.
+Omit empty sections; do not rename labels to synonyms such as `Deferred concern`.
+Never emit `Review context` or `Earlier feedback`. Code restores exact history
+tuples from the canonical packet; do not copy those lines into another section.
 
 All `suggested` report and inline items keep suggestion grammar across the
 complete request, including every coordinated clause, test, and documentation

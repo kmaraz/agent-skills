@@ -126,10 +126,26 @@ Use a fresh OMP session after installed engine changes; do not mix cached old Py
 Use this Python recipe for the existing single clarity renderer and one
 two-auditor wave, in persistent Eval cells with **`timeout: 0`**.
 Do not retry a failed renderer/auditor, repair, or dispatch a second audit wave.
-For the renderer, load the trusted `validate-clarity-output.py --renderer-schema`
-output described in the engine's Final clarity pass and pass it unchanged as
-`request["schema"]`. Never invent native renderer schemas or use object-valued
-`const`/`enum`. Keep the auditor contracts unchanged.
+For the renderer, first create `CLARITY_RENDERER_INPUT` with the engine's
+`--renderer-input` recipe. Build `CLARITY_RENDERER_PROMPT` from the trusted
+prompt/profile, canonical packet and that editable projection, not the full
+source report. Load the trusted `validate-clarity-output.py --renderer-schema`
+output and pass it unchanged as `request["schema"]`. Never invent native renderer
+schemas or use object-valued `const`/`enum`. Keep the auditor contracts unchanged.
+
+For the renderer stage, prepare its one request from those files (the path
+variables name the engine recipe's already-created private artifacts):
+
+```python
+import json
+from pathlib import Path
+
+finalization_requests = [{
+    "name": "clarity-renderer",
+    "prompt": Path(clarity_renderer_prompt_path).read_text(encoding="utf-8"),
+    "schema": json.loads(Path(clarity_renderer_schema_path).read_text(encoding="utf-8")),
+}]
+```
 Prepare `finalization_requests` from the stage's trusted prompt and schema, with
 unique private artifact basenames: one renderer or two independent auditors.
 Apply the engine's direct native `yield` requirement to each new worker prompt
@@ -226,6 +242,16 @@ unmodified returned value. For recovery, load durable raw JSON with
 re-wait an expired/consumed handle, rerender or redispatch completed work.
 Missing durable and retained output is a technical blocker, never permission
 to reconstruct it from display text.
+
+For the renderer stage, the retained `clarity-renderer.raw.json` is
+`CLARITY_RENDERER_DRAFT`, not a validated or selected bundle. Run the engine's
+`--assemble-rendered "$CLARITY_PACKET" "$CLARITY_RENDERER_DRAFT"` recipe once
+and retain its stdout as the separate `CLARITY_BUNDLE` only on exit zero.
+Assembly inserts program-owned context/history and runs the existing complete
+validator. Only then prepare `--audit-rows` and start the one two-auditor wave.
+On any failure select exact retained source bytes and COMMENT through the
+existing fallback; never retry rendering, repair the raw draft or dispatch an
+audit against the projection. Native transport collection above is unchanged.
 
 Public report/sidecar emission is separate from private archive storage:
 

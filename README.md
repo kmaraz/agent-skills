@@ -311,6 +311,11 @@ Initial source assembly deterministically inserts required frozen scope, checks,
 author-relevant limitations and prior-feedback lines using the validator's
 shared metadata projection. It preserves finding/inline bodies and validates
 before emitting the source; it never repairs frozen source or renderer output.
+The renderer receives a validated projection without the program-owned
+Review context and Earlier feedback sections. It edits the remaining prose;
+the trusted helper assembles those sections from canonical metadata before
+validating the complete result. Changed inventories/decisions, missing findings
+or model-emitted reserved sections still fail validation.
 Native rendering loads its typed transport schema from the same trusted helper,
 using validated source field sets rather than model-authored object constants.
 Exact values still pass the original validator; schema compatibility does not

@@ -806,8 +806,8 @@ history lines into Earlier feedback, without duplicating present values or
 changing findings/inline bodies. The draft may omit `metadata_inventory`; the
 helper constructs it from the frozen packet. Supplied inventory must still match.
 The helper emits a source only after full validation. Check its exit status.
-Never use assembly to repair an already frozen source, renderer output or
-fallback; subsequent validation and `--emit-validated` remain read-only.
+Never use `--assemble-source` to repair an already frozen source, renderer output
+or fallback; subsequent standalone validation and `--emit-validated` remain read-only.
 
 Build each table as one contiguous block: join its header, separator and all
 data rows with single newlines. Use blank lines only between complete blocks,
@@ -816,6 +816,20 @@ chunks must not split a table. If source validation fails, retain the source and
 emit a local diagnostic failure report; do not dispatch a renderer, repair with
 another model, publish or label that source as validated.
 Retain each validated source bundle and its exact report/inline bytes.
+
+Build the editable projection for every renderer, native or external:
+
+```bash
+python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" --renderer-input \
+  "$CLARITY_PACKET" "$CLARITY_SOURCE_BUNDLE" > "$CLARITY_RENDERER_INPUT"
+```
+
+Require exit 0 before dispatch. This validates the full retained source and removes
+only its program-owned Review context and Earlier feedback Markdown blocks.
+All inventories, finding/disposition rows, anchors and decision remain frozen.
+Keep `$CLARITY_SOURCE_BUNDLE` separate and unchanged for exact-byte fallback.
+The renderer must not emit either reserved block; code restores canonical
+scope/check/history lines, rather than asking the model to copy exact prose.
 
 For native OMP rendering, obtain the transport schema from the trusted helper:
 
@@ -832,8 +846,27 @@ empty source arrays stay empty. Exact values, order, identities and anchors
 remain enforced by the existing validator, not provider-specific value locks.
 Keep one renderer attempt and the existing exact-source fallback/COMMENT.
 
-Read `references/clarity-pass-prompt.md` and dispatch one clean read-only
-renderer under the synthesis-side deadline rule. When using Codex for this
+Build `$CLARITY_RENDERER_PROMPT` from the trusted prompt/profile, the canonical
+packet and the editable projection, never the complete source Markdown:
+
+```bash
+{
+  cat "$ENGINE_ROOT/references/clarity-pass-prompt.md"
+  cat "$ENGINE_ROOT/references/asd-ste100-inspired.md"
+  printf '\nFROZEN_CLARITY_PACKET:\n'
+  cat "$CLARITY_PACKET"
+  printf '\nEDITABLE_CLARITY_BUNDLE:\n'
+  cat "$CLARITY_RENDERER_INPUT"
+} > "$CLARITY_RENDERER_PROMPT"
+```
+
+Dispatch one clean read-only renderer under the synthesis-side deadline rule.
+For native OMP, load `$CLARITY_RENDERER_PROMPT` as the renderer request's prompt
+and `$CLARITY_RENDERER_SCHEMA` as its schema in the native transport recipe;
+retain its complete returned value as `$CLARITY_RENDERER_DRAFT`, separate from
+the assembled bundle. For external rendering, pass the same prompt file on
+stdin and capture only the complete final JSON into `$CLARITY_RENDERER_DRAFT`.
+When using Codex for this
 renderer or for any action-lock auditor, apply the lazy resolution
 rule above and invoke `"$CODEX_BIN" exec -m gpt-6.1-sol -c 'model_reasoning_effort="high"' -c 'shell_environment_policy.inherit="all"'`;
 if the renderer/auditor workdir is not a trusted git repository (for example
@@ -845,15 +878,25 @@ do not use `--ignore-user-config`, `gpt-5.6-sol`, or a lower reasoning effort. T
 the top-level report and eligible inline comments in one bundle. It is a copy
 editor, not another reviewer: it cannot change inventory, priority, decision,
 disposition, facts, author work, anchors, or suggestions.
+For that external renderer invocation, append
+`- < "$CLARITY_RENDERER_PROMPT" > "$CLARITY_RENDERER_DRAFT"` so the process
+reads the projected prompt and saves its raw final JSON separately. Keep the
+existing deadline wrapper and check the process status before assembly.
 
-Write the packet and returned JSON to temporary files under `.review-anvil/`.
-Resolve `scripts/validate-clarity-output.py` from the trusted engine root and
-run:
+Retain the packet, projection, raw renderer draft and assembled JSON separately
+under `.review-anvil/`. Every renderer response crosses this mandatory boundary
+once before action auditors, selection, or publication:
 
 ```bash
-python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" \
-  "$CLARITY_PACKET" "$CLARITY_BUNDLE"
+python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" --assemble-rendered \
+  "$CLARITY_PACKET" "$CLARITY_RENDERER_DRAFT" > "$CLARITY_BUNDLE"
 ```
+
+Check exit 0. This is normal assembly, not a repair attempt: it rejects changed
+decision/metadata, unsupported fields and model-emitted reserved blocks, inserts
+the canonical frozen sections, then runs the existing complete validator.
+Finding inventories, exact predicates, anchors, footer and report shape must
+still pass. Never pass the raw draft or editable projection to auditors or posting.
 
 Do not post or approve an unvalidated clarity bundle. On renderer failure,
 timeout, malformed JSON, or validation failure, restore the byte-identical

@@ -82,8 +82,31 @@ summary.
 The pass rewrites the language as well as the layout. Prefer short ordinary
 sentences and concrete outcomes over internal mechanics. It cannot change the
 finding inventory, decision, priority, disposition, technical relationships,
-requested work, anchors, or suggestions. Validate its complete JSON bundle with
-`scripts/validate-clarity-output.py` before action-lock auditing or emission.
+requested work, anchors, or suggestions.
+
+Retain four separate artifacts: the complete validated source bundle, editable
+renderer input, raw renderer draft and assembled bundle. Build the editable input
+with `--renderer-input "$CLARITY_PACKET" "$CLARITY_SOURCE_BUNDLE"`: it validates
+the full source before removing only Review context and Earlier feedback from
+its Markdown. All inventories and anchors remain unchanged. Feed that projection,
+not the full source report, to the single native or external renderer.
+
+Save the returned JSON to `$CLARITY_RENDERER_DRAFT`, then run the mandatory
+assembly boundary:
+
+```bash
+python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" --assemble-rendered \
+  "$CLARITY_PACKET" "$CLARITY_RENDERER_DRAFT" > "$CLARITY_BUNDLE"
+```
+
+Only exit zero selects an assembled bundle. Assembly rejects model-emitted
+reserved blocks, changed decision/metadata and unsupported fields; inserts exact
+canonical context/history through the shared visible-metadata projection; and
+runs the existing complete validator. It does not generate findings, recover
+missing rows or relax anchors. Action auditors and publication consume only the
+assembled bundle, never the raw draft. Initial `--assemble-source`, standalone
+validation, type-only renderer schemas and byte-exact fallback are unchanged.
+This is normal assembly, not a repair attempt.
 If rendering, structural validation, or an audit verdict fails or is
 unverifiable, restore complete already-validated same-surface source bodies,
 not isolated request fragments. For malformed formatting or an invalid combined

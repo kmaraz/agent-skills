@@ -740,6 +740,237 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         )
         return canonical, rendered
 
+    def renderer_operation(self, mode: str, canonical: dict, bundle: dict) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ("canonical.json", "bundle.json")]
+            for path, value in zip(paths, (canonical, bundle), strict=True):
+                path.write_text(json.dumps(value), encoding="utf-8")
+            return subprocess.run(
+                ["python3", str(VALIDATOR), mode, *map(str, paths)],
+                check=False, capture_output=True, text=True,
+            )
+
+    def test_renderer_edits_prose_without_owning_frozen_context(self) -> None:
+        canonical, source = self.human_source_bundle()
+        projection = self.renderer_operation("--renderer-input", canonical, source)
+        self.assertEqual(projection.returncode, 0, projection.stderr)
+        draft = json.loads(projection.stdout)
+        self.assertNotIn("<summary>Review context</summary>", draft["report_markdown"])
+        self.assertEqual(draft["metadata_inventory"], source["metadata_inventory"])
+        draft["report_markdown"] = draft["report_markdown"].replace(
+            "The parser and numeric conversion still need changes.", "Two conversion problems need attention.")
+        result = self.renderer_operation("--assemble-rendered", canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        assembled = json.loads(result.stdout)
+        self.assertIn("Two conversion problems need attention.", assembled["report_markdown"])
+        for frozen in (canonical["scope"], canonical["checks"]):
+            self.assertEqual(assembled["report_markdown"].count(frozen), 1)
+        for key in ("decision", "report_items", "inline_comments", "predicate_inventory", "metadata_inventory"):
+            self.assertEqual(assembled[key], source[key])
+        self.assertEqual(self.validate(assembled, canonical).returncode, 0)
+
+    def test_renderer_assembly_cannot_conceal_changed_facts_or_findings(self) -> None:
+        canonical, source = self.human_source_bundle()
+        projection = self.renderer_operation("--renderer-input", canonical, source)
+        self.assertEqual(projection.returncode, 0, projection.stderr)
+        draft = json.loads(projection.stdout)
+        for field, value in (("decision", "APPROVE"), ("metadata_inventory", {}),
+                             ("inline_comments", []), ("report_items", [])):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(draft)
+                changed[field] = value
+                result = self.renderer_operation("--assemble-rendered", canonical, changed)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+        draft["report_markdown"] = source["report_markdown"]
+        result = self.renderer_operation("--assemble-rendered", canonical, draft)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_renderer_round_trip_restores_exact_history_and_limitations(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        canonical["earlier_feedback"] = [{
+            "id": "RAV-RUN2-R1-F003", "status": "still-present",
+            "text": "The parser defect remains — unchanged.", "url": "https://example.invalid/parser",
+        }]
+        canonical["run_details"] = ["Browser behavior was not checked.", "Two concerns checked."]
+        canonical["second_check"] = "Private second-check outcome."
+        draft.pop("metadata_inventory")
+        initial = self.assemble_source(canonical, draft)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        source = json.loads(initial.stdout)
+        original = copy.deepcopy(source)
+        projection = self.renderer_operation("--renderer-input", canonical, source)
+        self.assertEqual(projection.returncode, 0, projection.stderr)
+        editable = json.loads(projection.stdout)
+        for label in ("Review context", "Earlier feedback"):
+            self.assertNotIn(f"<summary>{label}</summary>", editable["report_markdown"])
+        for key in source.keys() - {"report_markdown"}:
+            self.assertEqual(editable[key], source[key])
+        result = self.renderer_operation("--assemble-rendered", canonical, editable)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        assembled = json.loads(result.stdout)
+        history = ("- **still-present** — The parser defect remains — unchanged. "
+                   "https://example.invalid/parser (`RAV-RUN2-R1-F003`)")
+        self.assertIn("<summary>Earlier feedback</summary>\n\n" + history + "\n\n</details>",
+                      assembled["report_markdown"])
+        for frozen in (canonical["scope"], canonical["checks"], canonical["run_details"][0], history):
+            self.assertEqual(assembled["report_markdown"].count(frozen), 1)
+        for private in ("decision_reason", "result", "second_check"):
+            self.assertNotIn(canonical[private], assembled["report_markdown"])
+        self.assertEqual(source, original)
+        self.assertEqual(self.validate(assembled, canonical).returncode, 0)
+
+    def test_renderer_assembly_rejects_lost_rows_corrupt_inventories_and_anchors(self) -> None:
+        canonical, source = self.human_source_bundle()
+        projected = self.renderer_operation("--renderer-input", canonical, source)
+        self.assertEqual(projected.returncode, 0, projected.stderr)
+        draft = json.loads(projected.stdout)
+        for mutation in ("lost-row", "work", "inline-anchor", "report-anchor", "suggestion",
+                         "unknown-field", "unknown-inline-field", "unknown-report-field",
+                         "unknown-predicate-field", "malformed-table", "footer"):
+            with self.subTest(mutation=mutation):
+                changed = copy.deepcopy(draft)
+                if mutation == "lost-row":
+                    row = changed["report_items"].pop(0)["rendered_body"]
+                    changed["report_markdown"] = changed["report_markdown"].replace(row + "\n", "")
+                elif mutation == "work":
+                    changed["predicate_inventory"][0]["requested_work"] = ["Skip verification."]
+                elif mutation == "inline-anchor":
+                    changed["inline_comments"][0]["line"] = 999
+                elif mutation == "report-anchor":
+                    row = changed["report_items"][0]["rendered_body"]
+                    replacement = row.replace("line=383", "line=999")
+                    changed["report_items"][0]["rendered_body"] = replacement
+                    changed["report_markdown"] = changed["report_markdown"].replace(row, replacement)
+                elif mutation == "suggestion":
+                    changed["inline_comments"][1]["suggestion"] = "unsafe_replacement()"
+                elif mutation == "unknown-field":
+                    changed["extra"] = "unsupported"
+                elif mutation == "unknown-inline-field":
+                    changed["inline_comments"][0]["extra"] = "unsupported"
+                elif mutation == "unknown-report-field":
+                    changed["report_items"][0]["extra"] = "unsupported"
+                elif mutation == "unknown-predicate-field":
+                    changed["predicate_inventory"][0]["extra"] = "unsupported"
+                elif mutation == "malformed-table":
+                    changed["report_markdown"] = changed["report_markdown"].replace(
+                        "|---|---|---|---|\n", "|---|---|---|---|\n\n")
+                else:
+                    changed["report_markdown"] = changed["report_markdown"].replace(
+                        "_Reviewed with [review-anvil]", "_Edited with [review-anvil]")
+                rejected = self.renderer_operation("--assemble-rendered", canonical, changed)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected.stdout, "")
+
+    def test_renderer_assembly_rejects_each_reserved_section_even_when_empty(self) -> None:
+        canonical, source = self.human_source_bundle()
+        projected = self.renderer_operation("--renderer-input", canonical, source)
+        self.assertEqual(projected.returncode, 0, projected.stderr)
+        for label in ("Review context", "Earlier feedback"):
+            with self.subTest(label=label):
+                draft = json.loads(projected.stdout)
+                draft["report_markdown"] = draft["report_markdown"].replace(
+                    "_Reviewed with [review-anvil]",
+                    f"<details>\n<summary>{label}</summary>\n\n\n</details>\n\n"
+                    "_Reviewed with [review-anvil]",
+                )
+                rejected = self.renderer_operation("--assemble-rendered", canonical, draft)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected.stdout, "")
+
+    def test_renderer_projection_requires_full_source_and_preserves_fallback_bytes(self) -> None:
+        canonical, source = self.human_source_bundle()
+        for mutation in ("context", "inventory", "finding", "anchor"):
+            with self.subTest(mutation=mutation):
+                changed = copy.deepcopy(source)
+                if mutation == "context":
+                    changed["report_markdown"] = changed["report_markdown"].replace(canonical["checks"], "")
+                elif mutation == "inventory":
+                    changed["metadata_inventory"]["scope"] = "Different scope."
+                elif mutation == "finding":
+                    changed["report_items"] = []
+                else:
+                    changed["inline_comments"][0]["line"] = 999
+                rejected = self.renderer_operation("--renderer-input", canonical, changed)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected.stdout, "")
+        payload = ("\n" + json.dumps(source, ensure_ascii=False, indent=3) + "\n\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            packet, bundle = (Path(directory) / name for name in ("canonical.json", "source.json"))
+            packet.write_text(json.dumps(canonical), encoding="utf-8")
+            bundle.write_bytes(payload)
+            projection = subprocess.run(
+                ["python3", str(VALIDATOR), "--renderer-input", str(packet), str(bundle)],
+                check=False, capture_output=True,
+            )
+            self.assertEqual(projection.returncode, 0, projection.stderr)
+            editable = json.loads(projection.stdout)
+            # Read-only validation and exact-byte emission never assemble a projection.
+            for mode in (None, "--emit-validated"):
+                bundle.write_text(json.dumps(editable), encoding="utf-8")
+                rejected = subprocess.run(
+                    ["python3", str(VALIDATOR), *([] if mode is None else [mode]), str(packet), str(bundle)],
+                    check=False, capture_output=True,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected.stdout, b"")
+            bundle.write_bytes(payload)
+            fallback = subprocess.run(
+                ["python3", str(VALIDATOR), "--emit-validated", str(packet), str(bundle)],
+                check=False, capture_output=True,
+            )
+            self.assertEqual(fallback.returncode, 0, fallback.stderr)
+            self.assertEqual(fallback.stdout, payload)
+
+    def test_renderer_assembled_bundle_supplies_original_and_rewritten_audit_rows(self) -> None:
+        canonical, source = self.human_source_bundle()
+        for finding in canonical["findings"]:
+            finding["source_context"] = "Accepted original diagnosis and supporting evidence."
+            finding["fact_lock"] = ["The accepted diagnostic predicate is unchanged."]
+        projected = self.renderer_operation("--renderer-input", canonical, source)
+        self.assertEqual(projected.returncode, 0, projected.stderr)
+        draft = json.loads(projected.stdout)
+        original = draft["report_items"][0]["rendered_body"]
+        rewritten = original.replace("The entry point uses the old parser.",
+                                     "The module entry point still uses the old parser.")
+        draft["report_items"][0]["rendered_body"] = rewritten
+        draft["report_markdown"] = draft["report_markdown"].replace(original, rewritten)
+        assembled = self.renderer_operation("--assemble-rendered", canonical, draft)
+        self.assertEqual(assembled.returncode, 0, assembled.stderr)
+        audited = self.prepare_audit_rows(canonical, source, json.loads(assembled.stdout))
+        self.assertEqual(audited.returncode, 0, audited.stderr)
+        rows = json.loads(audited.stdout)
+        self.assertEqual(len(rows), 4)
+        first = next(row for row in rows if row["id"] == "RAV-RUN2-R1-F003" and row["surface"] == "report")
+        self.assertEqual(first["source_body"], original)
+        self.assertEqual(first["rendered_body"], rewritten)
+        self.assertEqual(first["source_location"],
+                         {"path": "every_eval_ever/cli.py", "start_line": None, "line": 383})
+        self.assertNotEqual(self.prepare_audit_rows(canonical, source, draft).returncode, 0)
+
+    def test_renderer_assembly_supports_empty_editable_report_without_invented_findings(self) -> None:
+        canonical, source = self.human_source_bundle()
+        canonical.update(decision="APPROVE", findings=[], report_ids=[])
+        source.update(decision="APPROVE", report_items=[], inline_comments=[], predicate_inventory=[])
+        source["report_markdown"] = (
+            "No material issue was detected.\n\n"
+            "<details>\n<summary>Review context</summary>\n\n"
+            "CLI and metric conversion.\nTwo concerns checked.\n\n</details>\n\n"
+            "_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._"
+        )
+        projected = self.renderer_operation("--renderer-input", canonical, source)
+        self.assertEqual(projected.returncode, 0, projected.stderr)
+        draft = json.loads(projected.stdout)
+        self.assertNotIn("<details>", draft["report_markdown"])
+        assembled = self.renderer_operation("--assemble-rendered", canonical, draft)
+        self.assertEqual(assembled.returncode, 0, assembled.stderr)
+        bundle = json.loads(assembled.stdout)
+        self.assertEqual(bundle["decision"], "APPROVE")
+        self.assertEqual(bundle["report_items"], [])
+        self.assertNotIn("<summary>Earlier feedback</summary>", bundle["report_markdown"])
+        self.assertEqual(bundle["report_markdown"].count("<summary>Review context</summary>"), 1)
+
     def test_source_assembly_includes_exact_frozen_context_without_changing_findings(self) -> None:
         canonical, draft = self.human_source_bundle()
         canonical["run_details"] = ["Mobile rendering was not verified in a browser.", "Unicode boundary — unchanged."]

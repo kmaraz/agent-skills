@@ -1,7 +1,8 @@
 # Post-Render Action-Lock Audit
 
-Run one audit wave after the single clarity-rendering pass drafts all top-level
-report items and inline comment bodies, before any final artifact is written.
+Run one audit wave after the single clarity-rendering pass and mandatory
+`--assemble-rendered` boundary produce the complete validated top-level report
+and inline comment bodies, before any final artifact is written.
 Prevent a readability rewrite from hiding author work, inventing work, or
 changing a requested boundary on either surface. Never repair or re-audit.
 
@@ -13,6 +14,12 @@ exceptions, tests, documentation, purpose clauses, and safety clauses. Also
 freeze the exact source title and diagnosis plus the
 exact evidence and code fragments that the body may retain. Include source
 suggestions. Do not give the auditors unrelated repository or report context.
+
+Retain the raw renderer draft separately. The renderer edits only the validated
+`--renderer-input` projection; code rejects model-emitted Review context/Earlier
+feedback blocks and inserts exact canonical frozen sections during assembly.
+Use only the assembled `CLARITY_BUNDLE` below, never the raw draft or projection.
+Assembly is mandatory on every response, not a repair or another model attempt.
 
 For every nonempty audit, build the rows only through the trusted validator:
 
@@ -231,9 +238,9 @@ same-surface source body. Never restore only the request section, paraphrase,
 add prose, or change coupled conditions, facts, permissions, or boundaries.
 Passing surfaces may retain their byte-exact audited `rendered_body`.
 
-If the renderer fails, its JSON or formatting is malformed, audit preparation
-fails, or the combined fallback cannot be validated, use the complete source
-bundle rather than rebuilding tables or inventing section titles:
+If the renderer fails, its JSON or formatting is malformed, rendered assembly or
+audit preparation fails, or the combined fallback cannot be validated, use the
+complete source bundle rather than rebuilding tables or inventing section titles:
 
 ```bash
 python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" --emit-validated "$CLARITY_PACKET" "$CLARITY_SOURCE_BUNDLE"

@@ -811,6 +811,75 @@ def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[st
     return source
 
 
+def validate_renderer_fields(bundle: dict[str, Any]) -> None:
+    """Reject unsupported transport fields without weakening the full validator."""
+    fields = {
+        "decision", "metadata_inventory", "report_markdown", "report_items",
+        "disposition_items", "inline_comments", "predicate_inventory",
+    }
+    if set(bundle) != fields:
+        raise InvalidBundle("renderer bundle field set changed")
+    item_fields = {
+        "report_items": {"id", "rendered_body", "prior_feedback"},
+        "disposition_items": {"id", "rendered_body"},
+        "inline_comments": {
+            *ANCHOR_KEYS, "position", "start_position", "range", "subject_type",
+            "severity", "body", "suggestion", "prior_feedback",
+        },
+        "predicate_inventory": {"id", "requested_work"},
+    }
+    for field, allowed in item_fields.items():
+        items = bundle.get(field)
+        if not isinstance(items, list):
+            raise InvalidBundle(f"{field} must be an array")
+        if any(not isinstance(item, dict) or set(item) - allowed for item in items):
+            raise InvalidBundle(f"unsupported {field} fields")
+
+
+def renderer_input(canonical: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """Validate retained source before removing program-owned Markdown sections."""
+    validate(canonical, source)
+    if canonical.get("report_style") != "human-summary":
+        raise InvalidBundle("renderer input requires human-summary")
+    validate_renderer_fields(source)
+    projected = dict(source)
+    reserved = visible_metadata(canonical)
+    projected["report_markdown"] = COMPACT_DETAILS_RE.sub(
+        lambda block: "" if block.group(1) in reserved else block.group(0),
+        source["report_markdown"],
+    )
+    return projected
+
+
+def assemble_rendered(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
+    """Compose frozen sections around editable prose, then validate the full result."""
+    if canonical.get("report_style") != "human-summary":
+        raise InvalidBundle("rendered assembly requires human-summary")
+    validate_renderer_fields(draft)
+    if draft.get("decision") != canonical.get("decision"):
+        raise InvalidBundle("renderer decision changed")
+    if draft.get("metadata_inventory") != {field: canonical.get(field) for field in METADATA_FIELDS}:
+        raise InvalidBundle("metadata inventory changed")
+    report = draft.get("report_markdown")
+    if not isinstance(report, str):
+        raise InvalidBundle("report_markdown must be a string")
+    sections = visible_metadata(canonical)
+    blocks = compact_details_blocks(report)
+    if sections.keys() & blocks.keys():
+        raise InvalidBundle("renderer must not emit reserved frozen sections")
+    frozen_sections = []
+    for label, values in sections.items():
+        if values or label == "Review context":
+            body = "\n\n".join(dict.fromkeys(values))
+            frozen_sections.append(f"<details>\n<summary>{label}</summary>\n\n{body}\n\n</details>")
+    assembled = dict(draft)
+    assembled["report_markdown"] = report.replace(
+        REVIEW_FOOTER, "\n\n".join(frozen_sections) + "\n\n" + REVIEW_FOOTER, 1,
+    )
+    validate(canonical, assembled)
+    return assembled
+
+
 def renderer_schema(canonical: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
     """Describe validated source types, never freeze object values in provider schemas."""
     validate(canonical, source)
@@ -860,18 +929,26 @@ def main(argv: list[str]) -> int:
     emit = len(argv) > 1 and argv[1] == "--emit-validated"
     assemble = len(argv) > 1 and argv[1] == "--assemble-source"
     schema = len(argv) > 1 and argv[1] == "--renderer-schema"
-    if len(argv) != (5 if audit else 4 if emit or assemble or schema else 3):
+    project = len(argv) > 1 and argv[1] == "--renderer-input"
+    rendered = len(argv) > 1 and argv[1] == "--assemble-rendered"
+    if len(argv) != (5 if audit else 4 if emit or assemble or schema or project or rendered else 3):
         print(
             "usage: validate-clarity-output.py <canonical.json> <rendered.json>\n"
             "       validate-clarity-output.py --audit-rows <canonical.json> <source.json> <rendered.json>\n"
             "       validate-clarity-output.py --emit-validated <canonical.json> <source.json>\n"
             "       validate-clarity-output.py --assemble-source <canonical.json> <draft.json>\n"
-            "       validate-clarity-output.py --renderer-schema <canonical.json> <source.json>",
+            "       validate-clarity-output.py --renderer-schema <canonical.json> <source.json>\n"
+            "       validate-clarity-output.py --renderer-input <canonical.json> <source.json>\n"
+            "       validate-clarity-output.py --assemble-rendered <canonical.json> <draft.json>",
             file=sys.stderr,
         )
         return 2
     try:
-        if schema:
+        if project or rendered:
+            operation = renderer_input if project else assemble_rendered
+            bundle = operation(load_object(argv[2], "canonical packet"), load_object(argv[3], "renderer bundle"))
+            print(json.dumps(bundle, ensure_ascii=False, indent=2))
+        elif schema:
             contract = renderer_schema(load_object(argv[2], "canonical packet"), load_object(argv[3], "source bundle"))
             print(json.dumps(contract, ensure_ascii=False, indent=2))
         elif assemble:
@@ -892,7 +969,7 @@ def main(argv: list[str]) -> int:
     except InvalidBundle as error:
         print(f"clarity-output: {error}", file=sys.stderr)
         return 1
-    if not audit and not emit and not assemble and not schema:
+    if not audit and not emit and not assemble and not schema and not project and not rendered:
         print("clarity-output: valid")
     return 0
 
