@@ -368,6 +368,12 @@ GitHub's separate endpoint. The receipt remains even for body-only reviews;
 confirmed, failed or unknown attempts cannot be resubmitted. Actual partial
 outcomes are retained without retry or weaker fallback. Original history,
 freshness, approval and no-post controls remain intact.
+Immediately before an otherwise eligible approval, the shared PR helper reads
+all current per-reviewer GitHub opinions. An effective `CHANGES_REQUESTED`, or
+failure to verify that state, changes only the submission event to `COMMENT`;
+the full report and anchored feedback still post once. Dismissed requests and
+requests superseded by later approvals do not block. Other approval rules remain
+unchanged. This guard applies equally to manual reviews and unattended runners.
 Use a fresh OMP session after updating installed Python code.
 
 `post: false` independently forbids remote mutation, even with complete coverage.
