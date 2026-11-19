@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "batch_index": {"type": "integer"},
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "rule_id": {"type": "string"},
+          "disposition": {"type": "string", "enum": ["review", "not_applicable", "uncertain"]},
+          "evidence": {"type": "string"}
+        },
+        "required": ["rule_id", "disposition", "evidence"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["batch_index", "results"],
+  "additionalProperties": false
+}

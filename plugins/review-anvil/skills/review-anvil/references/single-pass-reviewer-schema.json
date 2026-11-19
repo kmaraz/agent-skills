@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "reviewer_id": {"type": "string"},
+    "review_markdown": {"type": "string"},
+    "result_groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "indices": {"type": "array", "items": {"type": "integer"}, "minItems": 1},
+          "verdict": {"type": "string", "enum": ["satisfied", "violated", "not_applicable", "not_assessed"]},
+          "evidence": {"type": "string"}
+        },
+        "required": ["indices", "verdict", "evidence"],
+        "additionalProperties": false
+      }
+    },
+    "candidates_json": {"type": "string"}
+  },
+  "required": ["reviewer_id", "review_markdown", "result_groups", "candidates_json"],
+  "additionalProperties": false
+}

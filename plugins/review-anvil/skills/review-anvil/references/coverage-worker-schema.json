@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "batch_index": { "type": "integer" },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "rule_id": { "type": "string" },
+          "verdict": {
+            "type": "string",
+            "enum": ["satisfied", "violated", "not_applicable", "not_assessed"]
+          },
+          "evidence": { "type": "string" }
+        },
+        "required": ["rule_id", "verdict", "evidence"],
+        "additionalProperties": false
+      }
+    },
+    "candidates_json": { "type": "string" }
+  },
+  "required": ["batch_index", "results", "candidates_json"],
+  "additionalProperties": false
+}

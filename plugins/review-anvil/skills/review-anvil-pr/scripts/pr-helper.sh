@@ -7,12 +7,12 @@
 #
 # Subcommands (see the case dispatch at the bottom for exact signatures):
 #
-#   init [<locator>]        — locator parse/auto-detect, gh preflight, marker
-#                             UUID + report path; prints KEY=VALUE lines.
+#   init [<locator>] [--rule-coverage scoped|all]
+#                           — locator/preflight, marker UUID + report path.
 #   post …                  — classify prior feedback and suppress duplicate
 #                             inline threads, prepend marker,
-#                             post as PR review (inline) or top-level comment;
-#                             prints the comment URL.
+#                             submit one PR review; failed/unknown delivery
+#                             retains the report locally without resubmission.
 #   verify-checkout […]     — improve-pr preflight: checkout matches PR head,
 #                             clean worktree; prints KEY=VALUE lines.
 #   post-start …            — post the "starting" comment, cc the author;
@@ -36,14 +36,16 @@
 #
 # Environment switches:
 #   REVIEW_ANVIL_NO_APPROVE=1     never submit APPROVE (downgrade to COMMENT)
+#   REVIEW_ANVIL_RULE_COVERAGE=all
+#                                 records requested knowledge audit mode
+#                                 (not a publication prerequisite)
+#   REVIEW_ANVIL_NO_POST=1        retain reports locally without remote writes
+#                                 (init persists intent for later retries)
 #   REVIEW_ANVIL_SKIP_DISMISSED=1 legacy name: skip full PR-history lookups
 #                                 (degraded mode for hosts without GraphQL;
 #                                 also forces APPROVE -> COMMENT)
 #   REVIEW_ANVIL_DISMISSALS=path  local-suppressions state file (default
 #                                 ~/.review-anvil/dismissed-findings.json)
-#   REVIEW_ANVIL_INLINE_MIN_SEVERITY=medium
-#                                 minimum severity posted as inline comments
-#                                 (lower findings stay in the summary)
 #   REVIEW_ANVIL_ENABLE_SUGGESTIONS=0
 #                                 disable helper-added ```suggestion blocks
 #
@@ -96,7 +98,7 @@ report_is_infra_failure() {
 
 cleanup_post_artifacts() {
     local report_path="$1" resolution_policy="${2:-remove}" dir
-    rm -f "$report_path" "${report_path}.inline.json" "${report_path}.approval.json" "${report_path}.followups.json" "${report_path}.context.json" "${report_path}.full.md"
+    rm -f "$report_path" "${report_path}.inline.json" "${report_path}.approval.json" "${report_path}.followups.json" "${report_path}.context.json" "${report_path}.rule-coverage" "${report_path}.no-post" "${report_path}.posting.md" "${report_path}.posting.inline.json" "${report_path}.posting.files.json"
     if [[ "$resolution_policy" != "keep" ]]; then
         rm -f "${report_path}.resolutions.json"
     fi
@@ -111,19 +113,17 @@ cleanup_post_artifacts() {
 # owner/repo/n/report_path locals (bash dynamic scoping). $1 = event,
 # $2 = inline-comments JSON file, or "" for a body-only review. On success
 # prints the review's html_url (possibly empty) and returns 0; on failure
-# prints a one-line warning to stderr and returns 1 — the caller decides the
-# next step in the fallback cascade.
+# prints a warning to stderr and returns 1. Unknown delivery is not success;
+# the caller retains artifacts and must not submit a fallback.
 _submit_review() {
-    # jq availability is preflighted at the top of cmd_post — a die here
-    # would run inside a command-substitution subshell and silently degrade
-    # the cascade instead of aborting.
-    local event="$1" inline="${2:-}" payload response
+    # jq availability is preflighted at the top of cmd_post.
+    local event="$1" inline="${2:-}" payload response body_path="${posting_report:-$report_path}"
     if [[ -n "$inline" ]]; then
-        payload=$(jq -n --rawfile body "$report_path" --arg event "$event" --slurpfile comments "$inline" \
-            '{event: $event, body: $body, comments: $comments[0]}')
+        payload=$(jq -n --rawfile body "$body_path" --arg event "$event" --slurpfile comments "$inline" \
+            '{event: $event, body: $body, comments: $comments[0]}') || return 1
     else
-        payload=$(jq -n --rawfile body "$report_path" --arg event "$event" \
-            '{event: $event, body: $body}')
+        payload=$(jq -n --rawfile body "$body_path" --arg event "$event" \
+            '{event: $event, body: $body}') || return 1
     fi
     if ! response=$(printf '%s' "$payload" | gh api \
                       "repos/${owner}/${repo}/pulls/${n}/reviews" \
@@ -133,7 +133,22 @@ _submit_review() {
             "$(printf '%s' "$response" | head -n1)" >&2
         return 1
     fi
-    printf '%s' "$response" | jq -r '.html_url // empty' 2>/dev/null || true
+    # A zero gh exit without a genuine submitted review is an unknown outcome,
+    # not permission to discard the local report or publish another payload.
+    if ! printf '%s' "$response" | jq -e -s \
+        --rawfile body "$body_path" --arg event "$event" '
+        length == 1 and (.[0] |
+          type == "object" and
+          (.id | type == "number" and . > 0 and . == floor) and
+          .body == $body and
+          .state == (if $event == "APPROVE" then "APPROVED" else "COMMENTED" end) and
+          (.submitted_at | type == "string" and length > 0) and
+          (.html_url == null or (.html_url | type == "string")))
+        ' >/dev/null 2>&1; then
+        printf 'warning: %s review submission outcome is unknown; response did not confirm the submitted report\n' "$event" >&2
+        return 1
+    fi
+    printf '%s' "$response" | jq -r '.html_url // empty'
 }
 
 # Resolve only live threads whose root comment carries review-anvil's terminal
@@ -196,11 +211,154 @@ compact_report_for_github() {
     return 0
 }
 
+# Build only the public projection. The original report and comment inventory
+# remain local evidence; matching is by stable identity, never similar prose.
+prepare_comment_projection() {
+    _py - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+report, inline, output, line_output, file_output = map(Path, sys.argv[1:])
+items = json.loads(inline.read_text()) if inline.exists() and inline.read_text().strip() else []
+lines = [item for item in items if item.get("subject_type") != "file"]
+files = [item for item in items if item.get("subject_type") == "file"]
+line_output.write_text(json.dumps(lines, indent=2) + "\n")
+file_output.write_text(json.dumps(files, indent=2) + "\n")
+ordinal = r"(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2,})"
+finding_id = rf"(?:RAV-(?:RUN[1-9][0-9]*-)?R[1-9][0-9]*-F{ordinal}|RAVF[0-9]{{3,}}|F-[0-9]{{3,}})"
+terminal = re.compile(
+    rf"<!--\s*review-anvil:\s*id=(?P<id>{finding_id})\s+severity=(?:critical|high|medium|low|nit)\s+area=[A-Za-z0-9][A-Za-z0-9._/-]*\s*-->\s*$", re.I)
+legacy = re.compile(rf"\*\*(?P<id>{finding_id})\s+\[(?:critical|high|medium|low|nit)\]", re.I)
+marker = re.compile(rf"<!--\s*review-anvil-report:\s*id=(?P<id>{finding_id})\s+[^>]*\bdisposition=active\s*-->", re.I)
+clarity = re.compile(rf"\(`(?P<id>{finding_id})`\)\s+<!--\s*review-anvil-report:", re.I)
+routed = set()
+for item in items:
+    body = item["body"].rstrip()
+    match = terminal.search(body.splitlines()[-1]) if body else None
+    match = match or legacy.search(body)
+    if match:
+        routed.add(match.group("id").upper())
+
+source = report.read_text().splitlines(keepends=True)
+out = []
+i = 0
+fence = None
+section_start = None
+section_routed = False
+headers = {"| Severity | Location | Issue | Suggested change |",
+           "| Severity | Location | Suggestion | Suggested change |", "|---|---|---|---|"}
+while i < len(source):
+    row = source[i]
+    fence_match = re.match(r"^\s*(`{3,}|~{3,})", row)
+    if fence_match:
+        token = fence_match.group(1)
+        if fence is None:
+            fence = token
+        elif token[0] == fence[0] and len(token) >= len(fence) and not row[fence_match.end():].strip():
+            fence = None
+        out.append(row)
+        i += 1
+        continue
+    if fence is None and row.strip() == "<details>" and i + 1 < len(source) and source[i + 1].strip() in {
+        "<summary>Issues and fixes</summary>", "<summary>Optional suggestions</summary>"
+    }:
+        section_start, section_routed = len(out), False
+    elif fence is None and row.strip() == "</details>" and section_start is not None:
+        if section_routed and not any(line.strip() and line.strip() not in headers
+                                      for line in out[section_start + 2:]):
+            del out[section_start:]
+            section_start = None
+            i += 1
+            continue
+        section_start = None
+    is_row = re.match(r"^\s*(?:[-*]\s+|\|)", row)
+    protected = re.search(r"\bdisposition=(?:deferred|outside)\b", row)
+    match = (marker.search(row) or clarity.search(row) or legacy.search(row)) if is_row and fence is None and not protected else None
+    if match and match.group("id").upper() in routed:
+        if section_start is not None:
+            section_routed = True
+        i += 1
+        if i < len(source) and source[i].strip() == "<!-- review-anvil: prior_feedback=reintroduced -->":
+            i += 1
+        # Table/modern marker rows are complete records. Legacy bullet rows
+        # may carry indented continuation paragraphs; do not eat other text.
+        if row.lstrip().startswith("|") or marker.search(row) or clarity.search(row):
+            continue
+        while i < len(source):
+            if source[i].startswith(("  ", "\t")) and source[i].strip():
+                i += 1
+            elif not source[i].strip() and i + 1 < len(source) and source[i + 1].startswith(("  ", "\t")):
+                i += 1
+            else:
+                break
+        continue
+    out.append(row)
+    i += 1
+output.write_text("".join(out))
+PY
+}
+
+# The reviews batch API has no subject_type field. File comments use its
+# documented standalone endpoint, once each, after the one confirmed review.
+submit_file_comments() {
+    _py - "$owner" "$repo" "$n" "$file_comments_result" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+owner, repo, number, receipt_path = sys.argv[1:]
+path = Path(receipt_path)
+receipt = json.loads(path.read_text())
+
+def save():
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(receipt, indent=2) + "\n")
+    temp.replace(path)
+
+failed = False
+for item in receipt["files"]:
+    payload = item["payload"]
+    item["status"] = "unknown"
+    save()  # A lost response never grants permission to resend this request.
+    try:
+        response = subprocess.run(
+            ["gh", "api", f"repos/{owner}/{repo}/pulls/{number}/comments", "-X", "POST", "--input", "-"],
+            input=json.dumps(payload), text=True, capture_output=True, check=False)
+        item["exit_code"] = response.returncode
+        item["stderr"] = response.stderr
+        try:
+            actual = json.loads(response.stdout)
+        except ValueError:
+            actual = response.stdout
+        item["response"] = actual
+        if response.returncode:
+            item["status"] = "failed"
+        elif (
+            isinstance(actual, dict)
+            and type(actual.get("id")) is int and actual["id"] > 0
+            and all(actual.get(key) == payload[key] for key in ("path", "body", "subject_type", "commit_id"))
+            and isinstance(actual.get("html_url"), str) and actual["html_url"].strip()
+        ):
+            item["status"] = "confirmed"
+            item["url"] = actual["html_url"]
+    except OSError as error:
+        item["error"] = str(error)
+    failed |= item["status"] != "confirmed"
+    save()
+if failed:
+    print(f"pr-helper: file comment delivery incomplete; confirmed main review: {receipt['review_url']}; retained receipt: {path}; no resubmission attempted", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 process_inline_comments_for_github() {
-    local inline_json="${1:-}" min_severity="${REVIEW_ANVIL_INLINE_MIN_SEVERITY:-medium}"
+    local inline_json="${1:-}"
     [[ -n "$inline_json" && -f "$inline_json" ]] || return 0
 
-    _py - "$inline_json" "$min_severity" <<'PY'
+    _py - "$inline_json" <<'PY'
 import json
 import os
 import re
@@ -208,15 +366,9 @@ import sys
 from pathlib import Path
 
 inline = Path(sys.argv[1])
-min_severity = sys.argv[2].lower()
 enable_suggestions = os.environ.get("REVIEW_ANVIL_ENABLE_SUGGESTIONS", "1") != "0"
 
 rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "nit": 4}
-if min_severity not in rank:
-    raise SystemExit(
-        "pr-helper: REVIEW_ANVIL_INLINE_MIN_SEVERITY must be one of "
-        "critical|high|medium|low|nit"
-    )
 
 raw = inline.read_text().strip()
 if not raw or raw == "[]":
@@ -312,18 +464,36 @@ def append_suggestion(body, item):
     return append_before_finding_metadata(body, block)
 
 kept = []
-filtered = 0
 suggested = 0
 
 for item in items:
     if not isinstance(item, dict):
-        kept.append(item)
-        continue
-    severity = infer_severity(item)
-    if rank[severity] > rank[min_severity]:
-        filtered += 1
-        continue
-    original_body = item.get("body") or ""
+        raise SystemExit("pr-helper: inline comment must be an object")
+    infer_severity(item)
+    if not isinstance(item.get("path"), str) or not item["path"].strip():
+        raise SystemExit("pr-helper: inline comment requires a nonblank path")
+    if not isinstance(item.get("body"), str) or not item["body"].strip():
+        raise SystemExit("pr-helper: inline comment requires a nonblank body")
+    subject = item.get("subject_type")
+    if subject is not None and subject not in {"file", "line"}:
+        raise SystemExit("pr-helper: subject_type must be file|line")
+    anchors = {"line", "side", "start_line", "start_side", "position", "start_position", "range"}
+    file_comment = subject == "file" or (subject is None and not anchors.intersection(item))
+    if file_comment:
+        if anchors.intersection(item):
+            raise SystemExit("pr-helper: file comment must not have line, side, range or position anchors")
+        if any(item.get(key) is not None for key in ("suggestion", "suggested_change", "suggestedChange")):
+            raise SystemExit("pr-helper: file comment cannot have an executable replacement")
+        if re.search(r"(?m)^\s*(`{3,}|~{3,})suggestion\b", item["body"]):
+            raise SystemExit("pr-helper: file comment cannot contain an executable suggestion block")
+        item = {**item, "subject_type": "file"}
+    else:
+        for key in ("line", "start_line", "position"):
+            if key in item and (type(item[key]) is not int or item[key] <= 0):
+                raise SystemExit(f"pr-helper: {key} must be a positive integer")
+        if "line" not in item and "position" not in item:
+            raise SystemExit("pr-helper: line comment requires a line or position")
+    original_body = item["body"]
     body = append_suggestion(original_body, item)
     if "```suggestion" in body and "```suggestion" not in original_body:
         suggested += 1
@@ -331,15 +501,13 @@ for item in items:
         body = append_before_finding_metadata(body, reintroduced_marker)
     clean = {key: item[key] for key in allowed if key in item}
     clean["body"] = body
+    if file_comment:
+        clean["subject_type"] = "file"
     kept.append(clean)
 
 inline.write_text(json.dumps(kept, indent=2) + "\n")
-if filtered or suggested:
-    print(
-        "pr-helper: inline comments processed "
-        f"({filtered} summary-only, {suggested} suggestion block(s) added)",
-        file=sys.stderr,
-    )
+if suggested:
+    print(f"pr-helper: inline comments processed ({suggested} suggestion block(s) added)", file=sys.stderr)
 PY
 }
 # Embed finding context from the engine's <report_path>.context.json (schema
@@ -678,6 +846,21 @@ from pathlib import Path
 from urllib.parse import unquote
 
 mode, owner, repo, n = sys.argv[1:5]
+packet = None
+if mode == "classify":
+    packet = json.loads(Path(sys.argv[5]).read_text())
+    if not isinstance(packet, dict) or not all(
+        isinstance(packet.get(field), list)
+        for field in ("findings", "earlier_feedback", "report_ids")
+    ):
+        raise SystemExit("pr-helper: classify-feedback requires findings, earlier_feedback and report_ids arrays")
+    if os.environ.get("REVIEW_ANVIL_SKIP_DISMISSED") == "1":
+        print("warning: REVIEW_ANVIL_SKIP_DISMISSED=1 — skipping prior-feedback classification (degraded mode)", file=sys.stderr)
+        if packet.get("decision") == "APPROVE":
+            packet["decision"] = "COMMENT"
+            packet["decision_reason"] = "PR review history was not checked."
+        print(json.dumps(packet, ensure_ascii=False, indent=2))
+        raise SystemExit(0)
 
 QUERY = r'''
 query($owner:String!,$repo:String!,$number:Int!,$threadCursor:String,$reviewCursor:String,$commentCursor:String){
@@ -854,7 +1037,7 @@ HUMAN_REPORT_TABLE_RE = re.compile(
     re.I,
 )
 EARLIER_FEEDBACK_RE = re.compile(
-    r"^\s*[-*]\s+\*\*(?P<status>open|still-present|fixed|stale|reported|author-resolved|author-explanation-accepted)\*\*"
+    r"^\s*[-*]\s+\*\*(?P<status>open|resolved|still-present|fixed|stale|reported|deferred|outside|review-dismissed|suppressed|author-resolved|author-explanation-accepted)\*\*"
     r"\s*[-—:]+\s*(?P<text>.+?)\s*$",
     re.I,
 )
@@ -911,6 +1094,24 @@ def severity_name(value):
     if value in SEVERITY_NAMES:
         return value
     return SEVERITY_INITIALS.get(value)
+
+def does_not_reraise(item):
+    return item["status"] in {
+        "suppressed",
+        "author-resolved",
+        "author-explanation-accepted",
+        "outside",
+    }
+
+def highest_severity(*values):
+    levels = ["nit", "low", "medium", "high", "critical"]
+    return max((value for value in values if value in levels), key=levels.index, default=None)
+
+def merge_history_severity(target, other):
+    # A new reintroduction has its own severity; closed feedback must not
+    # promote it back to a historical severity that no longer applies.
+    if not does_not_reraise(target) and not does_not_reraise(other):
+        target["severity"] = highest_severity(target.get("severity"), other.get("severity"))
 
 def severity_from_body(body):
     metadata = terminal_finding_metadata(body)
@@ -1126,9 +1327,11 @@ def path_from_block(block):
                 return path
     return ""
 
-def is_finding_line(line: str) -> bool:
-    return bool(FINDING_RE.search(line or "") or table_finding(line)
-                or clarity_report_finding(line))
+def is_finding_line(line: str, *, active_only: bool = False) -> bool:
+    finding = clarity_report_finding(line)
+    if active_only and finding and finding["disposition"] != "active":
+        return False
+    return bool(finding or FINDING_RE.search(line or "") or table_finding(line))
 
 def signature(body: str) -> str:
     body = body or ""
@@ -1512,7 +1715,7 @@ def report_findings(node):
                             or "prior-review-anvil-report"
                         ),
                         "status": earlier_item["status"],
-                        "severity": None,
+                        "severity": severity_from_body(earlier_item["finding"]),
                         "prior_feedback": None,
                         "structured_history": True,
                         "outdated": False,
@@ -1577,6 +1780,10 @@ for node in reviews + issue_comments:
         if candidate.get("prior_feedback") == "reintroduced" or previous is None:
             history.append(candidate)
         elif candidate.get("structured_history"):
+            if does_not_reraise(previous) and not does_not_reraise(candidate):
+                previous["severity"] = candidate.get("severity")
+            else:
+                merge_history_severity(previous, candidate)
             previous["status"] = candidate["status"]
             previous["summary"] = candidate["summary"]
             previous["source"] = candidate["source"]
@@ -1643,9 +1850,11 @@ def coalesce_history(items):
         current = coalesced[match_index]
         if history_rank(item) > history_rank(current):
             merge_identity(item, current, item)
+            merge_history_severity(item, current)
             coalesced[match_index] = item
         else:
             merge_identity(current, current, item)
+            merge_history_severity(current, item)
     return coalesced
 
 history = coalesce_history(history)
@@ -1686,11 +1895,11 @@ if mode in {"history", "list"}:
             print(f'- [{flags}] {loc} — {d["summary"]} ({"; ".join(metadata)})')
     raise SystemExit(0)
 
-if mode != "suppress":
+if mode not in {"suppress", "classify"}:
     raise SystemExit(f"pr-helper: unknown dismissed-findings mode: {mode}")
 
-report = Path(sys.argv[5])
-inline = Path(sys.argv[6])
+report = Path(sys.argv[5]) if mode == "suppress" else None
+inline = Path(sys.argv[6]) if mode == "suppress" else None
 
 def display_status(item):
     status = {
@@ -1709,14 +1918,6 @@ suppressed = []
 matched_history = []
 categorically_removed = 0
 explicit_suppressions = []
-
-def does_not_reraise(item):
-    return item["status"] in {
-        "suppressed",
-        "author-resolved",
-        "author-explanation-accepted",
-        "outside",
-    }
 
 def location_range_from_block(block):
     for line in block:
@@ -1748,7 +1949,7 @@ def inline_candidate(item):
 inline_items = None
 delivery_candidates = []
 reintroduced_candidates = []
-if inline.exists() and inline.read_text().strip() not in {"", "[]"}:
+if inline is not None and inline.exists() and inline.read_text().strip() not in {"", "[]"}:
     inline_items = json.loads(inline.read_text())
     if not isinstance(inline_items, list):
         raise SystemExit(f"pr-helper: {inline} is not a JSON array of comment objects")
@@ -1759,7 +1960,7 @@ if inline.exists() and inline.read_text().strip() not in {"", "[]"}:
             if item.get("prior_feedback") == "reintroduced":
                 reintroduced_candidates.append(candidate)
 
-if report.exists():
+if report is not None and report.exists():
     report_lines = report.read_text().splitlines()
     in_fence = False
     for index, line in enumerate(report_lines):
@@ -1767,7 +1968,7 @@ if report.exists():
         if stripped.startswith(("```", "~~~")):
             in_fence = not in_fence
             continue
-        if not in_fence and is_finding_line(line):
+        if not in_fence and is_finding_line(line, active_only=True):
             start_line, end_line = location_range_from_block([line])
             candidate = {
                 "path": path_from_block([line]),
@@ -1781,6 +1982,25 @@ if report.exists():
             if (index + 1 < len(report_lines)
                     and report_lines[index + 1].strip() == REINTRODUCED_MARKER):
                 reintroduced_candidates.append(candidate)
+
+def canonical_candidate(item):
+    diagnosis = item.get("title") or item.get("text") or item.get("source_context") or ""
+    return {
+        "path": item.get("report_path") or item.get("path") or "",
+        "start_line": str(item.get("report_start_line") or item.get("start_line")
+                          or item.get("report_line") or item.get("line") or "") or None,
+        "line": str(item.get("report_line") or item.get("line") or "") or None,
+        "sig": signature(f'[{item.get("severity")}] {item.get("area")} — {diagnosis}'),
+        "severity": severity_name(item.get("severity")),
+        **identity_metadata(item.get("id")),
+    }
+
+if packet is not None:
+    for item in packet["findings"]:
+        candidate = canonical_candidate(item)
+        delivery_candidates.append(candidate)
+        if item.get("prior_feedback") == "reintroduced":
+            reintroduced_candidates.append(candidate)
 
 def same_delivery_candidate_without_position(cand, candidate):
     if not same_finding(cand, candidate,
@@ -1844,6 +2064,86 @@ def matching_history(cand, require_path):
                 return exact
     return matches[0]
 
+def classify_candidate(cand, require_path, local_reintroduced=False):
+    reintroduced = explicitly_reintroduced(cand, local_reintroduced)
+    hit = matching_history(cand, require_path)
+    bypass_closed = bool(
+        hit and reintroduced
+        and hit["status"] in {"author-resolved", "author-explanation-accepted"}
+    )
+    disposition = (
+        "active" if not hit or bypass_closed
+        else "removed" if does_not_reraise(hit)
+        else "earlier"
+    )
+    return hit, reintroduced, bypass_closed, disposition
+
+def material_item_blocks(item, report_text):
+    if item.get("severity") not in {"critical", "high"} or does_not_reraise(item):
+        return False
+    source = item.get("source") or ""
+    assessment = next((line.lower() for line in report_text.splitlines()
+                       if source and source in line), "")
+    return not assessment or not any(clear in assessment for clear in ("fixed", "stale/outdated", "stale"))
+
+def material_match_blocks(matches):
+    return any(
+        severity in {"critical", "high"} and (reintroduced or not does_not_reraise(item))
+        for item, severity, reintroduced in matches
+    )
+
+if packet is not None:
+    kept = []
+    earlier = list(packet["earlier_feedback"])
+    for item in packet["findings"]:
+        cand = canonical_candidate(item)
+        hit, reintroduced, bypass_closed, disposition = classify_candidate(
+            cand, False, item.get("prior_feedback") == "reintroduced"
+        )
+        if hit:
+            matched_history.append((hit, cand["severity"], bypass_closed))
+        if disposition == "active":
+            kept.append({**item, "prior_feedback": "reintroduced"} if reintroduced else item)
+        elif disposition == "earlier":
+            identity = {}
+            merge_identity(identity, hit, cand)
+            finding_id = identity["finding_id"] or item["id"]
+            severity = highest_severity(cand["severity"], hit.get("severity"))
+            title = item.get("title") or hit["summary"]
+            status = hit["status"] if hit["status"] not in {"fixed", "stale"} else "still-present"
+            row = {
+                "id": finding_id, "status": status, "severity": severity,
+                "text": f'[{severity}] {item.get("area") or "history"} — {title} {display_status(hit)}',
+                "url": hit["source"],
+            }
+            if identity["legacy_ids"]:
+                row["legacy_ids"] = identity["legacy_ids"]
+            earlier = [old for old in earlier if old.get("id") not in {item["id"], finding_id}]
+            earlier.append(row)
+    packet["findings"] = kept
+    packet["earlier_feedback"] = earlier
+    identified = {
+        item["id"]
+        for group in ("findings", "earlier_feedback", "set_aside", "outside_scope")
+        for item in packet.get(group, [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    packet["report_ids"] = [finding_id for finding_id in packet["report_ids"] if finding_id in identified]
+    packet["report_ids"].extend(sorted(identified - set(packet["report_ids"])))
+    assessments = "\n".join(f'{item["status"]} {item["text"]} {item.get("url", "")}' for item in earlier)
+    earlier_material = [
+        {"status": item["status"], "severity": item.get("severity"), "source": item.get("url")}
+        for item in earlier
+    ]
+    if packet.get("decision") == "APPROVE" and (
+        any(material_item_blocks(item, assessments) for item in [*history, *earlier_material])
+        or material_match_blocks(matched_history)
+    ):
+        packet["decision"] = "COMMENT"
+        packet["decision_reason"] = "Prior critical/high PR feedback remains open or was matched as still present."
+    print(json.dumps(packet, ensure_ascii=False, indent=2))
+    raise SystemExit(0)
+
 inline_rewrite = None
 if inline_items is not None:
     items = inline_items
@@ -1854,29 +2154,21 @@ if inline_items is not None:
             kept.append(item)  # let posting fail loudly on malformed members
             continue
         cand = inline_candidate(item)
-        reintroduced = explicitly_reintroduced(
-            cand, item.get("prior_feedback") == "reintroduced"
+        hit, reintroduced, bypass_closed_feedback, disposition = classify_candidate(
+            cand, True, item.get("prior_feedback") == "reintroduced"
         )
         inline_reintroduced |= (
             reintroduced and item.get("prior_feedback") != "reintroduced"
         )
-        hit = matching_history(cand, require_path=True)
         if hit:
-            bypass_closed_feedback = (
-                hit["status"] in {
-                    "author-resolved",
-                    "author-explanation-accepted",
-                }
-                and reintroduced
-            )
             matched_history.append((hit, cand.get("severity"), bypass_closed_feedback))
-            if does_not_reraise(hit) and not bypass_closed_feedback:
+            if disposition == "removed":
                 categorically_removed += 1
                 if hit["status"] == "suppressed":
                     explicit_suppressions.append({"path": cand["path"],
                                                   "summary": summary(item.get("body") or ""),
                                                   "source": hit["source"], "sig": cand["sig"]})
-            elif does_not_reraise(hit):
+            elif disposition == "active":
                 kept.append(
                     {**item, "prior_feedback": "reintroduced"}
                     if reintroduced else item
@@ -1940,7 +2232,7 @@ if report.exists():
             out.append(line)
             i += 1
             continue
-        if not in_fence and is_finding_line(line):
+        if not in_fence and is_finding_line(line, active_only=True):
             j2 = block_end(i)
             block = lines[i:j2]
             start_line, end_line = location_range_from_block(block)
@@ -1948,8 +2240,8 @@ if report.exists():
             cand = {"path": path_from_block(block), "start_line": start_line,
                     "line": end_line, "sig": signature(block_body),
                     **identity_from_body(block_body)}
-            reintroduced = explicitly_reintroduced(
-                cand,
+            hit, reintroduced, bypass_closed_feedback, disposition = classify_candidate(
+                cand, False,
                 len(block) > 1 and block[1].strip() == REINTRODUCED_MARKER,
             )
             marked_block = (
@@ -1957,23 +2249,15 @@ if report.exists():
                 else [block[0], REINTRODUCED_MARKER, *block[1:]]
             )
             report_reintroduced |= reintroduced and marked_block != block
-            hit = matching_history(cand, require_path=False)
             if hit:
-                bypass_closed_feedback = (
-                    hit["status"] in {
-                        "author-resolved",
-                        "author-explanation-accepted",
-                    }
-                    and reintroduced
-                )
                 matched_history.append((hit, severity_from_body("\n".join(block)), bypass_closed_feedback))
-                if does_not_reraise(hit) and not bypass_closed_feedback:
+                if disposition == "removed":
                     categorically_removed += 1
                     if hit["status"] == "suppressed":
                         explicit_suppressions.append({"path": cand["path"],
                                                       "summary": summary("\n".join(block)),
                                                       "source": hit["source"], "sig": cand["sig"]})
-                elif does_not_reraise(hit):
+                elif disposition == "active":
                     out.extend(marked_block if reintroduced else block)
                 else:
                     identity = {}
@@ -2074,19 +2358,15 @@ if report.exists():
 # still-present assessments block. This lets a validated fix approve even when
 # the author has not yet clicked Resolve in GitHub.
 report_text = report.read_text() if report.exists() else ""
-def material_item_blocks(item):
-    if item.get("severity") not in {"critical", "high"} or does_not_reraise(item):
-        return False
-    source = item.get("source") or ""
-    assessment = next((line.lower() for line in report_text.splitlines()
-                       if source and source in line), "")
-    return not assessment or not any(clear in assessment for clear in ("fixed", "stale/outdated", "stale"))
 
-blocking_prior = any(material_item_blocks(item) for item in history)
-blocking_match = any(
-    severity in {"critical", "high"} and (reintroduced or not does_not_reraise(item))
-    for item, severity, reintroduced in matched_history
-)
+report_history = [
+    {"status": item["status"], "source": item["url"],
+     "severity": severity_from_body(item["finding"])}
+    for _, line in iter_unfenced_lines(report_text)
+    if (item := earlier_feedback_finding(line))
+]
+blocking_prior = any(material_item_blocks(item, report_text) for item in [*history, *report_history])
+blocking_match = material_match_blocks(matched_history)
 approval = Path(str(report) + ".approval.json")
 if (blocking_prior or blocking_match) and approval.exists():
     try:
@@ -2149,6 +2429,15 @@ cmd_history() {
     fi
     export GH_HOST="$host"
     _review_history_py history "$owner" "$repo" "$n"
+}
+
+cmd_classify_feedback() {
+    local host="${1:-}" owner="${2:-}" repo="${3:-}" n="${4:-}" packet="${5:-}"
+    for v in host owner repo n packet; do
+        [[ -n "${!v}" ]] || die "classify-feedback: missing <$v>"
+    done
+    export GH_HOST="$host"
+    _review_history_py classify "$owner" "$repo" "$n" "$packet"
 }
 
 cmd_resolve() {
@@ -2215,30 +2504,70 @@ PY
 cmd_check_pins() {
     # Mechanical pin-rejection (the engine's prose algorithm, made binding):
     #   check-pins <preset-name> <pins-csv> [<raw-args>]
-    # Segment-split raw args on commas, take each segment's key (text before
-    # its first ':'), lowercase, abort if it matches a pinned param. A comma
-    # inside a quoted value can split into stray segments, but those only
-    # abort if their derived key exactly equals a pin name — refusing in an
-    # ambiguous case is the safe direction.
+    # Split top-level argument segments without treating quoted focus text
+    # as controls. Validate exhaustive preset controls before removing them
+    # from engine arguments, so duplicates cannot disappear during parsing.
     local preset="${1:-}" pins_csv="${2:-}" raw="${3:-}"
     [[ -n "$preset" && -n "$pins_csv" ]] || die "check-pins: usage: check-pins <preset> <pins-csv> [<raw-args>]"
     if [[ -z "$raw" ]]; then
         printf 'pins-ok\n'
         return 0
     fi
-    local seg key pin pin_norm
-    local IFS=','
-    for seg in $raw; do
-        key=$(printf '%s' "${seg%%:*}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-        [[ -n "$key" ]] || continue
-        for pin in $pins_csv; do
-            pin_norm=$(printf '%s' "$pin" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-            if [[ "$key" == "$pin_norm" ]]; then
-                die "error: $pin_norm is pinned by $preset and cannot be overridden in args"
-            fi
-        done
-    done
-    printf 'pins-ok\n'
+    _py - "$preset" "$pins_csv" "$raw" <<'PY'
+import sys
+
+preset, pins_csv, raw = sys.argv[1:]
+pins = {pin.strip().lower() for pin in pins_csv.split(",")}
+segments, start, quote, escaped, depth = [], 0, None, False, 0
+for i, char in enumerate(raw):
+    if escaped:
+        escaped = False
+    elif char == "\\" and quote:
+        escaped = True
+    elif quote:
+        if char == quote:
+            quote = None
+    elif char in "\"'" and (i == 0 or raw[i - 1].isspace() or raw[i - 1] in ":,=([{"):
+        quote = char
+    elif char in "([{":
+        depth += 1
+    elif char in ")]}":
+        depth -= 1
+    elif char == "," and depth == 0:
+        segments.append(raw[start:i])
+        start = i + 1
+if quote or depth != 0:
+    raise SystemExit("pr-helper: cannot parse preset controls safely")
+segments.append(raw[start:])
+coverage = None
+workers = None
+memory_off = False
+for segment in segments:
+    key, separator, value = segment.partition(":")
+    key = key.strip().lower()
+    value = value.strip().lower()
+    if key in pins:
+        raise SystemExit(f"pr-helper: error: {key} is pinned by {preset} and cannot be overridden in args")
+    if preset == "review-anvil-pr" and key == "rule_coverage":
+        if coverage is not None:
+            raise SystemExit("pr-helper: duplicate rule_coverage control")
+        if not separator or value not in ("scoped", "all"):
+            raise SystemExit("pr-helper: rule_coverage must be scoped|all")
+        coverage = value
+    if preset == "review-anvil-pr" and key == "coverage_workers":
+        if workers is not None:
+            raise SystemExit("pr-helper: duplicate coverage_workers control")
+        if not separator or value not in ("1", "2", "3", "4"):
+            raise SystemExit("pr-helper: coverage_workers must be 1|2|3|4")
+        workers = value
+    if key == "memory" and value == "off":
+        memory_off = True
+if coverage == "all" and memory_off:
+    raise SystemExit("pr-helper: rule_coverage: all requires memory: on")
+if workers is not None and coverage != "all":
+    raise SystemExit("pr-helper: coverage_workers requires rule_coverage: all")
+print("pins-ok")
+PY
 }
 
 # Preflight the dependencies that would otherwise fail only at post time,
@@ -2253,7 +2582,25 @@ _preflight_deps() {
 }
 
 cmd_init() {
-    local locator="${1:-}"
+    local locator="" rule_coverage="scoped" coverage_seen=0
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+        locator="$1"
+        shift
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rule-coverage)
+                [[ "$coverage_seen" == 0 ]] || die "init: duplicate --rule-coverage"
+                [[ $# -ge 2 ]] || die "init: --rule-coverage requires scoped|all"
+                rule_coverage="$2"
+                [[ "$rule_coverage" == scoped || "$rule_coverage" == all ]] \
+                    || die "init: --rule-coverage must be scoped|all"
+                coverage_seen=1
+                shift 2
+                ;;
+            *) die "init: unexpected argument: $1" ;;
+        esac
+    done
     _preflight_deps
 
     # If the user supplied no locator, try to detect the PR for the
@@ -2329,6 +2676,14 @@ cmd_init() {
     # reads from the same file regardless of CWD changes between
     # invocations.
     report_path="$anchor/.review-anvil/final-report-${marker}.md"
+    # Retain the requested audit mode as diagnostics; it does not authorize
+    # or block ordinary publication. The no-post marker remains independent.
+    if [[ "$rule_coverage" == all ]]; then
+        (umask 077; printf 'all\n' >"${report_path}.rule-coverage")
+    fi
+    if [[ "${REVIEW_ANVIL_NO_POST:-0}" == 1 ]]; then
+        (umask 077; : >"${report_path}.no-post")
+    fi
 
     printf 'HOST=%s\n' "$host"
     printf 'OWNER=%s\n' "$owner"
@@ -2338,8 +2693,10 @@ cmd_init() {
     printf 'HEAD_SHA=%s\n' "$head_sha"
     printf 'MARKER=%s\n' "$marker"
     printf 'REPORT_PATH=%s\n' "$report_path"
+    printf 'RULE_COVERAGE=%s\n' "$rule_coverage"
     printf 'TITLE=%s\n' "$title"
 }
+
 
 cmd_post() {
     local host="${1:-}" owner="${2:-}" repo="${3:-}" n="${4:-}" marker="${5:-}" report_path="${6:-}"
@@ -2347,17 +2704,29 @@ cmd_post() {
         [[ -n "${!v}" ]] || die "post: missing <$v>"
     done
     [[ -f "$report_path" ]] || die "report file not found: $report_path"
+    if [[ "${REVIEW_ANVIL_NO_POST:-0}" == 1 || -f "${report_path}.no-post" ]]; then
+        printf '%s\n' "$report_path"
+        return 0
+    fi
     if [[ "${REVIEW_ANVIL_POST_INFRA_FAILURES:-0}" != "1" ]] && report_is_infra_failure "$report_path"; then
         die "review-anvil infrastructure failure report detected; refusing to post PR noise (report left at $report_path; set REVIEW_ANVIL_POST_INFRA_FAILURES=1 only for manual debugging)"
     fi
 
     export GH_HOST="$host"
 
-    # Preflight jq at top level: a die inside the cascade's command
-    # substitutions cannot abort the script. Note: gh's --jq is built-in
-    # gojq — it does NOT provide a jq binary on PATH.
+    # Preflight jq at top level. Note: gh's --jq is built-in gojq — it does
+    # NOT provide a jq binary on PATH.
     command -v jq >/dev/null 2>&1 \
         || die "jq not found — required to post reviews (gh's --jq is built-in gojq, not a jq binary; install jq)"
+    local file_comments_result="${report_path}.file-comments-result.json"
+    if [[ -e "$file_comments_result" ]]; then
+        die "publication already attempted; refusing to resend the review or file comments; retained receipt: $file_comments_result"
+    fi
+    # Keep selected source bytes before marker/history/publication projection.
+    [[ -f "${report_path}.full.md" ]] || cp "$report_path" "${report_path}.full.md"
+    if [[ -f "${report_path}.inline.json" && ! -e "${report_path}.inline.source.json" ]]; then
+        cp "${report_path}.inline.json" "${report_path}.inline.source.json"
+    fi
 
     # Prepend the marker atomically, exactly once (post is retryable after a
     # suppression failure — a retry must not stack marker lines).
@@ -2442,98 +2811,50 @@ cmd_post() {
         || printf 'warning: finding context could not be embedded; posting without it\n' >&2
     compact_report_for_github "$report_path" "$inline_json"
 
-    # Compute inline presence after suppression (which may have emptied the
-    # array). Empty array / whitespace-only / missing file = no inline.
-    local has_inline=0
-    if [[ -f "$inline_json" ]] \
-       && [[ -n "$(tr -d '[:space:]' <"$inline_json")" ]] \
-       && [[ "$(tr -d '[:space:]' <"$inline_json")" != "[]" ]]; then
-        has_inline=1
+    local posting_report="${report_path}.posting.md"
+    local posting_inline="${report_path}.posting.inline.json"
+    local posting_files="${report_path}.posting.files.json"
+    prepare_comment_projection "$report_path" "$inline_json" "$posting_report" "$posting_inline" "$posting_files" \
+        || die "cannot prepare lossless comment publication projection; report remains local: $report_path"
+    local file_count captured_head=""
+    file_count=$(jq 'length' "$posting_files") || return 1
+    if [[ "$file_count" -gt 0 ]]; then
+        captured_head=$(jq -r '.head_sha // empty' "$approval_json" 2>/dev/null || true)
+        [[ "$captured_head" =~ ^[[:xdigit:]]{40}$ || "$captured_head" =~ ^[[:xdigit:]]{64}$ ]] \
+            || die "file comments require the captured reviewed head; no review submitted"
     fi
 
-    # Review-submission cascade — a failed approval must never cost the
-    # report (GitHub rejects self-approval with 422, the most common case
-    # for the "review the PR I'm on" workflow):
-    #   1. review {requested event + inline comments}   (if inline exists;
-    #      can also fail when reviewer line refs aren't in the PR's diff)
-    #   2. review {APPROVE, body-only}                  (if event is APPROVE)
-    #   3. downgrade APPROVE -> COMMENT, note it in the report, retry
-    #      {COMMENT + inline}                           (if inline exists)
-    #   4. top-level comment fallback (below)
-    local url
-    if [[ "$has_inline" -eq 1 ]]; then
-        if url=$(_submit_review "$review_event" "$inline_json"); then
-            _emit_post_result "$review_event" "$url"
-            return 0
-        fi
+    # Submit the policy-selected event exactly once, preserving its full inline
+    # payload. A rejection or lost response never authorizes a weaker event,
+    # a body-only retry, or a top-level comment. Keep all local artifacts when
+    # delivery cannot be confirmed; even marker-only history is not proof that
+    # this exact review was delivered.
+    local url submission_inline=""
+    if jq -e 'length > 0' "$posting_inline" >/dev/null; then
+        submission_inline="$posting_inline"
     fi
-
-    if [[ "$review_event" == "APPROVE" ]]; then
-        local original_report_path="$report_path"
-        local approval_report_path=""
-        if [[ "$has_inline" -eq 1 ]]; then
-            approval_report_path=$(mktemp -t review-anvil-approval.XXXXXX)
-            cat "$report_path" >"$approval_report_path"
-            append_inline_details_to_report "$approval_report_path" "$inline_json"
-            report_path="$approval_report_path"
+    # Claim this publication exclusively for every payload shape. Even an
+    # unconfirmed response is terminal: a later invocation must not resend it.
+    (umask 077; set -o noclobber
+        jq -n --arg host "$host" --arg owner "$owner" --arg repo "$repo" --arg n "$n" \
+            --arg commit "$captured_head" --slurpfile comments "$posting_files" \
+            '{host:$host,owner:$owner,repo:$repo,pull_number:$n,commit_id:$commit,
+              review_status:"unknown",review_url:null,
+              files:[$comments[0][] | {path:.path,status:"not_attempted",
+                payload:(. + {commit_id:$commit})}]}' >"$file_comments_result"
+    ) || die "cannot exclusively persist delivery receipt; no review submitted"
+    if url=$(_submit_review "$review_event" "$submission_inline"); then
+        jq --arg url "$url" '.review_status = "confirmed" | .review_url = $url' \
+            "$file_comments_result" >"${file_comments_result}.tmp" \
+            && mv "${file_comments_result}.tmp" "$file_comments_result" \
+            || die "main review confirmed at $url but receipt update failed; no resubmission allowed"
+        if [[ "$file_count" -gt 0 ]]; then
+            submit_file_comments || return 1
         fi
-        if url=$(_submit_review APPROVE ""); then
-            report_path="$original_report_path"
-            [[ -z "$approval_report_path" ]] || rm -f "$approval_report_path"
-            _emit_post_result APPROVE "$url"
-            return 0
-        fi
-        report_path="$original_report_path"
-        [[ -z "$approval_report_path" ]] || rm -f "$approval_report_path"
-        review_event="COMMENT"
-        printf 'warning: approval could not be submitted (common cause: GitHub rejects approving your own PR); downgrading to a comment review\n' >&2
-        append_review_context_note "$report_path" \
-            "Delivery: review-anvil selected APPROVE, but GitHub rejected the approval, so review-anvil posted a comment instead."
-        compact_report_for_github "$report_path" "$inline_json"
-        if [[ "$has_inline" -eq 1 ]]; then
-            if url=$(_submit_review COMMENT "$inline_json"); then
-                _emit_post_result COMMENT "$url"
-                return 0
-            fi
-        fi
-    fi
-
-    # A gh failure while reading the response can leave a review created
-    # server-side; check for our marker among existing reviews before
-    # posting the report a second time.
-    local existing
-    existing=$(gh api "repos/${owner}/${repo}/pulls/${n}/reviews" --paginate \
-               --jq ".[] | select(.body | contains(\"$marker\")) | .html_url" 2>/dev/null \
-               | head -n1 || true)
-    if [[ -n "$existing" ]]; then
-        printf 'note: a review with this marker already exists on the PR; not posting again\n' >&2
-        finalize_post_artifacts "$host" "$owner" "$repo" "$n" "$report_path"
-        printf '%s\n' "$existing"
+        _emit_post_result "$review_event" "$url"
         return 0
     fi
-
-    append_inline_details_to_report "$report_path" "$inline_json"
-    # Fallback path: top-level comment + marker URL recovery.
-    if ! gh pr comment "$n" -R "$owner/$repo" --body-file "$report_path" >/dev/null 2>&1; then
-        die "gh pr comment failed for $owner/$repo#$n on host=$host"
-    fi
-
-    # Recover URL via marker lookup (with one retry for read-after-write lag).
-    local url
-    for attempt in 1 2; do
-        url=$(gh api "repos/${owner}/${repo}/issues/${n}/comments" --paginate \
-              --jq ".[] | select(.body | contains(\"$marker\")) | .html_url" 2>/dev/null \
-              | head -n1 || true)
-        [[ -n "$url" ]] && break
-        [[ "$attempt" -eq 1 ]] && sleep 2
-    done
-
-    finalize_post_artifacts "$host" "$owner" "$repo" "$n" "$report_path"
-    if [[ -n "$url" ]]; then
-        printf '%s\n' "$url"
-    else
-        printf 'posted (URL unavailable)\n'
-    fi
+    die "$review_event review submission failed or delivery is unknown; no resubmission attempted; report remains local: $report_path"
 }
 
 cmd_verify_checkout() {
@@ -2834,6 +3155,7 @@ case "${1:-}" in
     post-start)       shift; cmd_post_start "$@" ;;
     post-update)      shift; cmd_post_update "$@" ;;
     history)          shift; cmd_history "$@" ;;
+    classify-feedback) shift; cmd_classify_feedback "$@" ;;
     resolve)          shift; cmd_resolve "$@" ;;
     dismissed)        shift; cmd_dismissed "$@" ;;
     dismiss)          shift; cmd_dismiss "$@" ;;
@@ -2841,6 +3163,6 @@ case "${1:-}" in
     process-inline)   shift; process_inline_comments_for_github "$@" ;;
     embed-context)    shift; embed_finding_context "$@" ;;
     check-pins)       shift; cmd_check_pins "$@" ;;
-    "")               die "usage: pr-helper.sh {init [<locator>] | next-run <host> <owner> <repo> <n> | post <host> <owner> <repo> <n> <marker> <report_path> | verify-checkout [<locator>] | post-start <host> <owner> <repo> <n> <marker> <author> | post-update <host> <owner> <repo> <n> <comment_id> <marker> <report_path> <author> <success|failure> [<started_at>] | history <host> <owner> <repo> <n> | resolve <host> <owner> <repo> <n> <resolutions_json> | dismissed <host> <owner> <repo> <n> | dismiss <host> <owner> <repo> <n> <path> <pattern> [<reason>] | compact-report <report_path> [<inline_json>] | process-inline <inline_json> | embed-context <report_path> <context_json> | check-pins <preset> <pins-csv> [<raw-args>]}" ;;
+    "")               die "usage: pr-helper.sh {init [<locator>] | next-run <host> <owner> <repo> <n> | post <host> <owner> <repo> <n> <marker> <report_path> | verify-checkout [<locator>] | post-start <host> <owner> <repo> <n> <marker> <author> | post-update <host> <owner> <repo> <n> <comment_id> <marker> <report_path> <author> <success|failure> [<started_at>] | history <host> <owner> <repo> <n> | classify-feedback <host> <owner> <repo> <n> <canonical_json> | resolve <host> <owner> <repo> <n> <resolutions_json> | dismissed <host> <owner> <repo> <n> | dismiss <host> <owner> <repo> <n> <path> <pattern> [<reason>] | compact-report <report_path> [<inline_json>] | process-inline <inline_json> | embed-context <report_path> <context_json> | check-pins <preset> <pins-csv> [<raw-args>]}" ;;
     *)                die "unknown subcommand: $1" ;;
 esac
