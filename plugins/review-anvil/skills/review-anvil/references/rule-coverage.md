@@ -111,7 +111,7 @@ summary = CriteriaCoordinator(
 print({key: summary.get(key) for key in ("status", "reviewed_rules", "total_rules")})
 ```
 
-`ordinary_reviewers` is the complete nonempty ordered list of normal `{id, prompt}` tasks/lenses. The coordinator dispatches that cohort itself: **do not launch another ordinary wave**. `coverage_workers` is an integer 1–4, default 4. For single-pass it caps simultaneous ordinary reviewers, not their total count. Use the current host's actual `agent`, no model override/proxy/daemon. Start/wait stay on the Eval thread. A consumed worker/result failure does not cancel independent original jobs; trust/storage/freshness failures stop new scheduling. Harvest each started handle at most once, except changed-diff cancellation as above.
+`ordinary_reviewers` is the complete nonempty ordered list of normal `{id, prompt}` tasks/lenses. The coordinator dispatches that cohort itself: **do not launch another ordinary wave**. `coverage_workers` is an integer 1–4, default 4. For single-pass it caps simultaneous ordinary reviewers, not their total count. Use the current host's actual `agent`, no model override/proxy/daemon. Starts, coordination and durable writes stay on the Eval thread. The adapter independently receives every live handle in a copied Eval context, matching native handle-await semantics, and returns completed responses without waiting for slower siblings. A consumed worker/result failure does not cancel independent original jobs; trust/storage/freshness failures stop new scheduling. Harvest each started handle at most once, except changed-diff cancellation as above.
 
 `effective_reviewer_timeout` is the already resolved normal cap (default 600s,
 including the existing large-diff adjustment), not a new public setting.
@@ -192,7 +192,7 @@ try:
             # salvage ready output or cancel without an unbounded drain.
             for name, item in pending:
                 try:
-                    ready = item.done()
+                    ready = wave.done(item)
                 except BaseException as error:
                     failures.append((name, str(error)))
                     ready = False
@@ -220,14 +220,20 @@ try:
             retain(name, value)
         pending = [(name, item) for name, item in pending if item is not handle]
 finally:
+    wave.end_wave()
     archive.close()
 print({"saved": len(saved), "failed": len(failures)})
 ```
 
-Starts and waits stay on the Eval thread. Use the same timed adapter for ordinary,
-reproduction, adversarial, rendering and audit stages; no fresh timeout per handle,
-sleep-only alarm, threads or polling. The adapter returns the complete parsed
-value. Python `write`, `Path.write_text` and `_Directory.write` are synchronous:
+Keep starts, coordination and durable writes on the Eval thread. Use the same
+timed adapter for ordinary, reproduction, adversarial, rendering and audit
+stages. Its context-preserving receiver threads consume each live handle once,
+including ready siblings while the caller persists another response, and are
+released on stage exit, including cancellation or interruption. Unharvested
+receipts remain available on the adapter; ending a wave never discards them.
+No fresh timeout per handle, polling, reviewer
+retry or additional model job is introduced. The adapter returns the complete
+parsed value. Python `write`, `Path.write_text` and `_Directory.write` are synchronous:
 never await them. Private writes are atomic, owner-only and fsynced before progress.
 Counts are display only; validators consume the saved complete value.
 Any failure follows the existing stage fallback/COMMENT policy, not success

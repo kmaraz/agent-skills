@@ -552,6 +552,9 @@ class CriteriaCoordinator:
             while active:
                 self._harvest(active)
         finally:
+            end_wave = getattr(self.adapter, "end_wave", None)
+            if end_wave is not None:
+                end_wave()
             for _, directory, _ in active:
                 directory.close()
 

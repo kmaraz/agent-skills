@@ -729,50 +729,44 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("expired_native_adapter", adapter_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for failure_stage in ("done", "wait"):
-            with self.subTest(failure_stage=failure_stage):
-                self.begin(6)
-                outputs = NativeFixture()
-                expired = []
-                archive = self.archive
+        self.begin(6)
+        outputs = NativeFixture()
+        expired = []
+        archive = self.archive
 
-                class Handle:
-                    def __init__(self, token):
-                        self.token = token
-                        self.handle = f"agent://expiry-fixture-{token}"
+        class Handle:
+            def __init__(self, token):
+                self.token = token
+                self.handle = f"agent://expiry-fixture-{token}"
 
-                    def fail_if_expired(self, stage):
-                        if stage == failure_stage and self.token in (0, 2):
-                            expired.append(self.token)
-                            outputs.live.remove(self.token)
-                            raise RuntimeError(f"unknown agent handle {self.handle}; result expired")
+            def done(self):
+                return True
 
-                    def done(self):
-                        self.fail_if_expired("done")
-                        return True
+            def wait(self, timeout=None):
+                if self.token in (0, 2):
+                    expired.append(self.token)
+                    outputs.live.remove(self.token)
+                    raise RuntimeError(f"unknown agent handle {self.handle}; result expired")
+                return outputs.wait_one([self.token])[1]
 
-                    def wait(self, timeout=None):
-                        self.fail_if_expired("wait")
-                        return outputs.wait_one([self.token])[1]
+        def spawn(prompt, **kwargs):
+            request = next(json.loads(path.read_text()) for path in archive.glob("tasks/*/request.json")
+                           if json.loads(path.read_text())["label"] == kwargs["label"])
+            return Handle(outputs.start(request))
 
-                def spawn(prompt, **kwargs):
-                    request = next(json.loads(path.read_text()) for path in archive.glob("tasks/*/request.json")
-                                   if json.loads(path.read_text())["label"] == kwargs["label"])
-                    return Handle(outputs.start(request))
-
-                summary = self.coordinator(module.OMPNativeAdapter(spawn), workers=2).run(self.reviewers)
-                self.assertEqual(summary["status"], "incomplete")
-                self.assertEqual(len(outputs.requests), 6)
-                self.assertEqual(expired, [0, 2])
-                self.assertEqual(outputs.waited, [1, 3, 4, 5])
-                self.assertEqual(len(summary["normal_review_paths"]), 4)
-                self.assertEqual(summary["candidate_count"], 4)
-                self.assertEqual(len(list(archive.glob("tasks/*/worker-error.json"))), 2)
-                retained = {str(path): path.read_bytes() for path in archive.glob("tasks/*/response.json")}
-                restored = NativeFixture()
-                resumed = self.coordinator(restored).run(self.reviewers, resume=True)
-                self.assertEqual((resumed["status"], restored.requests), ("incomplete", []))
-                self.assertEqual(retained, {str(path): path.read_bytes() for path in archive.glob("tasks/*/response.json")})
+        summary = self.coordinator(module.OMPNativeAdapter(spawn), workers=2).run(self.reviewers)
+        self.assertEqual(summary["status"], "incomplete")
+        self.assertEqual(len(outputs.requests), 6)
+        self.assertCountEqual(expired, [0, 2])
+        self.assertCountEqual(outputs.waited, [1, 3, 4, 5])
+        self.assertEqual(len(summary["normal_review_paths"]), 4)
+        self.assertEqual(summary["candidate_count"], 4)
+        self.assertEqual(len(list(archive.glob("tasks/*/worker-error.json"))), 2)
+        retained = {str(path): path.read_bytes() for path in archive.glob("tasks/*/response.json")}
+        restored = NativeFixture()
+        resumed = self.coordinator(restored).run(self.reviewers, resume=True)
+        self.assertEqual((resumed["status"], restored.requests), ("incomplete", []))
+        self.assertEqual(retained, {str(path): path.read_bytes() for path in archive.glob("tasks/*/response.json")})
 
     def test_not_assessed_groups_are_real_questions_without_redispatch(self):
         self.begin(5)

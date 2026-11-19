@@ -693,6 +693,9 @@ class CoverageCoordinator:
             archive.write("last-summary.json", summary)
             return summary
         finally:
+            end_wave = getattr(self.adapter, "end_wave", None)
+            if end_wave is not None:
+                end_wave()
             for entry in active:
                 entry[1].close()
             if lock is not None:

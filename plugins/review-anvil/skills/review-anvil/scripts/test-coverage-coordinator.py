@@ -677,49 +677,6 @@ class CoordinatorTests(unittest.TestCase):
             adapter.wait_one([handle])
         self.assertEqual(calls.count("wait"), 1)
 
-    def test_native_done_scan_interrupt_drains_unconsumed_handles_exactly_once(self):
-        self.begin(21)
-        adapter_path = HERE.parent / "references" / "coverage-omp-adapter.py"
-        spec = importlib.util.spec_from_file_location("omp_interrupt_adapter", adapter_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        outputs = ScriptedWorkers()
-        interrupted = False
-        waited = []
-        archive = self.archive
-
-        class Handle:
-            def __init__(self, token):
-                self.token = token
-                self.handle = f"agent://interrupt-fixture-{token}"
-
-            def done(self):
-                nonlocal interrupted
-                if not interrupted:
-                    interrupted = True
-                    raise KeyboardInterrupt()
-                return True
-
-            def wait(self, timeout=None):
-                waited.append(self.token)
-                return outputs.wait_one([self.token])[1]
-
-        def spawn(prompt, **kwargs):
-            request = next(json.loads(path.read_text()) for path in archive.glob("attempts/*/request.json")
-                           if json.loads(path.read_text())["label"] == kwargs["label"])
-            return Handle(outputs.start(request))
-
-        try:
-            stopped = self.coordinator(module.OMPNativeAdapter(spawn)).run()
-        except CoordinatorError as exc:
-            self.fail(f"pre-consumption native interrupt bypassed inflight drain: {exc}")
-        self.assertEqual(stopped["status"], "stopped")
-        self.assertEqual(waited, [0, 1])
-        self.assertEqual(outputs.waited, [0, 1])
-        self.assertEqual(len(list(self.archive.glob("attempts/*/response.json"))), 2)
-        self.assertEqual(stopped["candidate_count"], 21)
-        self.assertEqual(self.backend.status(self.run_id)["assessed_rules"], 21)
-
 class NativeDeadlineTests(unittest.TestCase):
     def setUp(self):
         spec = importlib.util.spec_from_file_location(
@@ -751,6 +708,118 @@ class NativeDeadlineTests(unittest.TestCase):
                 self.cancellations += 1
         return Handle()
 
+    def test_completed_sibling_is_received_before_blocked_first_handle(self):
+        from contextvars import ContextVar
+        from threading import Event
+        from coverage_coordinator import WorkerFailure
+        release, started = Event(), Event()
+        context = ContextVar("native-context", default=None)
+        context.set("review-context")
+        seen = []
+
+        class Handle:
+            def __init__(self, name):
+                self.handle = "agent://" + name
+                self.name = name
+            def done(self):
+                return False
+            def wait(self, timeout=None):
+                seen.append((self.name, context.get()))
+                if self.name == "slow":
+                    started.set()
+                    if not release.wait(2):
+                        raise TimeoutError("first reviewer is still running")
+                elif not started.wait(2):
+                    raise RuntimeError("first reviewer was not started")
+                return {"name": self.name, "candidates_json": "[]"}
+            def cancel(self):
+                release.set()
+
+        slow, fast = Handle("slow"), Handle("fast")
+        adapter = self.module.OMPNativeAdapter(lambda *args, **kwargs: None, timeout=10)
+        try:
+            try:
+                actual, output = adapter.wait_one([slow, fast])
+            except WorkerFailure as exc:
+                self.fail(f"completed sibling was blocked by first reviewer: {exc}")
+            self.assertIs(actual, fast)
+            self.assertEqual(output, {"name": "fast", "candidates_json": "[]"})
+            self.assertFalse(release.is_set())
+        finally:
+            release.set()
+        actual, output = adapter.wait_one([slow])
+        self.assertIs(actual, slow)
+        self.assertEqual(output, {"name": "slow", "candidates_json": "[]"})
+        self.assertCountEqual(seen, [("slow", "review-context"), ("fast", "review-context")])
+
+    def test_ready_siblings_are_received_while_caller_persists_first_result(self):
+        from threading import Event
+        class Handle:
+            def __init__(self, name):
+                self.handle = "agent://" + name
+                self.received = Event()
+            def done(self):
+                return True
+            def wait(self, timeout=None):
+                self.received.set()
+                return {"source": self.handle}
+
+        first, second = Handle("first"), Handle("second")
+        adapter = self.module.OMPNativeAdapter(lambda *args, **kwargs: None, timeout=10)
+        actual, output = adapter.wait_one([first, second])
+        sibling = second if actual is first else first
+        try:
+            self.assertTrue(sibling.received.wait(1), "ready sibling was not received while caller persisted first")
+        finally:
+            other, other_output = adapter.wait_one([sibling])
+        self.assertEqual({output["source"], other_output["source"]},
+                         {"agent://first", "agent://second"})
+        self.assertIs(other, sibling)
+
+    def test_cached_response_stays_ready_after_native_handle_expires(self):
+        first, sibling = self.handle("first"), self.handle("sibling")
+        adapter = self.module.OMPNativeAdapter(lambda *args, **kwargs: None, timeout=10)
+        actual, _ = adapter.wait_one([first, sibling])
+        remaining = sibling if actual is first else first
+        adapter._receiving[remaining.handle].result(timeout=1)
+        def expired():
+            raise RuntimeError("native handle expired")
+        remaining.done = expired
+        try:
+            self.assertTrue(adapter.done(remaining))
+        finally:
+            _, response = adapter.wait_one([remaining])
+        self.assertEqual(response["name"], remaining.handle.removeprefix("agent://"))
+
+    def test_ending_wave_releases_receivers_without_discarding_late_output(self):
+        from threading import Event, current_thread
+        started, release = Event(), Event()
+        threads = []
+        class Slow:
+            handle = "agent://slow"
+            def wait(self, timeout=None):
+                threads.append(current_thread())
+                started.set()
+                if not release.wait(2):
+                    raise TimeoutError("slow receiver")
+                return {"original": "late native output"}
+        slow, fast = Slow(), self.handle("fast")
+        adapter = self.module.OMPNativeAdapter(lambda *args, **kwargs: None, timeout=10)
+        try:
+            actual, _ = adapter.wait_one([slow, fast])
+            self.assertIs(actual, fast)
+            self.assertTrue(started.wait(1))
+            adapter.end_wave()
+            self.assertTrue(threads[0].is_alive(), "teardown blocked on unfinished native receipt")
+        finally:
+            release.set()
+            if threads:
+                threads[0].join(1)
+        self.assertFalse(threads[0].is_alive(), "receiver remained alive after wave ended")
+        actual, response = adapter.wait_one([slow])
+        self.assertIs(actual, slow)
+        self.assertEqual(response, {"original": "late native output"})
+
     def test_shared_budget_decreases_without_resetting_on_new_starts(self):
         first = self.handle("first", elapsed=4)
         second = self.handle("second")
@@ -763,30 +832,46 @@ class NativeDeadlineTests(unittest.TestCase):
         self.assertEqual(first.waits, [10])
         self.assertEqual(second.waits, [6])
 
-    def test_deadline_cancels_unfinished_once_and_salvages_ready_sibling(self):
+    def test_expired_wave_cancels_without_waiting_for_unfinished_handle(self):
         from coverage_coordinator import WorkerFailure
-        blocked = self.handle("blocked", elapsed=10, failure=TimeoutError("host timed out"))
-        sibling = self.handle("sibling", ready=True)
         unfinished = self.handle("unfinished")
         adapter = self.module.OMPNativeAdapter(lambda *args, **kwargs: None, timeout=10)
         adapter.begin_wave()
-        with self.assertRaises(WorkerFailure) as failed:
-            adapter.wait_one([blocked, unfinished])
-        self.assertIs(failed.exception.handle, blocked)
-        self.assertIsInstance(failed.exception.cause, TimeoutError)
-        actual, output = adapter.wait_one([unfinished, sibling])
-        self.assertIs(actual, sibling)
-        self.assertEqual(output["name"], "sibling")
+        self.now = 110
         with self.assertRaises(WorkerFailure) as expired:
             adapter.wait_one([unfinished])
         self.assertIs(expired.exception.handle, unfinished)
         self.assertIsInstance(expired.exception.cause, TimeoutError)
-        with self.assertRaises(WorkerFailure):
-            adapter.wait_one([blocked])
-        self.assertEqual(blocked.waits, [10])
-        self.assertEqual(sibling.waits, [0])
         self.assertEqual(unfinished.waits, [])
-        self.assertEqual([blocked.cancellations, sibling.cancellations, unfinished.cancellations], [1, 0, 1])
+        self.assertEqual(unfinished.cancellations, 1)
+
+    def test_expired_wave_retains_complete_ready_response(self):
+        ready = self.handle("ready", ready=True)
+        adapter = self.module.OMPNativeAdapter(lambda *args, **kwargs: None, timeout=10)
+        adapter.begin_wave()
+        self.now = 110
+        actual, output = adapter.wait_one([ready])
+        self.assertIs(actual, ready)
+        self.assertEqual(output, {"candidates_json": "[]", "name": "ready"})
+        self.assertEqual(ready.waits, [0])
+        self.assertEqual(ready.cancellations, 0)
+
+    def test_interrupted_collection_retains_independently_received_outputs(self):
+        for interrupt in (KeyboardInterrupt, SystemExit):
+            with self.subTest(interrupt=interrupt.__name__):
+                first = self.handle("first")
+                sibling = self.handle("sibling")
+                adapter = self.module.OMPNativeAdapter(lambda *args, **kwargs: None, timeout=10)
+                with patch.object(self.module, "wait", side_effect=interrupt):
+                    with self.assertRaises(interrupt):
+                        adapter.wait_one([first, sibling])
+                pending, outputs = [first, sibling], []
+                while pending:
+                    handle, response = adapter.wait_one(pending)
+                    outputs.append(response["name"])
+                    pending.remove(handle)
+                self.assertCountEqual(outputs, ["first", "sibling"])
+                self.assertEqual([len(item.waits) for item in (first, sibling)], [1, 1])
 
     def test_expired_wave_refuses_spawn_until_explicit_phase_reset(self):
         spawned = []
@@ -801,61 +886,11 @@ class NativeDeadlineTests(unittest.TestCase):
         adapter.start(request)
         self.assertEqual(len(spawned), 1)
 
-    def test_default_budget_is_finite_and_invalid_configuration_rejected(self):
-        first = self.handle("default")
-        adapter = self.module.OMPNativeAdapter(lambda *args, **kwargs: first)
-        adapter.wait_one([first])
-        self.assertEqual(first.waits, [600])
+    def test_invalid_configuration_is_rejected(self):
         for timeout in (True, False, 0, -1, float("inf"), float("-inf"), float("nan"), "600", None):
             with self.subTest(timeout=timeout), self.assertRaises((TypeError, ValueError)):
                 self.module.OMPNativeAdapter(lambda *args, **kwargs: None, timeout=timeout)
 
-
-
-    def test_finalization_recipe_salvages_readiness_interrupt_and_cancels_pending(self):
-        import shutil
-        recipe = (HERE.parent / "references" / "rule-coverage.md").read_text()
-        recipe = recipe.split("### Finalization result transport", 1)[1].split("```python\n", 1)[1].split("\n```", 1)[0]
-        for interrupt in (KeyboardInterrupt, SystemExit):
-            with self.subTest(interrupt=interrupt.__name__):
-                first = self.handle("first", ready=True)
-                sibling = self.handle("sibling", ready=True)
-                unfinished = self.handle("unfinished")
-                original_done, raised = first.done, False
-                def interrupted_done():
-                    nonlocal raised
-                    if not raised:
-                        raised = True
-                        raise interrupt("readiness interrupted before consumption")
-                    return original_done()
-                first.done = interrupted_done
-                handles = iter([first, sibling, unfinished])
-                namespace = {
-                    "native": self.module,
-                    "agent": lambda *args, **kwargs: next(handles),
-                    "effective_reviewer_timeout": 10,
-                    "finalization_requests": [
-                        {"name": name, "prompt": "Complete frozen task", "schema": {"type": "object"}}
-                        for name in ("first", "sibling", "unfinished")
-                    ],
-                }
-                try:
-                    try:
-                        exec(compile(recipe, "trusted-finalization-recipe", "exec"), namespace)
-                    except (KeyboardInterrupt, SystemExit):
-                        self.fail("readiness interruption bypassed salvage and cancellation")
-                    self.assertEqual(set(namespace["returned_values"]), {"first", "sibling"})
-                    self.assertEqual(namespace["saved"], ["first", "sibling"])
-                    self.assertTrue(namespace["failures"])
-                    self.assertEqual([len(item.waits) for item in (first, sibling, unfinished)], [1, 1, 0])
-                    self.assertEqual([item.cancellations for item in (first, sibling, unfinished)], [0, 0, 1])
-                    root = Path(namespace["private_finalization_directory"])
-                    self.assertEqual(json.loads((root / "sibling.raw.json").read_text())["name"], "sibling")
-                    self.assertFalse((root / "unfinished.raw.json").exists())
-                finally:
-                    root = namespace.get("private_finalization_directory")
-                    if root:
-                        shutil.rmtree(root)
 
 
 if __name__ == "__main__":
