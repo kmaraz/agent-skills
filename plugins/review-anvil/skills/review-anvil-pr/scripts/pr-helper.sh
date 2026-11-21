@@ -2121,6 +2121,10 @@ if packet is not None:
             earlier = [old for old in earlier if old.get("id") not in {item["id"], finding_id}]
             earlier.append(row)
     packet["findings"] = kept
+    for item in earlier:
+        # The frozen report uses text; provisional rows can carry a title.
+        if "text" not in item:
+            item["text"] = item.pop("title")
     packet["earlier_feedback"] = earlier
     identified = {
         item["id"]

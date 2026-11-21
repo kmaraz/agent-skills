@@ -1979,6 +1979,10 @@ JSON
     GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
       "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/classified.json" >"$tmp/again.json"
     jq -e --slurpfile original "$tmp/classified.json" '. == $original[0]' "$tmp/again.json" >/dev/null
+    jq '.earlier_feedback[0] |= (.title = .text | del(.text))' "$tmp/classified.json" >"$tmp/provisional-history.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/provisional-history.json" >"$tmp/normalized-history.json"
+    jq -e --slurpfile original "$tmp/classified.json" '. == $original[0]' "$tmp/normalized-history.json" >/dev/null
     jq 'del(.findings[0].title) | .findings[0].source_context = "PRIVATE-EVIDENCE-NOT-FOR-PUBLICATION"' "$packet" >"$tmp/private.json"
     GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
       "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/private.json" >"$tmp/public.json"
