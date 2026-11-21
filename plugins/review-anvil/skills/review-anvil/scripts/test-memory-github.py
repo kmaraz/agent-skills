@@ -82,10 +82,16 @@ class CollectorTests(unittest.TestCase):
             result = self.api(host, endpoint, paginate)
             if endpoint == "repos/acme/widgets/pulls/7":
                 result["changed_files"] = 3001
+            if endpoint.startswith("repos/acme/widgets/pulls/7/files"):
+                return result * 3000
             return result
         with patch.object(memory_github, "github_api", side_effect=incomplete):
             with self.assertRaises(memory_github.GitHubError):
                 memory_github.collect_feedback("acme/widgets#7")
+            packet = memory_github.collect_feedback("acme/widgets#7", allow_discussion_only=True)
+        self.assertIsNone(packet["pr"]["files"])
+        self.assertIn("issue_comment:10", {source["id"] for source in packet["sources"]})
+        self.assertIn("review_comment:31", {source["id"] for source in packet["sources"]})
 
     def test_unsafe_locators_fail_without_executing_gh(self):
         invalid = [

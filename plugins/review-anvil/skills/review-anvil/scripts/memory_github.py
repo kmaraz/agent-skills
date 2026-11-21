@@ -251,7 +251,7 @@ def resolve_pull_request(locator, cwd=None):
     return repository, number
 
 
-def collect_feedback(locator, cwd=None):
+def collect_feedback(locator, cwd=None, *, allow_discussion_only=False):
     """Collect all current visible PR feedback, rejecting incomplete revisions."""
     repository, number = resolve_pull_request(locator, cwd=cwd)
     host, name = repository["host"], repository["name"]
@@ -260,15 +260,19 @@ def collect_feedback(locator, cwd=None):
     pr = github_api(host, endpoint)
     head_sha, base_sha = _revision(pr, number)
     files = _array(github_api(host, f"{endpoint}/files?per_page=100", paginate=True), "PR files")
-    if "changed_files" in pr and pr["changed_files"] != len(files):
-        raise GitHubError("GitHub did not return all changed files (REST has a 3000-file limit)")
-    paths = []
-    for item in files:
-        for key in ("filename", "previous_filename"):
-            if key == "filename" or key in item:
-                path = _path(item.get(key))
-                if path not in paths:
-                    paths.append(path)
+    count = pr.get("changed_files", len(files))
+    paths = None
+    if count != len(files):
+        if not (allow_discussion_only and type(count) is int and count >= 0):
+            raise GitHubError("GitHub did not return all changed files (REST has a 3000-file limit)")
+    else:
+        paths = []
+        for item in files:
+            for key in ("filename", "previous_filename"):
+                if key == "filename" or key in item:
+                    path = _path(item.get(key))
+                    if path not in paths:
+                        paths.append(path)
     comments = _array(github_api(host, f"{prefix}/issues/{number}/comments?per_page=100", paginate=True), "issue comments")
     reviews = _array(github_api(host, f"{endpoint}/reviews?per_page=100", paginate=True), "reviews")
     inline = _array(github_api(host, f"{endpoint}/comments?per_page=100", paginate=True), "review comments")

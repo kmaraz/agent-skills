@@ -293,7 +293,8 @@ class SeedRuns(MemoryStore):
         pr = packet['pr']
         sources = {source['id']: source for source in packet['sources']}
         expected = {'head_sha': pr['head_sha'], 'base_sha': pr['base_sha'],
-                    'files': _paths(pr['files'], glob=False), 'source_ids': sorted(sources)}
+                    'files': None if pr['files'] is None else _paths(pr['files'], glob=False),
+                    'source_ids': sorted(sources)}
         if state['prs'].get(str(pr['number'])) != expected:
             return False
         if any(state['sources'].get(sid) != {'source': source, 'pr_number': pr['number'], 'version': _digest(source)}
@@ -337,7 +338,7 @@ class SeedRuns(MemoryStore):
             if 'pull_request' in issue:
                 raise GitHubError('Pull request is unavailable but its issue still exists; resume after access is restored')
             return None, 'not-a-pull-request'
-        return collect_feedback(f'https://{self.repository}/pull/{number}'), None
+        return collect_feedback(f'https://{self.repository}/pull/{number}', allow_discussion_only=True), None
 
     def next(self, run_id, output):
         output = Path(os.path.abspath(output))

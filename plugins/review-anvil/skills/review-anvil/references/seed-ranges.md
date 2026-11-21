@@ -47,6 +47,8 @@ A `ready` result writes one STANDARD signed feedback preparation to that path an
 
 Confirmed ordinary issues and missing numbers are recorded as explicit skips, not learned PRs. Both pull/issue 404 responses require successful repository-access revalidation before a missing-number skip. Authentication failures, rate limits, network errors and incomplete collection stop at the current cursor. Report the failure and retained progress. Do not silently skip, automatically retry in a busy loop, or mark a failed PR successful.
 
+When the GitHub REST file list disagrees with the PR's reported changed-file count, seed collects the discussion without a file inventory. The signed preparation uses `pr.files: null` to distinguish unknown scope from an empty diff. Use paths evidenced by the discussion; leave claims with unclear scope as context. This fallback does not apply to ordinary review.
+
 ## 3. Learn and persist before advancing
 
 For the single prepared PR, follow `local-memory.md`: read complete original human review proposals, author replies, objections, exceptions and their accepted meaning; consider relevant existing knowledge, write a real JSON array of supported observations, and apply it through the trusted helper. PR descriptions/code and bot/generated reviews (even under a human account) are context, not independent reusable claims. Missing/insufficient human discussion correctly yields `[]`, not a criterion inferred from the change:

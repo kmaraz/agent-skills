@@ -360,7 +360,7 @@ class MemoryStore:
                 raise MemoryError("Corrupt PR source checkpoint")
             self._revision(pr["head_sha"])
             self._revision(pr["base_sha"])
-            if _paths(pr["files"], glob=False) != pr["files"]:
+            if pr["files"] is not None and _paths(pr["files"], glob=False) != pr["files"]:
                 raise MemoryError("Corrupt PR file checkpoint")
             for source_id in pr["source_ids"]:
                 _source_id(source_id, int(number))
@@ -499,7 +499,8 @@ class MemoryStore:
         _text(pr["body"], "PR body", 1000000, empty=True)
         if _text(pr["url"], "PR URL", 3000).lower() != f"https://{self.repository}/pull/{number}":
             raise MemoryError("PR URL does not match repository identity")
-        _paths(pr["files"], glob=False)
+        if pr["files"] is not None:
+            _paths(pr["files"], glob=False)
         if not isinstance(packet["sources"], list):
             raise MemoryError("Feedback sources must be a complete list")
         seen = set()
@@ -613,7 +614,8 @@ class MemoryStore:
                 del state["sources"][sid]
             for sid, source in incoming.items():
                 state["sources"][sid] = {"source": source, "pr_number": number, "version": _digest(source)}
-            state["prs"][str(number)] = {"head_sha": packet["pr"]["head_sha"], "base_sha": packet["pr"]["base_sha"], "source_ids": sorted(incoming), "files": _paths(packet["pr"]["files"], glob=False)}
+            files = packet["pr"]["files"]
+            state["prs"][str(number)] = {"head_sha": packet["pr"]["head_sha"], "base_sha": packet["pr"]["base_sha"], "source_ids": sorted(incoming), "files": None if files is None else _paths(files, glob=False)}
             state["repository_id"] = packet["repository"]["id"]
             added, updated, unchanged = [], [], []
             rejected = self._rejections(state)
