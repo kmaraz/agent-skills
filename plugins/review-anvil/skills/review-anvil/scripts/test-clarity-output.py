@@ -740,6 +740,24 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         )
         return canonical, rendered
 
+    def test_human_report_collapses_single_line_range_without_moving_anchor(self) -> None:
+        canonical, source = self.human_source_bundle()
+        finding = next(item for item in canonical["findings"] if item["id"] == "RAV-RUN2-R1-F005")
+        finding["report_start_line"] = finding["report_line"]
+        row = source["report_items"][1]
+        old = row["rendered_body"]
+        new = old.replace(":300-302`", ":302`").replace("start_line=300", "start_line=302")
+        row["rendered_body"] = new
+        source["report_markdown"] = source["report_markdown"].replace(old, new)
+        result = self.validate(source, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        row["rendered_body"] = new.replace(":302`", ":303`")
+        source["report_markdown"] = source["report_markdown"].replace(new, row["rendered_body"])
+        result = self.validate(source, canonical)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("visible report location changed", result.stderr)
+
     def renderer_operation(self, mode: str, canonical: dict, bundle: dict) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             paths = [Path(directory) / name for name in ("canonical.json", "bundle.json")]

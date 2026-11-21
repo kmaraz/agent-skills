@@ -176,7 +176,7 @@ def report_location_text(finding: dict[str, Any]) -> str:
         return "—"
     start = finding.get("report_start_line")
     line_range = (
-        f"{start}-{line}" if isinstance(start, int) else str(line)
+        f"{start}-{line}" if isinstance(start, int) and start != line else str(line)
     )
     return f"`{escape_table_cell(path)}:{line_range}`"
 
