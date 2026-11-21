@@ -1,5 +1,6 @@
 """Private, repository-scoped advisory review memory. No reviewed input is executable."""
 
+import base64
 import copy
 import fcntl
 import fnmatch
@@ -11,6 +12,7 @@ import re
 import stat
 import unicodedata
 import uuid
+import zlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -25,6 +27,7 @@ SCHEMA_VERSION = 1
 MAX_SNAPSHOT_OBSERVATIONS = 50
 MAX_SNAPSHOT_BYTES = 65536
 MAX_FILE_BYTES = 64 * 1024 * 1024
+MAX_SOURCE_BYTES = 256 * 1024 * 1024
 KINDS = {"observation", "decision", "proposed-rule"}
 STATUSES = {"active", "invalidated", "disputed"}
 _MISSING = object()
@@ -239,6 +242,43 @@ class MemoryStore:
         except (ValueError, UnicodeError, RecursionError) as exc:
             raise MemoryError(f"Corrupt memory file: {name}") from exc
 
+    def _read_state(self, directory, missing=False):
+        state = self._read_json(directory, "state.json", missing)
+        if not isinstance(state, dict) or "source_archive" not in state:
+            return state
+        pointer = state.pop("source_archive")
+        if not isinstance(pointer, dict) or set(pointer) != {"slot", "digest"} or pointer["slot"] not in ("a", "b") or "sources" in state:
+            raise MemoryError("Invalid memory source archive pointer")
+        encoded = self._read_json(directory, f"sources-{pointer['slot']}.json")
+        if not isinstance(encoded, str):
+            raise MemoryError("Invalid memory source archive")
+        try:
+            inflater = zlib.decompressobj()
+            raw = inflater.decompress(base64.b64decode(encoded, validate=True), MAX_SOURCE_BYTES + 1)
+            if len(raw) > MAX_SOURCE_BYTES or not inflater.eof or inflater.unused_data:
+                raise ValueError("Invalid source archive size or stream")
+            if hashlib.sha256(raw).hexdigest() != pointer["digest"]:
+                raise ValueError("Source archive digest mismatch")
+            state["sources"] = json.loads(raw)
+        except (ValueError, zlib.error, RecursionError) as exc:
+            raise MemoryError("Corrupt memory source archive") from exc
+        return state
+
+    def _write_state(self, directory, state):
+        # Stage into the inactive slot under the lock, then publish the pointer.
+        current = self._read_json(directory, "state.json", missing=True)
+        pointer = current.get("source_archive", {}) if isinstance(current, dict) else {}
+        raw = _json(state["sources"]).encode("utf-8")
+        if len(raw) > MAX_SOURCE_BYTES:
+            raise MemoryError("Memory source archive exceeds the supported size")
+        digest = hashlib.sha256(raw).hexdigest()
+        if pointer.get("digest") != digest:
+            slot = "b" if pointer.get("slot") == "a" else "a"
+            self._write_json(directory, f"sources-{slot}.json", base64.b64encode(zlib.compress(raw, level=3)).decode("ascii"))
+            pointer = {"slot": slot, "digest": digest}
+        metadata = {key: value for key, value in state.items() if key != "sources"}
+        self._write_json(directory, "state.json", {**metadata, "source_archive": pointer})
+
     def _write_json(self, directory, name, value):
         self._regular(directory, name, missing=True)
         content = (_json(value) + "\n").encode("utf-8")
@@ -363,7 +403,7 @@ class MemoryStore:
 
     def _state(self, directory):
         self._secret(directory)
-        state = self._read_json(directory, "state.json")
+        state = self._read_state(directory)
         if state is None:
             raise MemoryError("Memory is not initialized")
         try:
@@ -375,11 +415,11 @@ class MemoryStore:
         if repository_id is not None:
             _integer(repository_id, "repository ID")
         with self._locked(create=True, exclusive=True) as directory:
-            state = self._read_json(directory, "state.json", missing=True)
+            state = self._read_state(directory, missing=True)
             if state is _MISSING:
                 self._secret(directory, create=True)
                 state = {"schema_version": SCHEMA_VERSION, "repository": self.repository, "repository_id": repository_id, "generation": 0, "sources": {}, "prs": {}, "observations": {}, "audit": []}
-                self._write_json(directory, "state.json", state)
+                self._write_state(directory, state)
             else:
                 self._secret(directory)
                 try:
@@ -393,7 +433,7 @@ class MemoryStore:
                         state["repository_id"] = repository_id
                         state["generation"] += 1
                         state["audit"].append({"action": "bind-repository", "repository_id": repository_id, "at": _now()})
-                        self._write_json(directory, "state.json", state)
+                        self._write_state(directory, state)
             return copy.deepcopy(state)
 
     def inspect(self):
@@ -620,7 +660,7 @@ class MemoryStore:
             state["generation"] += 1
             state["audit"].append({"action": "checkpoint", "pr": number, "head_sha": packet["pr"]["head_sha"], "changed_sources": [source["id"] for source in expected["changed_sources"]], "deleted_sources": expected["deleted_sources"], "at": _now()})
             self._validate_state(state)
-            self._write_json(directory, "state.json", state)
+            self._write_state(directory, state)
             return self._result(state, added, updated, expected["invalidated"], sorted(set(unchanged)))
 
     def _target(self, target, files, revision, state=None):
@@ -707,7 +747,7 @@ class MemoryStore:
             record["status"] = "invalidated"
             self._event(state, record, "invalidate", reason, semantic_keys=self._semantic_keys(record))
             state["generation"] += 1
-            self._write_json(directory, "state.json", state)
+            self._write_state(directory, state)
             return self._result(state, invalidated=[id])
 
     def correct(self, id, claim, rationale, paths=None):
@@ -737,7 +777,7 @@ class MemoryStore:
                 record["fingerprints"].append(fingerprint)
             self._event(state, record, "correct", "Explicit user correction; advisory only", previous=previous, semantic_keys=semantic_keys, restored_semantic=key)
             state["generation"] += 1
-            self._write_json(directory, "state.json", state)
+            self._write_state(directory, state)
             return self._result(state, updated=[id])
 
     def _snapshot_ids(self, snapshot):

@@ -23,6 +23,32 @@ class StoreTests(unittest.TestCase):
         self.store.init()
     def learn(self):
         self.store.apply(self.store.prepare(packet()), [observation()])
+
+    def test_failed_pointer_publication_preserves_previous_sources(self):
+        self.learn()
+        before = self.store.inspect()
+        path = self.store.directory / "state.json"
+        pointer = json.loads(path.read_text())["source_archive"]
+        other_slot = "b" if pointer["slot"] == "a" else "a"
+        other = self.store.directory / f"sources-{other_slot}.json"
+        old_bytes = other.read_bytes() if other.exists() else None
+        prepared = self.store.prepare(packet(body="Revised discussion"))
+        write_json = self.store._write_json
+
+        def interrupt(directory, name, value):
+            if name == "state.json":
+                self.assertNotEqual(other.read_bytes(), old_bytes)
+                raise OSError("interrupted before pointer publication")
+            return write_json(directory, name, value)
+
+        with patch.object(self.store, "_write_json", side_effect=interrupt):
+            with self.assertRaisesRegex(MemoryError, "interrupted before pointer publication"):
+                self.store.apply(prepared, [])
+        self.assertEqual(self.store.inspect(), before)
+        self.store.apply(prepared, [])
+        self.assertEqual(self.store.inspect()["sources"]["issue_comment:10"]["source"]["body"],
+                         "Revised discussion")
+
     def test_cross_pr_snapshot_scopes_observations(self):
         self.learn()
         snap = self.store.snapshot(["src/other.ts"], "c" * 40)
