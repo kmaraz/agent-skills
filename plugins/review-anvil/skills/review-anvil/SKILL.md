@@ -403,6 +403,7 @@ Plausible-but-wrong findings are the dominant failure mode of LLM review, and bo
   nor its severity. Cite the local ID, source URL and frozen snapshot digest,
   never a fictional checked-in policy line. Explicit conflicting policy wins.
 - **Scope/artifact filter next (orchestrator judgment).** Drop or move to out-of-scope follow-ups before reproduction when the claim is about archived design notes, changelogs, old migration examples, generated fixtures, vendored files, or historical docs that are not the review's live product surface. Do not spend verifier budget proving historical provenance is stale. Conversely, live docs that users rely on — README usage, CLI help, API docs, config reference, plugin metadata, or marketplace copy — are product surface and may become reproduction candidates when they drift from code/runtime behavior.
+- **Support for the requested behavior.** Before recommending a substantial change (such as new persistence, a redesign, or a broader compatibility guarantee), separate evidence that the scenario can fail from evidence that it must work under the stated conditions. In the existing private evidence context, cite the exact support boundary from current policy, docs, acceptance criteria, a settled human decision, or verified baseline behavior that the change would regress. A platform capability, an enabled control, or a reproducible edge case alone does not establish that boundary. For a supported scenario, choose the smallest effective fix. Apply this check even when adversarial review is disabled.
 - **Assign provenance IDs.** Assign IDs after semantic deduplication, prior-feedback classification, and scope filtering, and before reproduction or adversarial dispatch. Use this output recipe:
 
   ```text
@@ -733,6 +734,12 @@ relationship. Do not promote incidental fixture values, proof citations,
 process instructions, or requested-work predicates into diagnostic locks.
 Retain those in the existing evidence/source context and requested-work fields.
 
+Apply the support check again to the final requested work before freezing
+`request_mode` and the work predicates. Omit any unsupported expansion, including
+tests or docs that would impose the same new guarantee. Keep independently
+supported defects and their required fixes. If only an independently useful
+smaller improvement remains, keep it as a suggestion with a concrete benefit;
+otherwise retain the unsupported proposal only in the private disposition.
 Freeze `request_mode: required|suggested` for every new active finding from its
 source obligation. Use the same mode for report and inline work. Severity is
 priority, not permission to weaken a required fix or strengthen a preference.
