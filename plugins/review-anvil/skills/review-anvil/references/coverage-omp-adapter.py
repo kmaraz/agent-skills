@@ -7,7 +7,8 @@ Every persistent Eval invocation must use timeout:0. Starts remain on Eval's
 calling thread. Independent receives copy its context, as native handle awaiting
 does, so one slow handle cannot let completed siblings expire.
 """
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+# AgentHandle.wait() resolves OMP's global `wait` in Python Eval.
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_for_futures
 from contextvars import copy_context
 from math import isfinite
 from time import monotonic
@@ -85,8 +86,8 @@ class OMPNativeAdapter:
             if identity not in self._receiving:
                 self._receiving[identity] = self._executor.submit(
                     copy_context().run, self._receive, handle)
-        wait([self._receiving[self.identity(handle)] for handle in handles],
-             return_when=FIRST_COMPLETED)
+        wait_for_futures([self._receiving[self.identity(handle)] for handle in handles],
+                         return_when=FIRST_COMPLETED)
         handle = next(handle for handle in handles
                       if self._receiving[self.identity(handle)].done())
         identity = self.identity(handle)

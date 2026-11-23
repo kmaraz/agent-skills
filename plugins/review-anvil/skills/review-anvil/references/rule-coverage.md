@@ -81,7 +81,13 @@ Evidence-index version 2 retains `rules` and `packet_paths`, identifies `assessm
 
 ## Native OMP invocation
 
-Read `xd://eval/agents` before native use. Persistent coordinator/recovery Eval cells use `timeout: 0`; print-mode OMP uses `--wait-async`. Resolve the trusted installed engine first:
+Read `xd://eval/agents` before native use. Persistent coordinator/recovery Eval
+cells use `timeout: 0`; print-mode OMP uses `--wait-async`.
+
+Resolve the trusted installed engine and load the adapter as a separate module
+via `spec.loader.exec_module` for every native stage, including runs with memory
+off. Do not `exec` its source into Eval globals; imported names can overwrite
+OMP runtime helpers.
 
 ```python
 import importlib.util
