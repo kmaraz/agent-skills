@@ -806,6 +806,7 @@ def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[st
         elif values or label == "Review context":
             section = f"<details>\n<summary>{label}</summary>\n\n" + "\n\n".join(missing) + "\n\n</details>"
             report = report.replace(REVIEW_FOOTER, section + "\n\n" + REVIEW_FOOTER, 1)
+    report = assemble_table_headers(report)
     source["report_markdown"] = report
     validate(canonical, source)
     return source
@@ -851,6 +852,21 @@ def renderer_input(canonical: dict[str, Any], source: dict[str, Any]) -> dict[st
     return projected
 
 
+def assemble_table_headers(report: str) -> str:
+    headers = {"Issues and fixes": ISSUES_TABLE_HEADER,
+               "Optional suggestions": SUGGESTIONS_TABLE_HEADER}
+
+    def replace_header(match: re.Match[str]) -> str:
+        header = headers.get(match.group(1))
+        first, newline, rest = match.group(2).partition("\n")
+        if header is None or not first.startswith("|") or not rest.startswith(TABLE_SEPARATOR + "\n"):
+            return match.group(0)
+        start = match.start(2) - match.start()
+        return match.group(0)[:start] + header + newline + rest + match.group(0)[match.end(2) - match.start():]
+
+    return COMPACT_DETAILS_RE.sub(replace_header, report)
+
+
 def assemble_rendered(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
     """Compose frozen sections around editable prose, then validate the full result."""
     if canonical.get("report_style") != "human-summary":
@@ -873,7 +889,7 @@ def assemble_rendered(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[
             body = "\n\n".join(dict.fromkeys(values))
             frozen_sections.append(f"<details>\n<summary>{label}</summary>\n\n{body}\n\n</details>")
     assembled = dict(draft)
-    assembled["report_markdown"] = report.replace(
+    assembled["report_markdown"] = assemble_table_headers(report).replace(
         REVIEW_FOOTER, "\n\n".join(frozen_sections) + "\n\n" + REVIEW_FOOTER, 1,
     )
     validate(canonical, assembled)
