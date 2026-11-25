@@ -37,6 +37,10 @@ Before assignment bind complete common context: verified canonical `repository`;
 
 During the existing preparation, use trusted `memory_github.read_pull_target` and
 `review_target.capture_pull_diff(..., cache_root=<owner-only-private-directory>)`.
+Run this preparation in an OMP Eval cell with `timeout: 0`; the helper's Git
+and GitHub request limits and the runner's whole-job limit still apply.
+An optional `object_repo` is used only if it contains both pinned commits
+(merge base and head); otherwise capture uses the same immutable GitHub IDs.
 Retain the complete snapshot, use its exact `diff` and frozen source identities,
 and put it in common context as `diff_snapshot`. This helper reads immutable
 objects without checkout/fetch; remote trees/blobs are verified and incomplete

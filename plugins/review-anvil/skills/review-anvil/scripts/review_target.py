@@ -246,6 +246,12 @@ def capture_pull_diff(target, *, object_repo=None, cache_root):
     if not isinstance(comparison, dict) or comparison.get('base_commit', {}).get('sha') != base:
         raise TargetError('Foreign or incomplete comparison ancestor')
     ancestor = _oid(comparison.get('merge_base_commit', {}).get('sha'))
+    if object_repo is not None:
+        try:
+            _git(object_repo, 'cat-file', '-e', ancestor + '^{commit}')
+            _git(object_repo, 'cat-file', '-e', head + '^{commit}')
+        except TargetError:
+            object_repo = None
     root = Path(cache_root)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077:
