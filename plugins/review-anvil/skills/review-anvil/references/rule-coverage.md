@@ -342,6 +342,10 @@ Before every report-path delivery, write a bounded owner-only sibling
 - `local_delivery`: actual artifact-delivery/validation state and report path.
 - `overall_review`: actual `incomplete`, `failed` or `completed` state, separate
   from local delivery.
+- `diff_checkpoint_error` when an observation returns `github_error`: copy
+  that object unchanged and add `phase` identifying the checkpoint (for example
+  `final_diff_check`). Keep this local; do not include command arguments, raw
+  stderr, or headers. An unknown diff still blocks publication without retry.
 - `coverage`: helper-issued `run_id`, authenticated `assessment_strategy`,
   repository and frozen PR/base/head identity; actual status, determinate,
   total, remaining, attempted/unvisited/unassessed and verdict counts,

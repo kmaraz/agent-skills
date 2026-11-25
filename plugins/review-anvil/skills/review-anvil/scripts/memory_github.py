@@ -17,9 +17,11 @@ from urllib.parse import urlsplit
 class GitHubError(Exception):
     """A locator or GitHub response cannot produce a complete feedback packet."""
 
-    def __init__(self, message, http_status=None):
+    def __init__(self, message, http_status=None, *, exit_code=None, category="unknown"):
         super().__init__(message)
         self.http_status = http_status
+        self.exit_code = exit_code
+        self.category = category
 
 
 def _host(value):
@@ -81,19 +83,23 @@ def _run_json(command, cwd=None):
             command, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise GitHubError(f"GitHub CLI could not complete the request: {error}") from error
+    except subprocess.TimeoutExpired as error:
+        raise GitHubError("GitHub CLI request timed out", category="timeout") from error
+    except OSError as error:
+        raise GitHubError("GitHub CLI could not start", category="local_execution") from error
     if result.returncode:
         # CLI stderr can contain private URLs; do not echo it into review output.
         diagnostic = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr
         statuses = set(re.findall(r"(?m)^gh: [^\r\n]* \(HTTP ([1-5][0-9]{2})\)(?:[ \t]*$)", diagnostic or ""))
         statuses.update(re.findall(r"(?m)^gh: HTTP ([1-5][0-9]{2})(?::|[ \t]|$)", diagnostic or ""))
         status = int(next(iter(statuses))) if len(statuses) == 1 else None
-        raise GitHubError(f"GitHub CLI request failed (exit {result.returncode})", http_status=status)
+        category = {401: "authentication", 429: "rate_limit"}.get(status, "unknown")
+        raise GitHubError(f"GitHub CLI request failed (exit {result.returncode})",
+                          http_status=status, exit_code=result.returncode, category=category)
     try:
         return json.loads(result.stdout)
     except (ValueError, UnicodeError) as error:
-        raise GitHubError("GitHub CLI returned invalid JSON") from error
+        raise GitHubError("GitHub CLI returned invalid JSON", category="invalid_response") from error
 
 
 def github_api(host, endpoint, paginate=False):
