@@ -298,6 +298,13 @@ test_process_inline() {
     "$HELPER" process-inline "$tmp/left.json" >/dev/null
     jq -e '.[0].body | contains("without losing the core point") and (contains("```suggestion") | not)' \
       "$tmp/left.json" >/dev/null
+
+    jq '.[0].body += "\n\n```suggestion\nunsafe\n```"' "$tmp/left.json" >"$tmp/raw-left.json"
+    if "$HELPER" process-inline "$tmp/raw-left.json" >/dev/null 2>"$tmp/raw-left.err"; then
+        echo "Expected raw suggestion fence on LEFT to be rejected" >&2
+        return 1
+    fi
+    grep -q 'inline comment cannot contain an executable suggestion block' "$tmp/raw-left.err"
 }
 
 test_process_inline_infers_id_prefixed_severity() {

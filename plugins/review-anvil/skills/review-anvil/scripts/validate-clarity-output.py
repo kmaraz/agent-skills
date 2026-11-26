@@ -636,11 +636,10 @@ def validate_inline(
         actual_subject = comment_subject(item, finding_id)
         if subject != actual_subject or subject == "file" and item.get("subject_type") != "file":
             raise InvalidBundle(f"{finding_id} inline subject_type changed")
-        if subject == "file":
-            if any(key in item for key in FILE_LINE_KEYS):
-                raise InvalidBundle(f"{finding_id} file comment has line fields")
-            if re.search(r"(?im)^[ \t]*(?:`{3,}|~{3,})suggestion(?:[ \t]|\r?$)", item["body"]):
-                raise InvalidBundle(f"{finding_id} file comment has an executable suggestion")
+        if subject == "file" and any(key in item for key in FILE_LINE_KEYS):
+            raise InvalidBundle(f"{finding_id} file comment has line fields")
+        if re.search(r"(?im)^\s*(?:`{3,}|~{3,})suggestion\b", item["body"]):
+            raise InvalidBundle(f"{finding_id} inline comment has an executable suggestion in its body")
         for key in ANCHOR_KEYS:
             if item.get(key) != finding.get(key):
                 raise InvalidBundle(f"{finding_id} inline {key} changed")
