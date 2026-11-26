@@ -451,14 +451,15 @@ def append_suggestion(body, item):
         suggestion = item.get("suggested_change")
     if suggestion is None:
         suggestion = item.get("suggestedChange")
-    if not enable_suggestions or suggestion is None:
+    if not enable_suggestions or not isinstance(suggestion, str):
         return body
-    suggestion = str(suggestion).strip("\n")
+    suggestion = suggestion.strip("\n")
     if not suggestion or "```" in suggestion or "```suggestion" in body:
         return body
     # GitHub suggestions apply to the commented line/range. Only append when
     # the comment has a concrete new-side anchor that GitHub can apply.
-    if not (item.get("line") or item.get("start_line") or item.get("position")):
+    if (not item.get("line") or item.get("side") != "RIGHT"
+            or ("start_line" in item and item.get("start_side") != "RIGHT")):
         return body
     block = "```suggestion\n" + suggestion + "\n```"
     return append_before_finding_metadata(body, block)

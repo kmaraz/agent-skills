@@ -292,6 +292,12 @@ test_process_inline() {
     jq -e '.[0].body | contains("preserve it without losing")' "$inline" >/dev/null
     jq -e '.[0].body | contains("without...") | not' "$inline" >/dev/null
     jq -e 'map(select(.path == "src/db.ts")) | length == 1' "$inline" >/dev/null
+
+    make_inline "$inline"
+    jq '.[0].side = "LEFT"' "$inline" >"$tmp/left.json"
+    "$HELPER" process-inline "$tmp/left.json" >/dev/null
+    jq -e '.[0].body | contains("without losing the core point") and (contains("```suggestion") | not)' \
+      "$tmp/left.json" >/dev/null
 }
 
 test_process_inline_infers_id_prefixed_severity() {

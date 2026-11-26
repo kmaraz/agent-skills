@@ -403,6 +403,7 @@ Plausible-but-wrong findings are the dominant failure mode of LLM review, and bo
   nor its severity. Cite the local ID, source URL and frozen snapshot digest,
   never a fictional checked-in policy line. Explicit conflicting policy wins.
 - **Scope/artifact filter next (orchestrator judgment).** Drop or move to out-of-scope follow-ups before reproduction when the claim is about archived design notes, changelogs, old migration examples, generated fixtures, vendored files, or historical docs that are not the review's live product surface. Do not spend verifier budget proving historical provenance is stale. Conversely, live docs that users rely on — README usage, CLI help, API docs, config reference, plugin metadata, or marketplace copy — are product surface and may become reproduction candidates when they drift from code/runtime behavior.
+- **Draft applyable code suggestions during synthesis.** For each retained required fix or optional suggestion with a small, self-contained implementation, try to write the exact replacement for one contiguous `RIGHT` diff range. Read the pinned head lines and relevant callers; the replacement must cover the whole requested change, preserve indentation and unrelated lines, and be useful without edits elsewhere. Keep it with the existing finding for the normal checks and confirm it again against the final wording and anchor before freezing `suggestion`. If the code or range cannot be independently verified, keep the text comment and omit the replacement. Never change request mode, severity, or approval merely because replacement code is available. Do not dispatch a separate suggestion-generation pass or apply the code.
 - **Assign provenance IDs.** Assign IDs after semantic deduplication, prior-feedback classification, and scope filtering, and before reproduction or adversarial dispatch. Use this output recipe:
 
   ```text
@@ -582,7 +583,7 @@ Default policy:
   feedback but no suggestion blocks, no high-risk fix plans, and `approve:
   never` / `REVIEW_ANVIL_NO_APPROVE=1`.
 - Use `targeted` when candidate output includes any `medium`+ inline comment,
-  any GitHub suggestion block, any `critical`/`high` actionable/deferred item,
+  any candidate GitHub suggestion (including an exact replacement drafted during synthesis), any `critical`/`high` actionable/deferred item,
   any would-apply plan that removes code, adds dependencies, changes behavior
   non-locally, touches auth/security/data/schema/migrations/concurrency/config,
   or looks like abstraction/tech-debt risk, or when open/resolved prior PR
