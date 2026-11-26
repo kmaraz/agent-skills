@@ -284,7 +284,9 @@ Preserve knowledge gaps in diagnostics and deliver the ordinary report under
 the original local/posting policy without waiting for user intervention.
 Use the engine's actual-diff observer/cancellation branch: a verified changed
 diff immediately supersedes current work and permits one fresh ordinary run.
-Metadata-only drift, unknown comparison and any failure never authorize retries.
+Metadata-only drift, unknown comparison and failures do not authorize an
+in-session restart. A runner can separately requeue preparation once when the
+trusted coordinator confirms target movement before any reviewer attempt.
 
 For all-mode delivery, retain a bounded owner-only `<REPORT_PATH>.delivery.json`
 following the engine reference's diagnostic contract: separate local-delivery
@@ -297,6 +299,10 @@ existing `blocked-signature-verification.json` diagnostic. Only actual successfu
 finish/check permits verified knowledge coverage. These diagnostics neither
 authorize nor block ordinary publication; record the ordinary review/publication
 outcome separately from knowledge completeness.
+Copy `interruption_reason: target_unverifiable_before_dispatch` from the trusted
+coordinator summary into the delivery manifest when present. Never derive it
+from blocker prose or missing reviewer output. Keep the actual ordinary review
+and publication states unchanged.
 
 
 When an authenticated memory snapshot is available, after the engine finishes

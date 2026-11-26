@@ -615,6 +615,31 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         self.assertEqual(summary["status"], "stopped")
         self.assertEqual(adapter.requests, [])
         self.assertEqual(summary["target_observation"]["relation"], "unknown")
+        self.assertNotIn("interruption_reason", summary)
+
+    def test_pre_dispatch_target_movement_is_classified_for_preparation_retry(self):
+        self.begin(6)
+        adapter = NativeFixture()
+        summary = CriteriaCoordinator(
+            self.backend, adapter, self.run_id, self.context,
+            observe_target=lambda: {"relation": "unknown", "github_error": {
+                "category": "target_moved", "changed_fields": ["body"]}},
+        ).run(self.reviewers)
+        self.assertEqual(adapter.requests, [])
+        self.assertEqual(summary.get("interruption_reason"), "target_unverifiable_before_dispatch")
+
+    def test_target_movement_after_dispatch_is_not_retryable(self):
+        self.begin(6)
+        adapter = NativeFixture()
+        observations = iter([{"relation": "same"}, {"relation": "same"}, {
+            "relation": "unknown", "github_error": {"category": "target_moved"},
+        }])
+        summary = CriteriaCoordinator(
+            self.backend, adapter, self.run_id, self.context, workers=2,
+            observe_target=lambda: next(observations),
+        ).run(self.reviewers)
+        self.assertTrue(adapter.requests)
+        self.assertNotIn("interruption_reason", summary)
 
     def test_nonfinite_candidate_json_does_not_abandon_original_queue(self):
         self.begin(6)

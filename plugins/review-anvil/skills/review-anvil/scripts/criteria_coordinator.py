@@ -803,6 +803,13 @@ class CriteriaCoordinator:
                 summary["target_observation"] = self.target_observation
                 if self.target_observation["relation"] == "changed":
                     summary["status"] = "superseded"
+                elif (
+                    not resume and self.strategy == "single-pass" and not self.state["tasks"]
+                    and self.target_observation["relation"] == "unknown"
+                    and isinstance(self.target_observation.get("github_error"), dict)
+                    and self.target_observation["github_error"].get("category") == "target_moved"
+                ):
+                    summary["interruption_reason"] = "target_unverifiable_before_dispatch"
             self.archive.write("last-summary.json", summary)
             return summary
         finally:

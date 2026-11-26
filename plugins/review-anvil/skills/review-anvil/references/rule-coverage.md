@@ -346,10 +346,17 @@ Before every report-path delivery, write a bounded owner-only sibling
 - `local_delivery`: actual artifact-delivery/validation state and report path.
 - `overall_review`: actual `incomplete`, `failed` or `completed` state, separate
   from local delivery.
+- `interruption_reason`: copy `target_unverifiable_before_dispatch` only
+  when present in the trusted coordinator summary. This denotes structured
+  GitHub target movement before any reviewer attempt; never infer it from
+  empty reviewer results or blocker text. Preserve `overall_review` and
+  the actual publication state. A runner may requeue preparation once
+  under its independent process, publication, and eligibility guards.
 - `diff_checkpoint_error` when an observation returns `github_error`: copy
   that object unchanged and add `phase` identifying the checkpoint (for example
   `final_diff_check`). Keep this local; do not include command arguments, raw
-  stderr, or headers. An unknown diff still blocks publication without retry.
+  stderr, or headers. An unknown diff still blocks publication and does not
+  authorize an in-session restart.
 - `coverage`: helper-issued `run_id`, authenticated `assessment_strategy`,
   repository and frozen PR/base/head identity; actual status, determinate,
   total, remaining, attempted/unvisited/unassessed and verdict counts,
