@@ -17,11 +17,12 @@ from urllib.parse import urlsplit
 class GitHubError(Exception):
     """A locator or GitHub response cannot produce a complete feedback packet."""
 
-    def __init__(self, message, http_status=None, *, exit_code=None, category="unknown"):
+    def __init__(self, message, http_status=None, *, exit_code=None, category="unknown", changed_fields=()):
         super().__init__(message)
         self.http_status = http_status
         self.exit_code = exit_code
         self.category = category
+        self.changed_fields = changed_fields
 
 
 def _host(value):
@@ -336,12 +337,17 @@ def read_pull_target(locator, cwd=None):
     closing = _object(github_api(host, endpoint), "closing pull request")
     closing_head = _object(_object(closing.get("head"), "head").get("repo"), "head repository")
     closing_base = _object(_object(closing.get("base"), "base").get("repo"), "base repository")
-    if (_revision(closing, number) != (head, base)
-            or any(closing.get(key) != pr.get(key) for key in ("title", "body", "html_url", "labels", "changed_files"))
-            or any(current.get(key) != original.get(key)
-                   for current, original in ((closing_head, head_repo), (closing_base, base_repo))
-                   for key in ("id", "full_name"))):
-        raise GitHubError("Pull request target moved during file collection")
+    revisions = _revision(closing, number)
+    changed = [key for key, current, original in zip(("head.sha", "base.sha"), revisions, (head, base))
+               if current != original]
+    changed.extend(key for key in ("title", "body", "html_url", "labels", "changed_files")
+                   if closing.get(key) != pr.get(key))
+    changed.extend(f"{side}.repo.{key}"
+                   for side, current, original in (("head", closing_head, head_repo), ("base", closing_base, base_repo))
+                   for key in ("id", "full_name") if current.get(key) != original.get(key))
+    if changed:
+        raise GitHubError("Pull request target moved during file collection (changed: " + ", ".join(changed) + ")",
+                          category="target_moved", changed_fields=changed)
     return {
         "schema_version": 1, "repository": repository,
         "head_repository": {"host": host, "name": head_name, "id": head_repo["id"]},

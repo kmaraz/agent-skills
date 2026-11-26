@@ -138,6 +138,16 @@ class TargetProjectionTests(unittest.TestCase):
             with self.assertRaises(memory_github.GitHubError):
                 memory_github.read_pull_target("acme/widgets#7")
 
+    def test_metadata_drift_reports_field_names_without_values(self):
+        def changed(host, endpoint, paginate=False):
+            result = self.api(host, endpoint, paginate)
+            if endpoint == "repos/acme/widgets/pulls/7" and self.head_reads > 1:
+                result["body"] = "private replacement text"
+            return result
+        with patch.object(memory_github, "github_api", side_effect=changed):
+            with self.assertRaisesRegex(memory_github.GitHubError, r"file collection \(changed: body\)$"):
+                memory_github.read_pull_target("acme/widgets#7")
+
     def test_base_move_while_collecting_same_size_inventory_is_rejected(self):
         def changed(host, endpoint, paginate=False):
             result = self.api(host, endpoint, paginate)

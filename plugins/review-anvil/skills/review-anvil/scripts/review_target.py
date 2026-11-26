@@ -372,7 +372,8 @@ def observe_pull_target(frozen, *, object_repo=None, cache_root):
         return {'relation': 'unknown', 'metadata_equal': None, 'snapshot': None,
                 'diagnostic': ('GitHub request failed during ' + operation),
                 'github_error': {'operation': operation, 'exit_code': exc.exit_code,
-                                 'http_status': exc.http_status, 'category': exc.category}}
+                                 'http_status': exc.http_status, 'category': exc.category,
+                                 **({'changed_fields': exc.changed_fields} if exc.changed_fields else {})}}
     except Exception as exc:
         return {'relation': 'unknown', 'metadata_equal': None, 'snapshot': None,
                 'diagnostic': f'{type(exc).__name__}: {exc}'}
