@@ -451,14 +451,15 @@ def append_suggestion(body, item):
         suggestion = item.get("suggested_change")
     if suggestion is None:
         suggestion = item.get("suggestedChange")
-    if not enable_suggestions or suggestion is None:
+    if not enable_suggestions or not isinstance(suggestion, str):
         return body
-    suggestion = str(suggestion).strip("\n")
+    suggestion = suggestion.strip("\n")
     if not suggestion or "```" in suggestion or "```suggestion" in body:
         return body
     # GitHub suggestions apply to the commented line/range. Only append when
     # the comment has a concrete new-side anchor that GitHub can apply.
-    if not (item.get("line") or item.get("start_line") or item.get("position")):
+    if (not item.get("line") or item.get("side") != "RIGHT"
+            or ("start_line" in item and item.get("start_side") != "RIGHT")):
         return body
     block = "```suggestion\n" + suggestion + "\n```"
     return append_before_finding_metadata(body, block)
@@ -474,6 +475,8 @@ for item in items:
         raise SystemExit("pr-helper: inline comment requires a nonblank path")
     if not isinstance(item.get("body"), str) or not item["body"].strip():
         raise SystemExit("pr-helper: inline comment requires a nonblank body")
+    if re.search(r"(?im)^\s*(`{3,}|~{3,})suggestion\b", item["body"]):
+        raise SystemExit("pr-helper: inline comment cannot contain an executable suggestion block; use the suggestion field")
     subject = item.get("subject_type")
     if subject is not None and subject not in {"file", "line"}:
         raise SystemExit("pr-helper: subject_type must be file|line")
@@ -484,8 +487,6 @@ for item in items:
             raise SystemExit("pr-helper: file comment must not have line, side, range or position anchors")
         if any(item.get(key) is not None for key in ("suggestion", "suggested_change", "suggestedChange")):
             raise SystemExit("pr-helper: file comment cannot have an executable replacement")
-        if re.search(r"(?m)^\s*(`{3,}|~{3,})suggestion\b", item["body"]):
-            raise SystemExit("pr-helper: file comment cannot contain an executable suggestion block")
         item = {**item, "subject_type": "file"}
     else:
         for key in ("line", "start_line", "position"):
