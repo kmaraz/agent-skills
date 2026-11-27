@@ -7,9 +7,9 @@ material for a new review.
 
 ## Purpose
 
-The top-level report is one natural visible summary sentence followed by
-collapsed issues and review context. Inline comments carry the detailed
-anchor-backed diagnosis and requested work.
+The final top-level report is one natural visible summary sentence followed by
+collapsed issues and program-owned review context/history. You edit only the
+summary, findings, dispositions and inline prose, not those reserved blocks.
 
 Simplify the contents, not only the formatting. Rewrite dense technical prose
 into ordinary language while preserving the minimum facts and exact actions a
@@ -17,7 +17,7 @@ reader needs to trust and fix the issue.
 
 Rewrite both surfaces in one pass so they use the same meaning and tone. Improve
 structure and plainness only. Do not add, remove, merge, split, reprioritize, or
-resolve findings.
+resolve findings. Do not perform a repair pass or request another audit wave.
 
 Research only. Do not inspect the repository, use tools, run commands, edit
 files, stage changes, commit, push, or post to GitHub. Apply the author-facing
@@ -31,30 +31,35 @@ profile in `asd-ste100-inspired.md` while preserving every frozen predicate.
 | Inline comment | Unlabeled diagnosis and labeled requested work | ID, severity, area, anchor JSON |
 | Unanchored material finding | Short self-contained problem and request | Finding marker |
 | Deferred/outside item | One plain reason in a collapsed section | Optional ID and disposition marker |
-| Review details | Collapsed exact metadata | Metadata inventory |
+| Review context and Earlier feedback | Inserted by code after rendering; never emit these blocks | Frozen metadata inventory copied unchanged |
 
 ## Input
 
-You receive one JSON object named `FROZEN_CLARITY_PACKET`:
+You receive `FROZEN_CLARITY_PACKET` for immutable facts and
+`EDITABLE_CLARITY_BUNDLE`, produced by the trusted `--renderer-input` command
+only after validating the full retained source. The latter has the same bundle
+fields and inventories, but its report Markdown omits the program-owned
+`Review context` and `Earlier feedback` sections. Return an edited copy of that
+bundle, not a reconstruction from this packet example:
 
 ```json
 {
   "report_style": "human-summary",
   "decision": "APPROVE | COMMENT",
   "report_ids": ["RAV-RUN3-R2-F001"],
-  "inline_min_severity": "medium",
-  "decision_reason": "exact final reason",
-  "result": "exact final result",
+  "decision_reason": "private frozen event/policy reason",
+  "result": "private frozen overall status",
   "scope": "exact reviewed scope",
   "checks": "exact reproduction result",
-  "second_check": "exact adversarial result",
+  "second_check": "private frozen adversarial outcome",
   "earlier_feedback": [
-    {"id": "optional modern or legacy finding ID", "status": "open | still-present | fixed | stale | reported | author-resolved | author-explanation-accepted", "text": "frozen status fact", "url": "optional exact URL"}
+    {"id": "optional modern or legacy finding ID", "status": "open | resolved | still-present | fixed | stale | reported | deferred | outside | review-dismissed | suppressed | author-resolved | author-explanation-accepted", "severity": "optional retained critical | high | medium | low | nit", "text": "frozen status fact", "url": "optional exact URL"}
   ],
   "findings": [
     {
       "id": "RAV-RUN3-R2-F001",
       "severity": "critical | high | medium | low | nit",
+      "request_mode": "required | suggested",
       "area": "machine-safe-area",
       "report_path": "src/auth.ts",
       "report_start_line": 42,
@@ -74,33 +79,66 @@ You receive one JSON object named `FROZEN_CLARITY_PACKET`:
   ],
   "set_aside": [{"id": "optional canonical ID", "severity": "medium", "area": "runtime", "text": "frozen issue", "reason": "frozen reason"}],
   "outside_scope": [{"id": "optional canonical ID", "severity": "low", "area": "docs", "text": "frozen issue", "reason": "frozen reason"}],
-  "run_details": ["exact run-detail line"]
+  "run_details": ["author-relevant verification limitation, if any"]
 }
 ```
 
 Absent optional fields stay absent. Inline anchors and report locations are
-independent. `report_ids` is the complete report identity inventory, including
-identified deferred and outside-scope items.
+independent. `report_ids` is the unique union of active findings, identified
+earlier feedback and deferred/outside-scope items. One identity may have both
+its active/disposition surface and its earlier-feedback surface; retain both
+roles without inventing another ID. Duplicate rows within a role are invalid.
+Earlier feedback produced by pre-freeze classification retains severity in both
+its structured record and status text. Preserve it: moving an unresolved
+critical/high item out of active findings does not make approval safe. The
+classifier has already selected its history role; do not restore an active
+finding or duplicate inline comment during clarity.
+
+
+New packet builders must set `request_mode` explicitly from the accepted source
+on every active finding before rendering. Severity is impact, not obligation:
+low correctness work can be `required`, while a medium preference can be
+`suggested`. Keep that mode consistent across the complete report request and
+inline request. Reject invalid explicit modes; never guess a replacement.
+Only stored old canonical packets lacking the field use legacy severity
+fallback: low/nit suggested, otherwise required.
+
+Do not receive or render knowledge coverage/signature notices, reviewer counts,
+worker failures or orchestration logs. They belong in private local diagnostics.
+Author-relevant checks and concrete code-risk limitations are inserted into
+Review context by code. Do not generate either reserved context/history block.
 
 ## Output
 
-Return one JSON object and no surrounding prose or Markdown fence:
+Return one draft JSON object and no surrounding prose or Markdown fence.
+Keep `Review context` and `Earlier feedback` absent from `report_markdown`,
+including empty blocks. The coordinator retains this raw draft separately and
+calls `--assemble-rendered` once to insert exact frozen sections and validate the
+complete result before auditors, selection or publication. This is mandatory
+assembly, not a repair pass or permission for a second rendering attempt.
+
+Native OMP dispatch uses the trusted `validate-clarity-output.py --renderer-schema`
+type projection of the validated full source. Preserve the editable bundle's
+object field sets, including nested metadata and optional anchor/suggestion
+fields. The transport schema constrains types; the existing complete validator
+checks exact frozen values after assembly. Do not add fields or reconstruct
+missing metadata.
 
 ```json
 {
   "decision": "APPROVE | COMMENT",
   "metadata_inventory": {
-    "decision_reason": "exact final reason",
-    "result": "exact final result",
+    "decision_reason": "private frozen event/policy reason",
+    "result": "private frozen overall status",
     "scope": "exact reviewed scope",
     "checks": "exact reproduction result",
-    "second_check": "exact adversarial result",
+    "second_check": "private frozen adversarial outcome",
     "earlier_feedback": [],
     "set_aside": [],
     "outside_scope": [],
     "run_details": []
   },
-  "report_markdown": "complete human-facing report",
+  "report_markdown": "editable report with summary, finding/disposition sections and footer, without reserved context/history blocks",
   "report_items": [
     {"id": "RAV-RUN3-R2-F001", "prior_feedback": "reintroduced", "rendered_body": "byte-identical human summary line copied from report_markdown"}
   ],
@@ -129,6 +167,16 @@ anchors, severity, safe exact `suggestion`, and helper-only `prior_feedback`
 unchanged. Copy every frozen metadata and disposition field byte-for-byte into
 `metadata_inventory`.
 
+`metadata_inventory` is private machine transport, not a public report template.
+Keep `decision_reason`, `result` and `second_check` there unchanged; do not copy
+them into visible `Decision reason:`, `Result:` or `Second check:` sections.
+An approval-disabled policy and a second review's mechanics are not code findings.
+Write the headline directly from useful code outcomes. Do not append generic
+sentences that earlier suggestions or deferred questions remain. Mention history
+only when a concrete changed/fixed/still-present code concern helps its author.
+Code composes public Review context from canonical scope, actual checks and
+concrete limitations; it does not repeat internal status or the headline.
+
 ## Hidden report metadata
 
 Every report or disposition line ends with one hidden marker:
@@ -145,8 +193,10 @@ still shows the unencoded path. Do not show hidden fields in visible prose.
 `report_items` and `disposition_items` contain the complete byte-identical
 line, including the marker.
 
-For a reintroduced finding, copy `"prior_feedback": "reintroduced"` into the
-report and inline items and keep the existing reintroduction marker contract.
+For a reintroduced finding, preserve `"prior_feedback": "reintroduced"` in
+the report and inline items. Keep `<!-- review-anvil: prior_feedback=reintroduced -->`
+immediately before the terminal `review-anvil-report` marker in the same table
+row. Do not put it on a separate line, which would break the table.
 
 ## Human language rules
 
@@ -188,14 +238,14 @@ forms, not templates. Do not vary wording mechanically.
 Mention severity, scope, optional suggestions, or set-aside uncertainty only
 when it helps the reader understand the detection result. Do not invent praise,
 readiness, or an `otherwise looks good` claim. When no material issue is
-detected, state that plainly and mention optional suggestions if present.
+detected, state that plainly. Mention useful suggestions only when it adds context.
 
-When the only active findings are low/nit, lead with the absence of material
-issues and optionally mention their count or broad topic. Do not lead with
-the exact low-priority behavior; its full detail belongs in the collapsed
-`Optional suggestions` table. Apply this even if the frozen result or draft
-headline foregrounds that behavior. Do not claim the whole PR is correct or
-ready to merge.
+When every active finding has `request_mode: suggested`, lead with the absence
+of required fixes and optionally mention the suggestions' count or broad
+topic. Do not lead with the exact optional behavior; its detail belongs in
+its native review comment, or `Optional suggestions` if genuinely unanchored.
+Do not treat required low-severity work as optional or a suggested medium preference as mandatory. Do not claim the whole
+PR is correct or ready to merge.
 
 Do not narrate the review pipeline in the visible summary. Avoid internal
 phrases such as:
@@ -243,7 +293,7 @@ short bullet.
 The top-level report has no Markdown heading. Write one or two natural visible
 summary sentences under the neutral detection guidance above.
 
-Use this shape:
+Use this draft shape. Code inserts the frozen context/history blocks before the footer:
 
 ```md
 <One or two neutral detection sentences.>
@@ -266,42 +316,48 @@ Use this shape:
 
 </details>
 
-<details>
-<summary>Review context</summary>
-
-<exact frozen metadata>
-
-</details>
-
 _Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._
 ```
 
-Every active finding becomes one row in `Issues and fixes` or `Optional
-suggestions`. Keep the complete diagnosis, impact, and requested or suggested
-change in that collapsed row even when an inline comment exists. Inline comments
-still carry the same anchored detail in GitHub's native review UI.
+The complete local bundle retains every active finding as one row in
+`Issues and fixes` for `required` or `Optional suggestions` for `suggested`.
+Preserve full diagnosis, impact and work predicates there for validation/audit.
+Every active finding with a verified PR anchor also gets one comment regardless
+of severity. A verified changed-file path without a diff line uses
+`subject_type: file`, no line/side/range/position, and no executable suggestion.
+Use exact existing diff anchors for line/range comments. Do not convert a
+report-only source reference into a fabricated PR anchor. The posting projection
+removes duplicate routed rows and empty finding tables from the outgoing body;
+only unanchored details remain there. Keep obligation and fact locks identical.
 
-Use exactly four columns. Each table row stays on one source line and ends with
-its hidden `review-anvil-report` marker in the final cell. Escape every literal
-`|` inside a cell as `\|`; do not add multiline cells or rely on generic
+Use exactly four columns. Keep the header, separator and all data rows contiguous,
+joined with single newlines and no blank lines inside a table. Each table row
+stays on one source line and ends with its hidden `review-anvil-report` marker
+in the final cell. Escape every literal `|` inside a cell as `\|`; do not add multiline cells or rely on generic
 pipe-splitting. Show severity as `Critical`, `High`, `Medium`, `Low`, or `Nit`.
-Show the frozen report location as `` `path:line` ``, a line range, or `—`.
+Copy the frozen report location exactly as `` `path:line` `` or
+`` `path:start_line-line` `` using the ASCII hyphen `-` for ranges, never an
+en/em dash. Preserve the full path and both range endpoints; use `—` only
+when the canonical report location is absent. This is structural formatting,
+not prose to rewrite.
 Keep IDs, area, encoded location, and disposition in the hidden terminal marker.
 The review-anvil footer appears exactly once as the absolute final nonblank
 line. Every collapsed section and helper-only idempotency marker must come
 before it.
 
-Keep earlier feedback, changes made, set-aside/outside items, and exact review
-metadata in separate collapsed sections with natural labels. Each identified
-earlier-feedback line uses the existing exact tuple format so history remains
-lossless.
+Use only these editable collapsed-section labels: `Issues and fixes`,
+`Optional suggestions`, `Changes made`, `Set aside`, and `Outside this change`.
+Omit empty sections; do not rename labels to synonyms such as `Deferred concern`.
+Never emit `Review context` or `Earlier feedback`. Code restores exact history
+tuples from the canonical packet; do not copy those lines into another section.
 
-```md
-- **<status>** — <exact text> <exact URL> (`<finding ID>`)
-```
-
-Low and nit report items keep suggestion grammar.
-Emit inline comments only at or above the frozen threshold.
+All `suggested` report and inline items keep suggestion grammar across the
+complete request, including every coordinated clause, test, and documentation
+suggestion.
+“Consider adding a summary and documenting its format” must not become
+“Consider adding a summary. Document its format.” A suggestion heading alone
+does not make a bare command optional.
+Emit one comment for every verified line/file anchor, including low/nit.
 
 
 ## Inline recipe
@@ -344,13 +400,21 @@ template. Keep any additional source-backed condition or required test.
 
 Default to starting required work with its action verb.
 End a direct imperative as a statement, not a question. Use `Consider …` for
-optional low/nit guidance. Use a real question such as `Should …?` only when
-the source leaves a decision unresolved.
+`suggested` work at any severity. Use a real question such as `Should …?` only
+when the source leaves a decision unresolved.
 
 Do not add a synthetic title, another field label, action heading, or checklist.
 
 Keep accepted current behavior and optional follow-ups as natural boundary
-prose. Keep every safe exact `suggestion` byte-identical.
+prose. When a no-change boundary constrains an action, keep it attached with
+`while keeping … unchanged` or `without changing …`; never split it into a
+standalone `Keep …` or `Preserve …` author command. For example, “Save the
+report while keeping the existing failure condition unchanged” is one action
+with a boundary, not “Save the report. Keep the failure condition.”
+An optional multi-clause request stays optional as a whole: “Consider saving a
+summary and documenting its format without changing the exit condition” must
+not produce mandatory documentation or preservation bullets.
+Keep every safe exact `suggestion` byte-identical.
 
 ## Fact and action lock
 
@@ -368,10 +432,18 @@ Do not make requested behavior sound already implemented. Do not promote an
 allowed boundary or optional follow-up into required work. A finding with no
 requested verification gets none. Do not invent a test purpose, outcome, or
 success condition.
+Keep a required test coupled to its source condition and expected outcome.
+“Add a test that returns a nonzero status when a required input is missing”
+must not shrink to “Add a test” or detach the outcome as a new behavior change.
+Accepted current behavior supplies constraints, not additional work: do not
+derive a new fix, test, or preservation command from it.
 
 ## Common rendering mistakes and red flags
 
-Restore frozen wording when any of these occurs:
+These conditions invalidate the rewrite. Do not attempt another rendering pass;
+the coordinator restores the complete already-validated source surface or
+bundle, forces COMMENT under existing guards, and validates actual emitted
+bytes. Invalid source is diagnostic-only, never validated success:
 
 - The neutral summary becomes a compressed technical paragraph.
 - IDs, areas, audit counts, or run mechanics become visible.

@@ -31,6 +31,8 @@ npx skills add mrshu/agent-skills \
   --skill review-anvil-readonly \
   --skill review-anvil-pr \
   --skill review-anvil-improve-pr \
+  --skill review-anvil-init \
+  --skill review-anvil-rules \
   --skill codex-exec \
   --skill claude-exec
 ```
@@ -93,8 +95,10 @@ checked before they land.
 |---|---|---:|---:|---:|---:|---:|
 | Harden local changes with fix commits | `review-anvil` | Yes | Yes | No | No | No |
 | Review without touching files | `review-anvil-readonly` | No | No | No | No | No |
-| Review a PR and post findings | `review-anvil-pr` | No | No | No | Yes | Yes, unless disabled |
+| Review a PR with local memory | `review-anvil-pr` | No | No | No | Unless `post: false` | Yes, subject to review gates and user controls |
 | Improve a checked-out PR branch | `review-anvil-improve-pr` | Yes | Yes | Yes | Yes | No |
+| Initialize or maintain local memory | `review-anvil-init` | No | No | No | No | No |
+| Learn source-backed local review rules | `review-anvil-rules` | Private memory only | No | No | No | No |
 
 What makes it useful:
 
@@ -134,14 +138,17 @@ What makes it useful:
 - **PR repair flow:** `review-anvil-improve-pr` can announce a run, commit and
   push verified fixes to a checked-out PR branch, then update the same PR comment
   with the result.
-- **Approval control:** `review-anvil-pr` can submit a real GitHub approval when
-  review-only checks pass. Use `approve: never` or "comment only" when
-  approval should stay human.
+- **Local feedback memory:** PR review learns advisory observations from new
+  discussion, reuses them across visited PRs, and invalidates changed evidence.
+  `review-anvil-init` initializes, seeds, inspects and corrects local memory.
+- **PR controls:** `review-anvil-pr` uses the normal approval gates;
+  `approve: never` requests comment-only feedback. `post: false` prevents
+  posting and thread resolution; `memory: off` disables the knowledge overlay.
 - **Simplicity lens:** the default focus includes a minimization ladder (need it
   at all? → stdlib → native feature → existing dependency → one line → the
   minimum that works), adapted from [ponytail](https://github.com/DietrichGebert/ponytail).
 
-The plugin ships four cross-agent skills under `plugins/review-anvil/skills/`.
+The plugin ships six cross-agent skills under `plugins/review-anvil/skills/`.
 Anything that supports `Skill <name>` (Claude Code, Codex CLI, Cursor, OpenCode,
 Continue, Cline, Gemini CLI, …) can activate them by description match. In
 Claude Code, you can also invoke directly as `Skill review-anvil "<free-form
@@ -149,6 +156,225 @@ args>"`; see `skills/review-anvil/SKILL.md` for the full behavior and advanced
 controls (`rounds`, `max_rounds`, `agents`, `focus`, `target`, `verify_cmd`,
 `reproduction`, `proof_runner`, `adversarial`, `approve`, `report_path`, and
 more).
+
+#### Manual local memory in OMP
+
+Install the development skill directories from a trusted checkout into OMP's
+user skill discovery root (including `review-anvil-init`, the existing review
+skills, and their `codex-exec`/`claude-exec` dependencies). Restart OMP to discover
+new skills. The native invocation is `/skill:<name>`:
+
+```text
+/skill:review-anvil-init sli-do/slido-frontend
+/skill:review-anvil-init sli-do/slido-frontend seed: sli-do/slido-frontend#12345
+/skill:review-anvil-init sli-do/slido-frontend seed: sli-do/slido-frontend#18520-18530
+/skill:review-anvil-init sli-do/slido-frontend seed: sli-do/slido-frontend#18001-19000
+/skill:review-anvil-pr sli-do/slido-frontend#12345, post: false
+/skill:review-anvil-pr sli-do/slido-frontend#12345, memory: off, post: false
+```
+
+The default PR review initializes memory automatically. Each run reads complete
+current human PR discussion, asks the invoking model for source-backed advisory
+observations, and freezes selected knowledge for all review stages. Proposals,
+author replies, objections and accepted qualifications supply learning evidence.
+PR descriptions/code are context only; bot/generated reviews (even under a
+human account), merge/approval state and praise alone do not establish criteria.
+It needs existing `gh` and reviewer authentication, not a new API service.
+An empty first run is normal. Initialization alone does not scan PR history;
+explicit seed PRs use the same learning workflow without reviewing or posting.
+
+Seed ranges are inclusive and processed sequentially: `18520-18530` selects
+11 numbers; `18001-19000` selects 1000. Each PR's semantic extraction is
+saved before advancing, using bounded per-PR worker context. Mixed singles
+and ranges deduplicate overlaps in first-occurrence order. The authenticated
+private seed journal retains progress across interruptions; repeat the same
+incomplete invocation to resume. Repeating a completed selection refreshes it.
+Confirmed issues/missing numbers are explicit skips; authentication, network
+and rate-limit failures stop at the current step without losing earlier work.
+Final local-rule assessment completes the run. Large ranges consume real GitHub
+and model quotas; no background service continues after the host stops.
+See the [sequential seed protocol](plugins/review-anvil/skills/review-anvil/references/seed-ranges.md).
+
+Durable data lives under `~/.local/share/review-anvil/<host>/<owner>/<repo>/`,
+outside the reviewed checkout. `REVIEW_ANVIL_MEMORY_HOME` selects an isolated
+test root. Do not commit private memory or collected conversations. To inspect,
+correct or invalidate knowledge use `review-anvil-init` or the trusted helper
+commands in the [local memory contract](plugins/review-anvil/skills/review-anvil/references/local-memory.md).
+Learned rules are private review preferences, automatically saved locally.
+They cannot override base-side project policy or reviewer safety/output contracts.
+Reports identify the snapshot and private run record.
+
+OMP uses native task reviewers by default, so separate Codex/Claude CLIs are
+not required there. Native reviewers inherit the configured host model and
+are reported as native, not as independent providers. Explicit Codex/Claude
+backend selections still require their actual CLIs.
+
+#### Automatic local rules
+
+Successful memory-enabled PR reviews incrementally learn reusable rules into
+private `local-rules.json` by default. Learning uses the review's original
+applied PR preparation and only its changed observations plus affected/related
+native topics; unrelated rules stay unchanged. No delta skips model learning
+and catalog mutation. The existing invoking model selects related topics from
+the compact current-native-topic index and compares complete candidate criteria,
+not just keys. It reads complete original human support, merges equivalent
+recommendations under the supported canonical stable key/ID and unions genuine
+support while preserving author qualifications, exceptions and optional wording.
+Historical-only topic IDs are identity metadata, not criteria to resurrect.
+Every activated observation needs its own substantive human-discussion support;
+missing/insufficient evidence stays context-only or triage. One clear standing
+human convention can suffice, but discussion existence is not endorsement.
+The model checks scope, authority, conflicts and current base-side policy.
+There is no extra model cohort or automatic full-history fallback. The next
+review loads supported, path-scoped rules into its frozen snapshot.
+
+The private rule catalog and CLI JSON artifacts share the memory store's
+64 MiB per-file safety limit. Oversized outputs fail before creating an artifact;
+complete source evidence is never truncated to fit.
+Snapshot selection retains its 64 KiB canonical-JSON budget, 50-rule limit and
+50 unique supporting observations. Target identity, diagnostics and signatures
+count toward that budget too. If mandatory metadata alone cannot fit, knowledge
+is unavailable and ordinary review continues without that augmentation.
+Eligible rules that do not fit are omitted with an explicit count and complete
+included evidence. The separate 128 KiB limit applies to manual policy input,
+not the catalog. Pretty-printed snapshots can exceed their canonical size;
+selection is measured before display formatting.
+
+```text
+/skill:review-anvil-rules reassess: sli-do/slido-frontend
+/skill:review-anvil-rules inspect: sli-do/slido-frontend
+```
+
+`reassess:` explicitly assesses the full retained active history and replaces
+the native learned-rule catalog; back up private `local-rules.json` first.
+It reads locally retained complete original human discussions, not a fresh
+GitHub collection or rules inferred from descriptions/code. Bounded reading
+batches must feed a global semantic integration of **all complete candidates**
+before activation: compare text, scope, conditions, type, exceptions and support
+IDs, not just key collisions. Reuse currently supported canonical topics over
+historical aliases, union genuine support, retain author qualifications and
+optional obligations, and triage contradictions. Read full originals for every
+merged/ambiguous group; keep compact integration decisions and an accurate
+change digest outside Git. This uses the existing model/orchestrator, without
+hidden provider calls, extra cohorts, approval gates or automatic retries.
+A bare repository invocation remains a compatible explicit manual full
+reassessment, never an automatic PR-learning command. `inspect:` only inspects.
+Explicit init seed finalization is deliberately full so it covers historical
+learning across the selected seeds, not just the final PR.
+
+Learning creates no branches, commits, proposal PRs or reviewed-repository
+changes. Ordinary review comments remain independently controlled by `post`:
+`post: false` still learns and applies local rules. `rules: off` skips new
+generation but loads supported saved rules; `memory: off` disables both
+observations and learned rules.
+
+Changed or invalidated native supporting evidence excludes affected rules.
+Unrelated memory updates do not discard them. Base-side project policy takes precedence
+over local preferences; comments cannot grant permissions or override findings
+schemas, severity, approval or verification requirements.
+
+Old proposal metadata is retained as private history, not automatically
+activated or reconciled remotely. Existing proposal PRs are left untouched.
+See the [local rules contract](plugins/review-anvil/skills/review-anvil/references/rule-promotion.md)
+for assessment JSON, source provenance and local storage.
+
+On explicit request, selected native rules can also be privately adopted from
+another locally initialized repository with the trusted `rules-import` helper.
+The target keeps signed, scoped copies with unchanged original source URLs;
+its own observations and rules are preserved. These copies load with
+`rules: off` and in all-rule mode, but do not follow later donor changes.
+Reimport a reviewed selection to refresh it, or an empty selection to remove
+that origin. See [private adoption](plugins/review-anvil/skills/review-anvil/references/rule-promotion.md#explicit-private-adoption-from-another-repository).
+
+#### Exhaustive local rule coverage
+
+The default `rule_coverage: scoped` uses the bounded scoped snapshot above.
+To explicitly consider every supported saved rule, including deciding whether
+off-path criteria apply, use:
+
+```text
+/skill:review-anvil-pr owner/repo#123, post: false, rules: off, rule_coverage: all, coverage_workers: 4
+```
+
+`rules: off` isolates saved-rule use from generating new criteria; it does
+not disable coverage. `memory: off` cannot be combined with exhaustive coverage.
+New all-mode runs use **single-pass** coverage: every supported saved rule is
+assigned directly to exactly one of the actual ordinary reviewers. Complete,
+unchanged rule objects and the response schema are inlined before each complete
+ordinary task and lens. No rule is filtered for path mismatch, and there is no
+applicability-model stage or extra coverage reviewer cohort.
+
+Reviewers return explicit indexed verdict groups; each group's evidence must
+genuinely establish the verdict for every listed rule, including its exceptions.
+Original discussions and supporting observations remain frozen and accessible.
+Read complete originals for ambiguity, source/policy conflicts or possible
+violations, rather than rereading all histories automatically.
+`coverage_workers: 1`–`4` (default `4`) caps simultaneous ordinary reviewers,
+not their total count or lenses. Historical criteria-first runs retain their
+routing-only worker cap. Storage `batch_count` is not a worker count.
+
+Every supported rule receives a determinate verdict or an explicit open
+question. Violations enter normal synthesis, verification and adversarial
+review; learned prose never overrides manual policy or establishes a defect by
+itself. Knowledge accounting never adds a new publication prerequisite.
+See the [exhaustive coverage protocol](plugins/review-anvil/skills/review-anvil/references/rule-coverage.md).
+
+The private phase ledger binds direct signed reviewer assignments,
+actual normal review reports, verdicts and genuine violation packets to the
+same frozen run. Each original reviewer task is issued at most once; malformed,
+missing, rejected or failed output never triggers replacement. Independent
+original jobs continue when trust/freshness permits. Accepted results remain
+immutable, and all returned candidate/report inventories remain available for
+adjudication. Missing evidence stays `not_assessed` and prevents a complete
+knowledge claim, not ordinary publication. Valid ordinary reports remain usable
+even when supplemental rule data is malformed or a reviewer result is missing.
+Knowledge limitations remain in private diagnostics; public comments explain only concrete author-relevant code risks.
+
+Actual-diff checkpoints compare complete patches, paths, modes and binary
+content. A verified changed diff supersedes current work, requests cancellation
+and permits one fresh ordinary run; metadata/SHA-only drift does not. There is
+no continuous watcher during a blocking native wait. New starts never adopt a
+matching incomplete archive. Historical full-evidence/criteria-first signatures
+and recovery protocols remain intact.
+
+Initial source assembly deterministically inserts required frozen scope, checks,
+author-relevant limitations and prior-feedback lines using the validator's
+shared metadata projection. It preserves finding/inline bodies and validates
+before emitting the source; it never repairs frozen source or renderer output.
+The renderer receives a validated projection without the program-owned
+Review context and Earlier feedback sections. It edits the remaining prose;
+the trusted helper assembles those sections from canonical metadata before
+validating the complete result. Changed inventories/decisions, missing findings
+or model-emitted reserved sections still fail validation.
+Native rendering loads its typed transport schema from the same trusted helper,
+using validated source field sets rather than model-authored object constants.
+Exact values still pass the original validator; schema compatibility does not
+replace frozen-metadata or finding checks.
+Clarity then uses one renderer and one audit wave, with exact validated-source
+fallback and no repair/re-audit. Required versus optional work follows source
+obligation, independently of severity. Publish every useful line/file-anchored finding as its
+own review comment, including optional low/nit suggestions; keep only unanchored
+details in the main body and preserve complete local evidence. Internal knowledge
+counts, signatures and orchestration diagnostics stay local.
+Frozen approval reasons, overall status and second-check mechanics also remain
+private metadata, rather than mandatory public boilerplate. Native OMP waves
+share one enforced monotonic deadline, cancel unfinished work on expiry and
+retain ready results without retries. Synthesis reads the original complete
+review reports without an improvised optional-YAML dependency; private archive
+writes and ordinary report-file writes use their existing distinct APIs.
+Publication exclusively records an attempt before submitting one review with
+line comments, then sends at most one request per file-level comment through
+GitHub's separate endpoint. The receipt remains even for body-only reviews;
+confirmed, failed or unknown attempts cannot be resubmitted. Actual partial
+outcomes are retained without retry or weaker fallback. Original history,
+freshness, approval and no-post controls remain intact.
+Use a fresh OMP session after updating installed Python code.
+
+`post: false` independently forbids remote mutation, even with complete coverage.
+No fixed runtime or speedup is promised: fewer worker dispatches alone do not
+establish lower latency or less substantive assessment.
+
+
 
 #### Repository-specific review rules
 

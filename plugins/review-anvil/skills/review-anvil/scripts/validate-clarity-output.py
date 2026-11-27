@@ -43,11 +43,13 @@ HUMAN_REPORT_ITEM_RE = re.compile(
     r"line=(?P<line>\d+|-)\s+"
     r"disposition=(?P<disposition>active|deferred|outside)\s*-->\s*$"
 )
+REINTRODUCED_MARKER = "<!-- review-anvil: prior_feedback=reintroduced -->"
 HUMAN_REPORT_TABLE_ROW_RE = re.compile(
     r"^\|\s*(?P<visible_severity>Critical|High|Medium|Low|Nit)\s*\|\s*"
     r"(?P<location>(?:\\\||[^|\n])+?)\s*\|\s*"
     r"(?P<issue>(?:\\\||[^|\n])+?)\s*\|\s*"
     r"(?P<action>(?:\\\||[^|\n])+?)\s+"
+    rf"(?:(?P<reintroduced>{re.escape(REINTRODUCED_MARKER)})\s+)?"
     rf"<!--\s*review-anvil-report:\s*id=(?P<id>{FINDING_ID_PATTERN})\s+"
     r"severity=(?P<severity>critical|high|medium|low|nit)\s+"
     r"area=(?P<area>[A-Za-z0-9][A-Za-z0-9._/-]*)\s+"
@@ -61,6 +63,7 @@ SUGGESTIONS_TABLE_HEADER = (
 )
 TABLE_SEPARATOR = "|---|---|---|---|"
 ANCHOR_KEYS = ("path", "start_line", "line", "side", "start_side")
+FILE_LINE_KEYS = ("start_line", "line", "side", "start_side", "position", "start_position", "range")
 METADATA_FIELDS = (
     "decision_reason",
     "result",
@@ -76,6 +79,7 @@ REVIEW_FOOTER = (
     "_Reviewed with [review-anvil]"
     "(https://github.com/mrshu/agent-skills/#review-anvil)._"
 )
+REVIEW_MARKER_PREFIX = re.compile(r"^(?:<!--\s*review-anvil-marker:.*?-->\s*\n)?\n*")
 COMPACT_DETAILS_RE = re.compile(
     r"<details>\n<summary>([^<\n]+)</summary>\n\n"
     r"([\s\S]*?)\n\n?</details>"
@@ -98,7 +102,7 @@ COMPACT_SECTION_LABELS = frozenset(
 )
 
 
-SEVERITY_RANK = {"nit": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+SEVERITIES = ("nit", "low", "medium", "high", "critical")
 class InvalidBundle(ValueError):
     pass
 
@@ -111,6 +115,16 @@ def load_object(path: str, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise InvalidBundle(f"{label} must be a JSON object")
     return value
+
+
+def finding_request_mode(finding: dict[str, Any]) -> str:
+    if "request_mode" in finding:
+        mode = finding["request_mode"]
+        if mode not in ("required", "suggested"):
+            raise InvalidBundle(f"{finding.get('id')} invalid request_mode {mode!r}")
+        return mode
+    # Stored canonical packets predate explicit source-based obligation modes.
+    return "suggested" if finding.get("severity") in {"low", "nit"} else "required"
 
 
 def indexed_findings(canonical: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -126,6 +140,9 @@ def indexed_findings(canonical: dict[str, Any]) -> dict[str, dict[str, Any]]:
             raise InvalidBundle(f"invalid canonical finding id {finding_id}")
         if finding_id in indexed:
             raise InvalidBundle(f"duplicate canonical finding {finding_id}")
+        if finding.get("severity") not in SEVERITIES:
+            raise InvalidBundle(f"{finding_id} invalid severity")
+        finding_request_mode(finding)
         indexed[finding_id] = finding
     return indexed
 
@@ -162,7 +179,7 @@ def report_location_text(finding: dict[str, Any]) -> str:
         return "—"
     start = finding.get("report_start_line")
     line_range = (
-        f"{start}-{line}" if isinstance(start, int) else str(line)
+        f"{start}-{line}" if isinstance(start, int) and start != line else str(line)
     )
     return f"`{escape_table_cell(path)}:{line_range}`"
 
@@ -195,27 +212,27 @@ def report_id_inventory(
     disposition_ids = {
         item.get("id") for item in structured_dispositions(canonical) if item.get("id")
     }
-    extra_ids = set(report_ids) - set(findings)
-    if extra_ids != history_ids | disposition_ids:
+    expected_ids = set(findings) | history_ids | disposition_ids
+    if set(report_ids) != expected_ids:
         raise InvalidBundle(
             "report_ids do not match identified history and dispositions"
         )
     return set(report_ids)
 
 
-def validate_report(report: Any, expected_ids: set[str]) -> None:
+def validate_report(report: Any, expected_counts: dict[str, int]) -> None:
     if not isinstance(report, str):
         raise InvalidBundle("report_markdown must be a string")
     report_ids = REPORT_ID_RE.findall(report)
     for finding_id in report_ids:
-        if finding_id not in expected_ids:
+        if finding_id not in expected_counts:
             raise InvalidBundle(f"unknown report finding {finding_id}")
     counts = Counter(report_ids)
     for finding_id, count in counts.items():
-        if count > 1:
+        if count != expected_counts[finding_id]:
             raise InvalidBundle(f"report finding {finding_id} appears {count} times")
-    if set(report_ids) != expected_ids:
-        missing = sorted(expected_ids - set(report_ids))
+    if set(report_ids) != set(expected_counts):
+        missing = sorted(set(expected_counts) - set(report_ids))
         raise InvalidBundle(
             "report finding inventory mismatch; missing " + ", ".join(missing)
         )
@@ -228,24 +245,34 @@ def earlier_feedback_line(item: dict[str, Any]) -> str:
         line += f' (`{item["id"]}`)'
     return line
 
+def visible_metadata(canonical: dict[str, Any]) -> dict[str, list[str]]:
+    """Project only metadata that the report must show, shared with assembly."""
+    return {
+        "Review context": [
+            value for value in (
+                canonical.get("scope"),
+                canonical.get("checks"),
+                *(item for item in (canonical.get("set_aside") or []) if isinstance(item, str)),
+                *(item for item in (canonical.get("outside_scope") or []) if isinstance(item, str)),
+                *(canonical.get("run_details") or []),
+            ) if value
+        ],
+        "Earlier feedback": [
+            earlier_feedback_line(item) for item in (canonical.get("earlier_feedback") or [])
+        ],
+    }
+
+
 def validate_metadata(
     canonical: dict[str, Any], rendered: dict[str, Any], report: str
 ) -> None:
     expected = {field: canonical.get(field) for field in METADATA_FIELDS}
     if rendered.get("metadata_inventory") != expected:
         raise InvalidBundle("metadata inventory changed")
-    visible_values = [
-        expected["decision_reason"],
-        expected["result"],
-        expected["scope"],
-        expected["checks"],
-        expected["second_check"],
-        *(item.get("text") for item in (expected["earlier_feedback"] or [])),
-        *(item for item in (expected["set_aside"] or []) if isinstance(item, str)),
-        *(item for item in (expected["outside_scope"] or []) if isinstance(item, str)),
-        *(expected["run_details"] or []),
+    missing = [
+        value for values in visible_metadata(expected).values()
+        for value in values if value not in report
     ]
-    missing = [value for value in visible_values if value and value not in report]
     if missing:
         raise InvalidBundle(f"report omits frozen metadata: {missing[0]}")
     for item in expected["earlier_feedback"] or []:
@@ -281,12 +308,8 @@ def validate_human_report_envelope(
     ):
         raise InvalidBundle("review footer must be the final nonblank line")
     report_body = stripped_report[: -len(REVIEW_FOOTER)].rstrip()
-    visible_report = re.sub(
-        r"^<!--\s*review-anvil-marker:.*?-->\s*\n",
-        "",
-        report_body,
-        count=1,
-    ).lstrip("\n")
+    # Keep this boundary in sync with initial source assembly.
+    visible_report = REVIEW_MARKER_PREFIX.sub("", report_body, count=1)
     blocks = compact_details_blocks(visible_report)
     summary, separator, _ = visible_report.partition("\n\n<details>\n")
     if (
@@ -315,11 +338,11 @@ def validate_human_report_envelope(
     dispositions = structured_dispositions(canonical)
     expected_sections = {
         "Issues and fixes": any(
-            finding.get("severity") not in {"low", "nit"}
+            finding_request_mode(finding) == "required"
             for finding in findings.values()
         ),
         "Optional suggestions": any(
-            finding.get("severity") in {"low", "nit"}
+            finding_request_mode(finding) == "suggested"
             for finding in findings.values()
         ),
         "Earlier feedback": bool(canonical.get("earlier_feedback")),
@@ -345,7 +368,7 @@ def validate_human_report_envelope(
             continue
         label = (
             "Optional suggestions"
-            if finding.get("severity") in {"low", "nit"}
+            if finding_request_mode(finding) == "suggested"
             else "Issues and fixes"
         )
         rows_by_section[label].append(item.get("rendered_body"))
@@ -473,9 +496,12 @@ def validate_report_items(
             if shape.group("location") != expected_location:
                 raise InvalidBundle(f"{finding_id} report location changed")
         metadata = shape
-        if prior_feedback == "reintroduced":
-            reintroduced = body + "\n<!-- review-anvil: prior_feedback=reintroduced -->"
-            if report.count(reintroduced) != 1:
+        if human_style:
+            marked = prior_feedback == "reintroduced"
+            if bool(shape.group("reintroduced")) != marked or body.count(REINTRODUCED_MARKER) != int(marked):
+                raise InvalidBundle(f"{finding_id} prior-feedback metadata changed")
+        elif prior_feedback == "reintroduced":
+            if report.count(body + "\n" + REINTRODUCED_MARKER) != 1:
                 raise InvalidBundle(f"{finding_id} prior-feedback metadata changed")
         finding = findings[finding_id]
         if metadata.group("severity") != finding.get("severity"):
@@ -541,24 +567,53 @@ def marker_from_body(body: Any) -> re.Match[str]:
     raise InvalidBundle("inline metadata marker is missing or malformed")
 
 
+def comment_subject(item: dict[str, Any], finding_id: str) -> str | None:
+    """Validate structural anchors; frozen canonical equality supplies provenance."""
+    subject = item.get("subject_type")
+    if "subject_type" in item and subject not in ("file", "line"):
+        raise InvalidBundle(f"{finding_id} invalid inline subject_type")
+    path = item.get("path")
+    if path is None:
+        if subject is not None:
+            raise InvalidBundle(f"{finding_id} inline subject requires a path")
+        return None
+    if (
+        not isinstance(path, str) or not path.strip() or path.startswith("/")
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or any(part in ("", ".", "..") for part in path.split("/"))
+    ):
+        raise InvalidBundle(f"{finding_id} invalid inline path")
+    if subject == "file" or item.get("line") is None and subject is None:
+        if any(item.get(key) is not None for key in FILE_LINE_KEYS):
+            raise InvalidBundle(f"{finding_id} file anchor has line fields")
+        if item.get("suggestion") is not None:
+            raise InvalidBundle(f"{finding_id} file anchor has an executable suggestion")
+        return "file"
+    line = item.get("line")
+    if type(line) is not int or line <= 0:
+        raise InvalidBundle(f"{finding_id} invalid inline line")
+    start = item.get("start_line")
+    if start is not None and (type(start) is not int or not 0 < start <= line):
+        raise InvalidBundle(f"{finding_id} invalid inline start_line")
+    for key in ("side", "start_side"):
+        if item.get(key) is not None and item[key] not in ("LEFT", "RIGHT"):
+            raise InvalidBundle(f"{finding_id} invalid inline {key}")
+    if item.get("start_side") is not None and start is None:
+        raise InvalidBundle(f"{finding_id} inline start_side requires start_line")
+    return "line"
+
+
 def validate_inline(
     rendered: dict[str, Any],
     findings: dict[str, dict[str, Any]],
-    inline_min_severity: Any,
 ) -> None:
-    if inline_min_severity not in SEVERITY_RANK:
-        raise InvalidBundle(f"invalid inline_min_severity {inline_min_severity}")
     inline_comments = rendered.get("inline_comments")
     if not isinstance(inline_comments, list):
         raise InvalidBundle("inline_comments must be an array")
 
     expected = {
-        finding_id: finding
-        for finding_id, finding in findings.items()
-        if SEVERITY_RANK.get(finding.get("severity"), -1)
-        >= SEVERITY_RANK[inline_min_severity]
-        and isinstance(finding.get("path"), str)
-        and isinstance(finding.get("line"), int)
+        finding_id: finding for finding_id, finding in findings.items()
+        if comment_subject(finding, finding_id) is not None
     }
     seen: set[str] = set()
     for item in inline_comments:
@@ -579,7 +634,19 @@ def validate_inline(
             raise InvalidBundle(f"{finding_id} marker area changed")
         if item.get("severity") != finding.get("severity"):
             raise InvalidBundle(f"{finding_id} helper severity changed")
+        subject = comment_subject(finding, finding_id)
+        actual_subject = comment_subject(item, finding_id)
+        if subject != actual_subject or subject == "file" and item.get("subject_type") != "file":
+            raise InvalidBundle(f"{finding_id} inline subject_type changed")
+        if subject == "file":
+            if any(key in item for key in FILE_LINE_KEYS):
+                raise InvalidBundle(f"{finding_id} file comment has line fields")
+            if re.search(r"(?im)^[ \t]*(?:`{3,}|~{3,})suggestion(?:[ \t]|\r?$)", item["body"]):
+                raise InvalidBundle(f"{finding_id} file comment has an executable suggestion")
         for key in ANCHOR_KEYS:
+            if item.get(key) != finding.get(key):
+                raise InvalidBundle(f"{finding_id} inline {key} changed")
+        for key in ("position", "start_position", "range"):
             if item.get(key) != finding.get(key):
                 raise InvalidBundle(f"{finding_id} inline {key} changed")
         if item.get("suggestion") != finding.get("suggestion"):
@@ -631,33 +698,372 @@ def validate(canonical: dict[str, Any], rendered: dict[str, Any]) -> None:
             f"decision changed from {expected_decision} to {actual_decision}"
         )
     report = rendered.get("report_markdown")
+    if not isinstance(report, str):
+        raise InvalidBundle("report_markdown must be a string")
     validate_metadata(canonical, rendered, report)
-    validate_report(report, expected_report_ids)
+    # An identity has one finding/disposition surface and may also have its
+    # exact earlier-feedback surface. Repetition within either role stays invalid.
+    expected_counts = dict.fromkeys(expected_report_ids, 1)
+    surfaced_ids = set(findings) | {
+        item.get("id") for item in structured_dispositions(canonical) if item.get("id")
+    }
+    for item in canonical.get("earlier_feedback") or []:
+        if item.get("id") in surfaced_ids:
+            expected_counts[item["id"]] = 2
+    validate_report(report, expected_counts)
     validate_report_items(report, rendered, findings, human_style)
     validate_disposition_items(report, rendered, canonical, human_style)
     if human_style:
         validate_human_report_envelope(canonical, rendered, findings, report)
-    validate_inline(
-        rendered,
-        findings,
-        canonical.get("inline_min_severity"),
-    )
+    validate_inline(rendered, findings)
     validate_predicates(rendered, findings)
 
 
+def prepare_action_audit_rows(
+    canonical: dict[str, Any], source: dict[str, Any], rendered: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Conserve frozen source evidence; semantic verdicts still belong to auditors."""
+    validate(canonical, source)
+    validate(canonical, rendered)
+    findings = indexed_findings(canonical)
+    rows: list[dict[str, Any]] = []
+
+    def text(value: Any, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidBundle(f"audit preparation requires {label}")
+        return value
+
+    def row(finding_id: str, surface: str, finding: dict[str, Any],
+            source_body: str, rendered_body: str, disposition: bool = False) -> dict[str, Any]:
+        if disposition:
+            disposition_facts = [text(finding.get(key), key) for key in ("text", "reason")]
+            context = text(finding.get("source_context", "\n".join(disposition_facts)), "source_context")
+            facts = finding.get("fact_lock", disposition_facts)
+            work, mode = finding.get("requested_work", []), "boundary"
+        else:
+            context = text(finding.get("source_context"), "source_context")
+            facts, work = finding.get("fact_lock"), finding.get("requested_work")
+            mode = finding_request_mode(finding)
+        for values, label in ((facts, "fact_lock"), (work, "requested_work")):
+            if not isinstance(values, list):
+                raise InvalidBundle(f"audit preparation requires {label} array")
+            for value in values:
+                text(value, label)
+        location = ({key: finding[key] for key in ANCHOR_KEYS if key in finding}
+                    if surface == "inline" else {
+                        "path": finding.get("report_path"),
+                        "start_line": finding.get("report_start_line"),
+                        "line": finding.get("report_line"),
+                    })
+        return {
+            "id": finding_id, "surface": surface, "request_mode": mode,
+            "source_context": context, "source_fact_lock": list(facts),
+            "source_requested_work": "\n".join(work), "source_location": location,
+            "source_body": source_body, "rendered_body": rendered_body,
+        }
+
+    source_reports = {item["id"]: item["rendered_body"] for item in source["report_items"]}
+    for item in rendered["report_items"]:
+        finding_id = item["id"]
+        rows.append(row(finding_id, "report", findings[finding_id],
+                        source_reports[finding_id], item["rendered_body"]))
+    source_inline = {marker_from_body(item["body"]).group("id"): item["body"]
+                     for item in source["inline_comments"]}
+    for item in rendered["inline_comments"]:
+        finding_id = marker_from_body(item["body"]).group("id")
+        rows.append(row(finding_id, "inline", findings[finding_id],
+                        source_inline[finding_id], item["body"]))
+    dispositions = structured_dispositions(canonical)
+    if dispositions:
+        if canonical.get("report_style") != "human-summary":
+            raise InvalidBundle("audit dispositions require validated human-summary surfaces")
+        for index, (finding, original, item) in enumerate(zip(
+                dispositions, source["disposition_items"], rendered["disposition_items"], strict=True)):
+            finding_id = finding.get("id") or f"AUDIT:disposition:{index}"
+            rows.append(row(finding_id, "report", finding,
+                            original["rendered_body"], item["rendered_body"], disposition=True))
+    return rows
+
+def _assemble_source_layout(canonical: dict[str, Any], source: dict[str, Any]) -> str:
+    """Place authored prose and rows in sections owned by the classified packet."""
+    summary = source.pop("summary")
+    if not isinstance(summary, str):
+        raise InvalidBundle("source summary must be a string")
+    findings = indexed_findings(canonical)
+    source.setdefault("decision", canonical.get("decision"))
+    source.setdefault("predicate_inventory", [
+        {"id": finding_id, "requested_work": finding.get("requested_work")}
+        for finding_id, finding in findings.items()
+    ])
+    sections: dict[str, list[str]] = {
+        "Issues and fixes": [],
+        "Optional suggestions": [],
+        "Set aside": [],
+        "Outside this change": [],
+    }
+    for field in ("report_items", "disposition_items"):
+        items = source.get(field)
+        if not isinstance(items, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("rendered_body"), str)
+            for item in items
+        ):
+            raise InvalidBundle(f"{field} must contain complete report rows")
+    report_items = []
+    for item in source["report_items"]:
+        finding_id = item.get("id")
+        if not isinstance(finding_id, str) or finding_id not in findings:
+            raise InvalidBundle("source row does not belong to the classified findings")
+        finding = findings[finding_id]
+        body = item["rendered_body"]
+        if (finding.get("prior_feedback") == "reintroduced" and REINTRODUCED_MARKER not in body
+                and (row := HUMAN_REPORT_TABLE_ROW_RE.fullmatch(body))):
+            end = row.end("action")
+            body = body[:end] + " " + REINTRODUCED_MARKER + body[end:]
+            item = {**item, "rendered_body": body}
+        report_items.append(item)
+        label = "Issues and fixes" if finding_request_mode(finding) == "required" else "Optional suggestions"
+        sections[label].append(body)
+    source["report_items"] = report_items
+    dispositions = structured_dispositions(canonical)
+    if len(dispositions) != len(source["disposition_items"]):
+        raise InvalidBundle("disposition item inventory changed")
+    for expected, item in zip(dispositions, source["disposition_items"], strict=True):
+        label = "Set aside" if expected["disposition"] == "deferred" else "Outside this change"
+        sections[label].append(item["rendered_body"])
+    blocks = [" ".join(line.strip() for line in summary.splitlines() if line.strip())]
+    for label, rows in sections.items():
+        if not rows:
+            continue
+        if label == "Issues and fixes":
+            rows = [ISSUES_TABLE_HEADER, TABLE_SEPARATOR, *rows]
+        elif label == "Optional suggestions":
+            rows = [SUGGESTIONS_TABLE_HEADER, TABLE_SEPARATOR, *rows]
+        content = "\n".join(rows)
+        blocks.append(f"<details>\n<summary>{label}</summary>\n\n{content}\n\n</details>")
+    return "\n\n".join([*blocks, REVIEW_FOOTER]) + "\n"
+
+
+def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
+    """Construct initial frozen context; never repair renderer or fallback output."""
+    if canonical.get("report_style") != "human-summary":
+        raise InvalidBundle("source assembly requires human-summary")
+    source = dict(draft)
+    if "disposition_items" not in source and not structured_dispositions(canonical):
+        source["disposition_items"] = []
+    source.setdefault("metadata_inventory", {field: canonical.get(field) for field in METADATA_FIELDS})
+    if "summary" in source:
+        if "report_markdown" in source:
+            raise InvalidBundle("source draft cannot supply both summary and report_markdown")
+        source["report_markdown"] = _assemble_source_layout(canonical, source)
+    report = source.get("report_markdown")
+    if not isinstance(report, str):
+        raise InvalidBundle("report_markdown must be a string")
+    if REVIEW_FOOTER not in report:
+        raise InvalidBundle("review footer is missing")
+    for label, values in visible_metadata(canonical).items():
+        blocks = compact_details_blocks(report)
+        missing = list(dict.fromkeys(value for value in values if value not in report))
+        if label in blocks:
+            if not missing:
+                continue
+            block = next(match for match in COMPACT_DETAILS_RE.finditer(report)
+                         if match.group(1) == label)
+            end = block.end(2)
+            report = report[:end] + "\n\n" + "\n\n".join(missing) + report[end:]
+        elif values or label == "Review context":
+            section = f"<details>\n<summary>{label}</summary>\n\n" + "\n\n".join(missing) + "\n\n</details>"
+            report = report.replace(REVIEW_FOOTER, section + "\n\n" + REVIEW_FOOTER, 1)
+    # The marker is not visible prose and must be retained byte-for-byte.
+    # Reflow only initial prose; keep frozen sections and renderer output exact.
+    start = REVIEW_MARKER_PREFIX.match(report).end()
+    prefix, separator, sections = report[start:].partition("\n\n<details>\n")
+    lines = [line for line in prefix.splitlines() if line.strip()]
+    if separator and len(lines) > 1 and all(
+        re.match(r" {0,3}[\w\"'“‘(]", line) and not re.match(r"\s*\d+[.)]\s", line)
+        for line in lines
+    ):
+        report = report[:start] + " ".join(line.strip() for line in lines) + separator + sections
+    report = assemble_table_headers(report)
+    source["report_markdown"] = report
+    validate(canonical, source)
+    return source
+
+
+def validate_renderer_fields(bundle: dict[str, Any]) -> None:
+    """Reject unsupported transport fields without weakening the full validator."""
+    fields = {
+        "decision", "metadata_inventory", "report_markdown", "report_items",
+        "disposition_items", "inline_comments", "predicate_inventory",
+    }
+    if set(bundle) != fields:
+        raise InvalidBundle("renderer bundle field set changed")
+    item_fields = {
+        "report_items": {"id", "rendered_body", "prior_feedback"},
+        "disposition_items": {"id", "rendered_body"},
+        "inline_comments": {
+            *ANCHOR_KEYS, "position", "start_position", "range", "subject_type",
+            "severity", "body", "suggestion", "prior_feedback",
+        },
+        "predicate_inventory": {"id", "requested_work"},
+    }
+    for field, allowed in item_fields.items():
+        items = bundle.get(field)
+        if not isinstance(items, list):
+            raise InvalidBundle(f"{field} must be an array")
+        if any(not isinstance(item, dict) or set(item) - allowed for item in items):
+            raise InvalidBundle(f"unsupported {field} fields")
+
+
+def renderer_input(canonical: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """Validate retained source before removing program-owned Markdown sections."""
+    validate(canonical, source)
+    if canonical.get("report_style") != "human-summary":
+        raise InvalidBundle("renderer input requires human-summary")
+    validate_renderer_fields(source)
+    projected = dict(source)
+    reserved = visible_metadata(canonical)
+    projected["report_markdown"] = COMPACT_DETAILS_RE.sub(
+        lambda block: "" if block.group(1) in reserved else block.group(0),
+        source["report_markdown"],
+    )
+    return projected
+
+
+def assemble_table_headers(report: str) -> str:
+    headers = {"Issues and fixes": ISSUES_TABLE_HEADER,
+               "Optional suggestions": SUGGESTIONS_TABLE_HEADER}
+
+    def replace_header(match: re.Match[str]) -> str:
+        header = headers.get(match.group(1))
+        first, newline, rest = match.group(2).partition("\n")
+        if header is None or not first.startswith("|") or not rest.startswith(TABLE_SEPARATOR + "\n"):
+            return match.group(0)
+        start = match.start(2) - match.start()
+        return match.group(0)[:start] + header + newline + rest + match.group(0)[match.end(2) - match.start():]
+
+    return COMPACT_DETAILS_RE.sub(replace_header, report)
+
+
+def assemble_rendered(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
+    """Compose frozen sections around editable prose, then validate the full result."""
+    if canonical.get("report_style") != "human-summary":
+        raise InvalidBundle("rendered assembly requires human-summary")
+    validate_renderer_fields(draft)
+    if draft.get("decision") != canonical.get("decision"):
+        raise InvalidBundle("renderer decision changed")
+    if draft.get("metadata_inventory") != {field: canonical.get(field) for field in METADATA_FIELDS}:
+        raise InvalidBundle("metadata inventory changed")
+    report = draft.get("report_markdown")
+    if not isinstance(report, str):
+        raise InvalidBundle("report_markdown must be a string")
+    sections = visible_metadata(canonical)
+    blocks = compact_details_blocks(report)
+    if sections.keys() & blocks.keys():
+        raise InvalidBundle("renderer must not emit reserved frozen sections")
+    frozen_sections = []
+    for label, values in sections.items():
+        if values or label == "Review context":
+            body = "\n\n".join(dict.fromkeys(values))
+            frozen_sections.append(f"<details>\n<summary>{label}</summary>\n\n{body}\n\n</details>")
+    assembled = dict(draft)
+    assembled["report_markdown"] = assemble_table_headers(report).replace(
+        REVIEW_FOOTER, "\n\n".join(frozen_sections) + "\n\n" + REVIEW_FOOTER, 1,
+    )
+    validate(canonical, assembled)
+    return assembled
+
+
+def renderer_schema(canonical: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """Describe validated source types, never freeze object values in provider schemas."""
+    validate(canonical, source)
+
+    def shape(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return {
+                "type": "object",
+                "properties": {key: shape(item) for key, item in value.items()},
+                "required": list(value),
+                "additionalProperties": False,
+            }
+        if isinstance(value, list):
+            if not value:
+                return {"type": "array", "items": {"type": "null"}, "maxItems": 0}
+            variants = []
+            for item in value:
+                variant = shape(item)
+                if variant not in variants:
+                    variants.append(variant)
+            return {"type": "array", "items": variants[0] if len(variants) == 1 else {"anyOf": variants}}
+        types = {str: "string", bool: "boolean", int: "integer", float: "number", type(None): "null"}
+        kind = types.get(type(value))
+        if kind is None:
+            raise InvalidBundle("renderer source contains a non-JSON value")
+        return {"type": kind}
+
+    return shape(source)
+
+
+def validated_source_bytes(canonical: dict[str, Any], path: str) -> bytes:
+    """Validate and return the same bytes, without a formatting fallback rewrite."""
+    try:
+        payload = Path(path).read_bytes()
+        source = json.loads(payload)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise InvalidBundle(f"cannot read source bundle: {error}") from error
+    if not isinstance(source, dict):
+        raise InvalidBundle("source bundle must be a JSON object")
+    validate(canonical, source)
+    return payload
+
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
+    audit = len(argv) > 1 and argv[1] == "--audit-rows"
+    emit = len(argv) > 1 and argv[1] == "--emit-validated"
+    assemble = len(argv) > 1 and argv[1] == "--assemble-source"
+    schema = len(argv) > 1 and argv[1] == "--renderer-schema"
+    project = len(argv) > 1 and argv[1] == "--renderer-input"
+    rendered = len(argv) > 1 and argv[1] == "--assemble-rendered"
+    if len(argv) != (5 if audit else 4 if emit or assemble or schema or project or rendered else 3):
         print(
-            "usage: validate-clarity-output.py <canonical.json> <rendered.json>",
+            "usage: validate-clarity-output.py <canonical.json> <rendered.json>\n"
+            "       validate-clarity-output.py --audit-rows <canonical.json> <source.json> <rendered.json>\n"
+            "       validate-clarity-output.py --emit-validated <canonical.json> <source.json>\n"
+            "       validate-clarity-output.py --assemble-source <canonical.json> <draft.json>\n"
+            "       validate-clarity-output.py --renderer-schema <canonical.json> <source.json>\n"
+            "       validate-clarity-output.py --renderer-input <canonical.json> <source.json>\n"
+            "       validate-clarity-output.py --assemble-rendered <canonical.json> <draft.json>",
             file=sys.stderr,
         )
         return 2
     try:
-        validate(load_object(argv[1], "canonical packet"), load_object(argv[2], "rendered bundle"))
+        if project or rendered:
+            operation = renderer_input if project else assemble_rendered
+            bundle = operation(load_object(argv[2], "canonical packet"), load_object(argv[3], "renderer bundle"))
+            print(json.dumps(bundle, ensure_ascii=False, indent=2))
+        elif schema:
+            contract = renderer_schema(load_object(argv[2], "canonical packet"), load_object(argv[3], "source bundle"))
+            print(json.dumps(contract, ensure_ascii=False, indent=2))
+        elif assemble:
+            source = assemble_source(load_object(argv[2], "canonical packet"), load_object(argv[3], "source draft"))
+            print(json.dumps(source, ensure_ascii=False, indent=2))
+        elif emit:
+            payload = validated_source_bytes(load_object(argv[2], "canonical packet"), argv[3])
+            sys.stdout.buffer.write(payload)
+        elif audit:
+            rows = prepare_action_audit_rows(
+                load_object(argv[2], "canonical packet"),
+                load_object(argv[3], "source bundle"),
+                load_object(argv[4], "rendered bundle"),
+            )
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+        else:
+            validate(load_object(argv[1], "canonical packet"), load_object(argv[2], "rendered bundle"))
     except InvalidBundle as error:
         print(f"clarity-output: {error}", file=sys.stderr)
         return 1
-    print("clarity-output: valid")
+    if not audit and not emit and not assemble and not schema and not project and not rendered:
+        print("clarity-output: valid")
     return 0
 
 

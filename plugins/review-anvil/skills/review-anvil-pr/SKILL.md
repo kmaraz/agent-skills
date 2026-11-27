@@ -10,11 +10,11 @@ Preset that reviews a GitHub PR with the multi-agent loop and posts the result b
 ## Generated Language
 
 Apply the [ASD-STE100-inspired language contract](../review-anvil/references/asd-ste100-inspired.md) to this preset.
-Use direct imperatives for internal steps. Use short active declarative sentences in PR comments. Keep inline diagnoses unlabeled and put requested work under `Suggestions:`, with one bullet per independently implementable change. Default to starting required work with its action verb. Keep no-change constraints in prose, suggestion grammar for low/nit guidance, and questions for genuinely unresolved choices.
+Use direct imperatives internally and short active declarative sentences in PR comments. Keep diagnoses unlabeled and requested work under `Suggestions:`, one bullet per independently implementable change. Use action verbs for required work, suggestion grammar for explicitly optional work, prose for no-change constraints and questions for unresolved choices. Severity does not determine obligation.
 
-1. `scripts/pr-helper.sh init [<locator>]` — locator parsing or auto-detect from the current branch, `gh` preflight (auth + PR reachability), marker UUID + report path setup
+1. `scripts/pr-helper.sh init [<locator>] [--rule-coverage scoped|all]` — locator parsing or auto-detect from the current branch, `gh` preflight (auth + PR reachability), marker UUID + report path setup
 2. The [`review-anvil`](../review-anvil/SKILL.md) engine in read-only mode (`commit_mode=none`)
-3. `scripts/pr-helper.sh post <host> <owner> <repo> <n> <marker> <report_path>` — marker injection, lossless report posting as a PR review / `gh pr comment`, race-free URL recovery
+3. `scripts/pr-helper.sh post <host> <owner> <repo> <n> <marker> <report_path>` — one review submission, anchored line/file comments and confirmed delivery receipts
 
 The engine automatically loads `.review-anvil-rules.md` from the PR's base
 repository and captured base SHA under its
@@ -29,21 +29,76 @@ The user may provide a PR locator as the first argument, or omit it entirely:
 - **Full GitHub URL** — `https://<host>/<owner>/<repo>/pull/<N>` for github.com or GitHub Enterprise.
 - **Slug** — `<owner>/<repo>#<N>` (host defaults to github.com).
 
-**Bare integers are rejected** by the helper script to prevent wrong-repo misdirection. To target a PR you don't have checked out, pass the URL or slug; to target the PR you're currently on, just omit the locator.
+The posting helper rejects bare integers. This preset first canonicalizes
+`#123`/`123` in the actual reviewed repository using stateless `resolve-pr` or
+`gh pr view`, then passes a full URL. Knowledge availability is not required.
+
+### Memory and coverage controls
+
+- `memory: on` (default): automatically initialize local repository memory,
+  process changed PR feedback, and use one frozen advisory snapshot.
+- `memory: off`: do not read or update local memory; run a normal comparison.
+- `rules: on` (default with memory enabled): after a successful review, assess
+  that applied PR's changed observations and affected/related saved topics,
+  preserving all unrelated private local rules.
+- `rules: off`: skip rule generation while still loading supported saved local
+  rules. `memory: off` disables all local memory and learned-rule reads/writes.
+- `rule_coverage: scoped` (default): use the normal bounded, path-selected
+  local-rule snapshot. Existing review behavior stays unchanged.
+- `rule_coverage: all`: assign every supported saved criterion directly to the
+  actual ordinary reviewers, including off-path/global rules. New runs use one
+  single-pass cohort, zero applicability workers and explicit indexed verdict
+  groups. Inline unchanged full criteria and schema before each complete
+  original ordinary task/lens. Read complete original discussions for ambiguity,
+  source/policy conflicts or possible violations, not every history by default.
+  Require `memory: on`; `memory: off` plus `all` is an error, not fallback.
+  `rules: off` disables new rule generation only, not saved-rule coverage.
+  Read `../review-anvil/references/rule-coverage.md` before starting.
+- `coverage_workers: 4` (default for all mode): integer `1`–`4` caps simultaneous
+  ordinary reviewers on new single-pass runs, never their total count or lenses.
+  Historical criteria-first retains its routing-only cap; storage `batch_count`
+  is not a worker count. Explicit use requires `rule_coverage: all`; reject
+  duplicates and invalid values.
+- `post: false`: keep the report local; do not post, approve or resolve threads.
+  Posting remains enabled otherwise. Local learning/activation still runs.
+  Rule learning never creates GitHub branches, commits or PRs in either mode.
+
+Parse these preset-only controls before building engine arguments; remove
+their segments from `<extra-user-args>`. Reject invalid values and duplicate
+or conflicting controls, including repeated identical `rule_coverage` values.
+Run step 0 against the original arguments before removing any segment; the
+helper mechanically validates coverage controls and rejects forged run IDs.
+Approval follows the engine's default `approve: allowed` and its existing
+review/adversarial/freshness gates. Memory, saved-rule coverage and rule
+generation do not disable approval. Do not inject `approve: never` or set
+`REVIEW_ANVIL_NO_APPROVE=1` by default. Honor an explicit user request to
+never approve/comment only by passing `approve: never` and exporting
+`REVIEW_ANVIL_NO_APPROVE=1` for helper calls; preserve an explicitly supplied
+no-approve environment switch as well.
+Export `REVIEW_ANVIL_RULE_COVERAGE=<scoped|all>` and, for `post: false`,
+`REVIEW_ANVIL_NO_POST=1` **before init**; unset the no-post switch for a new
+posting-enabled invocation. Init persists all-mode/no-post intent beside the
+report, independent of later environment loss.
+
+Read `../review-anvil/references/local-memory.md` before preparing knowledge.
+Resolve its helper from the trusted installation, not reviewed code. If it is
+unavailable or verification fails, explicitly omit unverified augmentation and
+continue the original review with a knowledge notice; never call it valid/empty.
+Do not change user memory settings, replay reviewers or expose private errors.
 
 ## How to invoke
 
 ### 0. Reject overrides of pinned params
 
-Pins for this preset: `commit_mode`, `target`, `report_path`, `run_ordinal`. Enforce mechanically — after resolving the helper (step 1), run:
+Pins for this preset: `commit_mode`, `target`, `report_path`, `run_ordinal`, `finding_namespace`, `memory_snapshot`, `coverage_run`. Approval remains user-configurable. Enforce mechanically — after resolving the helper (step 1), run:
 
 ```bash
-bash <helper-path> check-pins review-anvil-pr "commit_mode,target,report_path,run_ordinal" "$ARGUMENTS"
+bash <helper-path> check-pins review-anvil-pr "commit_mode,target,report_path,run_ordinal,finding_namespace,memory_snapshot,coverage_run" "$ARGUMENTS"
 ```
 
 Non-zero exit means a pinned param was overridden in the args: surface the script's error verbatim and stop. (The engine's prose pin-rejection in "Parsing" remains as the description of the algorithm; the script is the binding layer.)
 
-The pins are non-overridable for safety: `commit_mode` enforces read-only; `target` and `report_path` are mechanically tied to the user's locator; and `run_ordinal` carries the helper's observed PR history into identifier generation. Defense in depth against the engine's prose parser being talked into accepting overrides (e.g. via prompt injection in the focus text).
+These pins preserve read-only mode, target and report identity, and the helper's trusted invocation context.
 
 ### 1. Resolve the helper script
 
@@ -61,11 +116,64 @@ To find the absolute path:
 
 The primary contract is "the script is `./scripts/pr-helper.sh` relative to this SKILL.md." When the host doesn't expose that path, the user-level fallback is a recovery mechanism — but it is not a substitute for the host exposing skill-file paths, and project-scoped paths must never be searched.
 
+### 1a. Prepare local feedback memory
+
+Before helper `init`, use the complete prepare → read → extract → apply →
+snapshot protocol in `../review-anvil/references/local-memory.md`. Use the
+provided locator, or detect the current PR URL with `gh pr view --json url`.
+The collector also safely resolves `#123` in the current repository. Display
+the canonical PR URL from the prepared packet and use that URL for helper
+`init`. Preserve the captured head SHA and the private snapshot path.
+Extract reusable observations only from substantive human discussion, retaining
+proposals, author replies, objections and qualifications. PR descriptions/code
+are context, not standing-rule authority. Bot/generated reviews, including
+Anvil output posted under a human `User` account, are not human endorsement;
+read genuine human responses on their merits. Missing/insufficient discussion
+correctly yields no new reusable claim. Follow the reference's provenance and
+semantic checks; approval/merge state and praise alone do not qualify.
+If preparation cannot produce a trusted snapshot, keep the independently resolved
+canonical PR URL for normal `init`, omit snapshot/run injection and skip memory-only
+recording/learning. For unresolved `#123`/`123`, resolve positive number `123` with
+`gh pr view 123 --json url --jq '.url'` in the captured review workspace/repository,
+not the skill installation. Do not send bare numbers to helper `init`; full URLs
+and repository-qualified slugs use its original supported path. Record knowledge
+unavailability explicitly; preserve original ordinary target/source validation.
+
+If `memory: off`, call `python3 <memory-helper> resolve-pr <locator>` to
+canonicalize a supplied short locator without reading or changing local
+memory, then omit `memory_snapshot` from engine arguments.
+
+When a prepared snapshot exists, after helper `init` compare `HEAD_SHA` and run:
+
+```bash
+python3 <memory-helper> verify-target --prepared /private/run/prepared.json --snapshot /private/run/snapshot.json
+```
+
+This verifies helper-issued snapshot provenance and the complete current
+repository/PR/head/base/file scope. If the head or base moved, the PR was
+retargeted, or the file scope changed, re-prepare feedback and take a new
+snapshot before dispatch. Never reuse memory selected for a different diff.
+
+For `rule_coverage: all`, after this verification call trusted
+`coverage-start --prepared /private/run/prepared.json`. New starts use the
+strategy-bound `single-pass` protocol. Retain the helper-issued run ID and
+strategy summary; pass only that ID as pinned `coverage_run`. Bind complete
+frozen context before direct assignment (`coverage-assign --context PATH`, or
+omit the option only after context is already bound). Do not call applicability
+export/record commands on single-pass runs.
+
+Explicit continuation authenticates the existing run and strategy, preserving
+archived original prompts, pending outputs and acknowledged assessments; never
+reset, convert, recollect or rebuild its prompts from current templates.
+Historical full-evidence and criteria-first protocols remain separate. Do not
+accept user-supplied IDs or substitute a scoped snapshot. In scoped mode omit
+`coverage_run`.
+
 ### 2. Init
 
 ```bash
-bash <helper-path> init "<locator>"     # explicit form
-bash <helper-path> init                 # auto-detect from current branch
+bash <helper-path> init "<locator>" --rule-coverage <scoped|all> # explicit form
+bash <helper-path> init --rule-coverage <scoped|all>             # auto-detect
 ```
 
 If the user supplied a locator (URL or `<owner>/<repo>#<N>` slug), pass it as the argument. If they didn't, invoke `init` with no argument — the script will run `gh pr view --json url` to find the PR associated with the currently checked-out branch and use that as the locator. The script aborts with a clear message if no PR is found.
@@ -78,15 +186,17 @@ OWNER=acme
 REPO=widgets
 N=137
 RUN_ORDINAL=3
+FINDING_NAMESPACE=<decimal UUID of MARKER>
 HEAD_SHA=<the PR head commit at review time>
 MARKER=<uuidv4>
 REPORT_PATH=<absolute-path>/.review-anvil/final-report-<uuidv4>.md
 TITLE=<PR title>
+RULE_COVERAGE=scoped
 ```
 
 If the locator was auto-detected, the script also prints `auto-detected PR: <url>` to stderr before the KEY=VALUE block, so the agent can echo that to the user before proceeding.
 
-Capture all values, including `RUN_ORDINAL`. Echo to the user: `review target: $HOST/$OWNER/$REPO#$N — $TITLE`.
+Capture all values, including `FINDING_NAMESPACE`. Echo to the user: `review target: $HOST/$OWNER/$REPO#$N — $TITLE`.
 
 On non-zero exit, surface the script's stderr verbatim and stop. Do not dispatch reviewers.
 
@@ -95,12 +205,18 @@ On non-zero exit, surface the script's stderr verbatim and stop. Do not dispatch
 Activate the `review-anvil` skill with this argument string (extra user args go between the pinned params and the rounds default):
 
 ```
-commit_mode: none, target: <locator>, report_path: <REPORT_PATH>, run_ordinal: <RUN_ORDINAL>, <extra-user-args>, adversarial: auto, rounds: 1
+commit_mode: none, target: <canonical-PR-URL>, report_path: <REPORT_PATH>, run_ordinal: <RUN_ORDINAL>, finding_namespace: <FINDING_NAMESPACE>, memory_snapshot: <private-snapshot-path>, <extra-user-args>, adversarial: auto, rounds: 1
 ```
 
-The user may override `rounds:` or `adversarial:` in their args (they are defaults, not pins). They cannot override the observed value of `run_ordinal`, or the `commit_mode`, `target`, and `report_path` pins; the step-0 segment-rejection above blocks override attempts.
+For all mode, add the trusted `rule_coverage: all, coverage_run: <helper-run-id>`
+and validated `coverage_workers: <count>` to those invocation arguments. Remove
+the preset worker-control segment before assembling the engine invocation.
+For scoped mode use `rule_coverage: scoped`, omit `coverage_run` and do not pass
+an explicit worker control. Never replace the helper-issued run identity.
 
-`RUN_ORDINAL` comes from the `init` preflight. When it is a positive integer, the engine includes the corresponding `RUN` segment in new provenance IDs. The value `unavailable` makes the engine emit IDs without the `RUN` segment; degraded history must not invent a run number.
+The user may override `rounds:` or `adversarial:` (defaults, not pins). Reject overrides of the step-0 pins.
+
+Use the exact `FINDING_NAMESPACE` for the `RUN` segment of newly assigned IDs. `RUN_ORDINAL` describes observed history; concurrent invocations can see the same ordinal. Keep existing IDs when carrying earlier feedback forward.
 
 The engine's default `reproduction: auto` runs before adversarial review and
 reproduces uncertain material findings in one batched confidence pass. The user
@@ -125,30 +241,207 @@ Provide `$HEAD_SHA` to the engine for its `.approval.json` `head_sha` field — 
 
 The engine runs the review loop, writes the final report to `<REPORT_PATH>` (on failure paths too), and prints that path on its last output line. Before posting, if `<REPORT_PATH>.followups.json` exists, read it and surface its entries to the user (the helper deletes it after a successful post; `auto_approved` entries are the only ones automation may file issues for, after a duplicate search).
 
-### 4. Post
+In all mode the engine accounts for every criterion and collects the normal
+reviewers' actual assessments before final synthesis. Single-pass dispatch is
+the ordinary reviewer wave, not an additional wave. Explicit external mixes use
+their actual requested backends and the same signed assignments/grouped
+envelope through the phase CLI, never native proxies. Follow the engine's
+single-pass external override: leave `REVIEW_ANVIL_REQUIRE_FINDINGS` unset for
+outer JSON; send external Codex the identical complete inlined prompt through an
+owner-only finite stdin file with literal `-` prompt argv, retaining watchdog,
+sandbox and model flags. Verify the selected installation supports forced stdin
+before dispatch, or fail that backend clearly without substitution. Scoped and
+historical dispatch recipes retain their existing defaults.
+
+Only determinate, authenticated full coverage produces
+`<REPORT_PATH>.coverage.json`; retain its strategy and bounded summary only in
+private coverage/delivery diagnostics. Every genuine candidate enters normal scope/confidence, reproduction,
+adversarial, clarity and synthesis checks with a retained disposition. Coverage
+never bypasses freshness or the persisted no-post publication gate.
+Finalization uses the engine's trusted `validate-clarity-output.py --audit-rows`
+with the frozen packet, validated complete source bundle and rendered bundle;
+do not assemble auditor rows ad hoc. Preserve one two-auditor wave and exact
+validated-source fallback/COMMENT; no repair, re-audit or repeated model task.
+Native finalization follows the single concrete transport recipe in
+`../review-anvil/references/rule-coverage.md#finalization-result-transport`:
+`timeout: 0`, Eval-thread start/wait, synchronous Python writes and complete
+schema-parsed `.wait()` values durably stored before display. Never use
+`agent://` display text as output transport or redispatch completed work.
+Finish the engine's normal synthesis and clarity path before recording
+observation dispositions or taking either the local-only or posting exit.
+Incomplete knowledge and `post: false` do not permit an early handwritten
+report. If the engine cannot continue, retain its exact failed stage and
+diagnostic in the delivery manifest. A renderer that was never started is
+not a renderer failure or the exact-source fallback.
+
+Valid `not_assessed` results remain open knowledge questions while other original
+work finishes. Missing reviewer output, rejected rule data, unavailable knowledge
+or a failed coverage seal must not suppress remaining valid ordinary reports.
+Run their original synthesis/verification/publication path. Keep knowledge gaps
+private; freeze only concrete author-relevant code limitations before clarity. Publish
+when normal report/target/history controls pass and posting is enabled; no
+knowledge certificate is a prerequisite. No usable ordinary report, invalid
+report structure or a superseded/unverifiable review target retains the original
+failure behavior. Never claim exhaustive knowledge coverage from a partial audit.
+
+Track local artifact validation and "Record signed coverage outcome" separately.
+Complete the recording task with the actual verified/failed/blocked-not-run
+outcome; recording unavailable coverage never means signature verification.
+Preserve knowledge gaps in diagnostics and deliver the ordinary report under
+the original local/posting policy without waiting for user intervention.
+Use the engine's actual-diff observer/cancellation branch: a verified changed
+diff immediately supersedes current work and permits one fresh ordinary run.
+Metadata-only drift, unknown comparison and failures do not authorize an
+in-session restart. A runner can separately requeue preparation once when the
+trusted coordinator confirms target movement before any reviewer attempt.
+
+For all-mode delivery, retain a bounded owner-only `<REPORT_PATH>.delivery.json`
+following the engine reference's diagnostic contract: separate local-delivery
+and overall-review states, actual authenticated coverage identity/counts,
+signed-verification state and actual finish/check outcomes, plus concrete
+blockers/inventory paths. Use `blocked_not_run` only when neither check could run,
+`not_verified` for pending checks, `failed` for an actual failed attempt, and
+`verified` only after both succeed. Retain and reference any
+existing `blocked-signature-verification.json` diagnostic. Only actual successful
+finish/check permits verified knowledge coverage. These diagnostics neither
+authorize nor block ordinary publication; record the ordinary review/publication
+outcome separately from knowledge completeness.
+Copy `interruption_reason: target_unverifiable_before_dispatch` from the trusted
+coordinator summary into the delivery manifest when present. Never derive it
+from blocker prose or missing reviewer output. Keep the actual ordinary review
+and publication states unchanged.
+
+
+When an authenticated memory snapshot is available, after the engine finishes
+write per-observation dispositions and run `local-memory.py record-run`,
+as defined in the memory reference before cleanup/posting. Account once for every ID in the
+union of top-level and local-rule supporting observations, marking unexamined
+claims `not_assessed`; do not invent evidence or influence.
+Report the actual memory change digest and applied/contradicted knowledge to
+the invoking user. With `memory: off`, skip this recording step.
+
+### 3a. Learn and activate local rules
+
+After a successful completed review (not an infrastructure/protocol failure),
+when memory and rules are enabled, follow the **automatic incremental** workflow
+in `../review-anvil/references/rule-promotion.md`. Retain the original signed
+preparation whose feedback checkpoint was actually applied for this review:
 
 ```bash
-bash <helper-path> post "$HOST" "$OWNER" "$REPO" "$N" "$MARKER" "$REPORT_PATH"
+python3 <memory-helper> rules-prepare owner/repo --prepared /private/run/prepared.json --output /private/run/rules-context.json
 ```
 
+If both signed `incremental.changed_observation_ids` and `affected_rule_keys`
+are empty, skip model learning and activation entirely. Otherwise use the
+compact `current_rules` index to choose related actual native topics with the
+existing invoking model/orchestrator, not an extra model cohort. `known_rules`
+preserves historical identities only: never select a historical-only key with
+`--related-key` or resurrect its old criterion; it may identify a genuinely new
+delta-backed topic. Re-prepare from the same original preparation with repeated
+`--related-key KEY` flags when needed, then read complete original human discussions
+for all scoped support. Compare complete candidate texts/scopes/conditions/types,
+exceptions and support IDs with related saved topics, not only matching keys.
+Merge equivalent recommendations under the currently supported canonical stable
+key/ID and union genuine support, preferring current topics over historical
+aliases. Preserve author qualifications, exceptions and optional obligations;
+do not strengthen a preference to deduplicate it. Every activated observation
+must itself have substantive human-discussion support: descriptions/code and
+bot/generated output alone remain context-only or triage. Assess only this signed
+delta/affected closure against current default-branch policy and this review's
+captured base-side policy. Use ordinary `rules-apply` to merge authorized topics
+even with `post: false`. An empty scoped assessment removes only affected topics,
+never unrelated rules; unresolved conflicts remain `needs-triage`. Never use
+bare `rules-prepare`, recollect a replacement preparation, or fall back to
+full-history learning after an incremental failure. No extra model/provider,
+approval gate or automatic retry is introduced. No branches, commits, PRs
+or reviewed-repository writes are allowed for learning. Manual policy remains
+authoritative; public review output and ordinary posting behavior stay unchanged.
+
+The completed review keeps its original snapshot; the next review loads the
+new rules automatically. If activation fails, retain diagnostics and report
+the failure separately without erasing a completed review or claiming learning.
+Normal review posting remains governed by step 4. With `rules: off`, skip
+generation but retain supported saved rules already frozen at step 1a.
+With `memory: off`, skip all local rule loading, generation and recording.
+
+**All-mode ordering:** keep generation/activation after ordinary delivery so
+the frozen audit is not modified mid-run. Record the knowledge audit outcome
+first; a missing completion sidecar does not block normal delivery or original
+learning eligibility. Never generate evidence from unassessed material or mark
+unexamined observations used. Preserve the original successful-review learning
+conditions and `rules: off`; `post: false` alone does not disable local learning.
+Retain trusted preparation/snapshot and memory artifacts needed for learning.
+
+When `post: false`, skip step 4 completely, retain local report and available
+private audit artifacts, and print the report path and snapshot digest. Do not
+call post/resolve helpers or submit any GitHub mutation. Otherwise continue to
+step 4 for a usable validated ordinary report even if knowledge is incomplete.
+Record deferred learning only when its original success/evidence conditions hold.
+
+### 4. Post
+
+Before dispatch, retain the exact PR target object used for the ordinary reviewer
+context (including `number` and `body`) as owner-only JSON. In all mode use the
+`target` object from the verified frozen diff snapshot. Carry its absolute path
+through any verified diff replacement, using only the replacement's reviewed
+target when posting. Never substitute a fresh PR description for this baseline.
+
+```bash
+REVIEW_ANVIL_FROZEN_TARGET="$FROZEN_TARGET_JSON" \
+  bash <helper-path> post "$HOST" "$OWNER" "$REPO" "$N" "$MARKER" "$REPORT_PATH"
+```
+
+The posting helper preserves the original report/history/event controls; it does
+not call `coverage-check` and does not require a knowledge sidecar. Knowledge
+receipts remain private diagnostics, never inputs to the PR body or a publication
+prerequisite. Do not freeze an internal-audit notice into the renderer input or
+public summary. Only concrete author-relevant code limitations belong there.
+Verify the current review target through the existing engine freshness checks.
+The helper compares the live description with the frozen one immediately before
+submission. A mismatch adds a note to the main publication body only; it does
+not change the event, start a new review, or affect the validated report.
+Persisted `.no-post` or `REVIEW_ANVIL_NO_POST=1` remains a mechanical veto even
+when the post helper is called accidentally.
+
+After successful all-mode publication, perform deferred step 3a when enabled;
+report a learning failure separately from successful publication.
+
 The script chooses the GitHub review event from `<REPORT_PATH>.approval.json` (`APPROVE` or `COMMENT`; default `COMMENT` if absent) and then posts the report:
+- **Single review submission.** Submit the selected `APPROVE` or `COMMENT` once, with a concise main body and every anchored line comment, including low/nit. Changed-file suggestions without a specific diff line use separate file comments (`subject_type: file`); the batch review endpoint does not document file subjects. Send each file comment at most once through its documented endpoint, using the captured head. No model rewrite or repeated review is needed.
+- **Failed or unknown delivery.** Retain actual outcomes and local artifacts. Never resend the review, retry a file comment, omit rejected anchors and retry, downgrade, or fall back to `gh pr comment`. File-comment failure after a confirmed review is partial delivery, not a completely failed or completely successful POST. Preserve the confirmed review URL and inspect `<REPORT_PATH>.file-comments-result.json` for actual per-file outcomes. Do not ask for repair/resume; finish with truthful local status. A marker alone never proves delivery.
+File comments require the reviewed `head_sha` retained in `.approval.json`; a
+fresh live head cannot substitute for the commit whose code was assessed.
 
-- **Approval / hybrid review.** If the decision is `APPROVE`, the helper submits a GitHub approval review. If `<REPORT_PATH>.inline.json` is non-empty, its comments are included as non-blocking findings or suggestions; by default the helper posts `critical`/`high`/`medium` inline comments and leaves lower-severity items self-contained in the top-level body unless `REVIEW_ANVIL_INLINE_MIN_SEVERITY` is lowered. Otherwise the approval has only the top-level body. If GitHub rejects the inline anchors but accepts a body-only approval, the helper puts those inline bodies under the same collapsed `Finding details` section before approval so no action disappears. Use this when there are no `critical`/`high` actionable in-scope findings; medium-and-lower issues are posted but left to the author. If GitHub rejects the approval (most commonly: you cannot approve your own PR), the helper **downgrades to a comment review**, appends a note to the report explaining the downgrade, and keeps cascading down to the top-level fallback — a failed approval never costs the report. An unexpected or malformed `approval.json` likewise defaults to `COMMENT`, never to `APPROVE`.
-- **Comment review.** If the decision is `COMMENT` and `<REPORT_PATH>.inline.json` exists and is non-empty, the script assembles a PR review payload (`{event: COMMENT, body: <report>, comments: [...]}`) and submits it via `gh api /repos/{O}/{R}/pulls/{N}/reviews`. This produces ONE review event in the PR timeline with a top-level summary body AND inline review comments anchored to specific files+lines — the native GitHub review UX. The API response's `html_url` is used directly (no marker lookup needed).
-- **Top-level fallback.** If the decision is `COMMENT` and `<REPORT_PATH>.inline.json` is absent or empty (no findings had `file`+`line`), or if the PR-review API call fails (most common cause: reviewer-supplied line numbers aren't in the PR's diff), the script appends the processed inline bodies under one collapsed `Finding details` section before posting `gh pr comment --body-file <REPORT_PATH>`. It then recovers the URL via paginated marker lookup with one retry for read-after-write lag. This keeps the summary readable while preserving the only copy of each detailed diagnosis and request.
+Before every review POST, including body-only and line-only payloads, the helper
+exclusively creates `<REPORT_PATH>.file-comments-result.json`. This attempt
+receipt remains after success or an unknown response and prevents another POST.
+No-post and validation failures detected before this claim do not consume an attempt.
 
-In all paths, the marker UUID is prepended to the report body (idempotently — retries don't stack markers) before posting, so URL recovery remains possible even on the fallback path. An `APPROVE` decision is additionally checked against the PR's current head SHA and downgraded to `COMMENT` if the PR moved since the review.
+The marker UUID is prepended before submission. The complete local source retains
+all finding tables. The outgoing main body removes duplicate routed finding rows
+and resulting empty tables while retaining general/unanchored findings and
+unrelated context. Each native comment keeps its full diagnosis and work clauses.
 
-**GitHub comment shape.** The engine writes one headingless line containing one or two neutral detection sentences, with no decision label or review mechanic. Every active finding stays in a collapsed fixed table showing severity, location, complete detail, and the requested or suggested change. Detailed facts and requested work also live in inline comments when GitHub can anchor them. Review context, prior feedback, changes, and dispositions are collapsed; the review-anvil footer is the absolute final nonblank line. The helper posts that body without shortening it. On a top-level fallback it inserts otherwise-unpublished inline bodies and its idempotency marker before the footer under one count-free collapsed `Finding details` section. If GitHub rejects an unusually large payload, posting fails with the report left at `<REPORT_PATH>` so the running agent can rewrite it without dropping facts or actions.
+**Review comment shape.** Process every verified line/file anchor in `<REPORT_PATH>.inline.json` regardless of severity. Keep diagnosis as prose, label requested work, and end with hidden `id`, `severity`, and `area` metadata. A file comment has `path` and explicit `subject_type: file`, no line/side/range/position fields and no executable suggestion. A line comment retains its exact verified diff anchor. Strip helper-only fields, insert safe line suggestions/reintroduction metadata before the final finding marker, and never invent an anchor.
 
-**Inline comment shape.** Before submitting a PR review, the helper filters `<REPORT_PATH>.inline.json`. Inline comments default to `critical`/`high`/`medium` findings (`REVIEW_ANVIL_INLINE_MIN_SEVERITY=medium`); lower-severity findings remain self-contained in the top-level report. Each new body keeps the diagnosis as prose, labels requested work, and ends with hidden `id`, `severity`, and `area` metadata. The helper strips helper-only JSON fields before calling GitHub, inserts any safe exact suggestion and reintroduced-prior-feedback marker before the finding metadata, and keeps the finding marker as the final line.
-
-The helper-only `"severity"` must match the terminal marker severity exactly; the helper aborts before filtering or posting when they disagree.
+The helper-only `"severity"` must match the terminal marker severity exactly; the helper aborts before posting when they disagree.
 A present but unrecognized helper severity also aborts; an absent helper field may use the terminal marker during migration.
 
 **Finding context.** The helper validates `<REPORT_PATH>.context.json` (schema in `../review-anvil/references/report-artifacts.md`) and embeds each finding's record as one hidden `<!-- review-anvil: context={…} -->` line at the end of the top-level report, before the footer, for every finding the report still lists, including findings that also get an inline comment. It drops invalid items with a warning; a missing or malformed file, or a report block that would exceed the size budget, never blocks the post.
 
-**Prior-feedback continuity.** Before review, the engine fetches every root review thread with open/resolved/outdated state, replies from the PR author, and findings from earlier review-anvil review bodies and fallback comments. Reviewers must account for every ledger item and validate author explanations against the current code; GitHub `resolved` means only that the discussion closed, not that the code was proven fixed. Immediately before posting, the helper refreshes this paginated history. If that refresh would remove, demote, or suppress an item from a compact report, posting fails closed and leaves the artifacts for a rerun so the visible summary can be rendered from the refreshed inventory; the helper never leaves a stale summary over a changed finding set. Legacy report forms retain compatible duplicate suppression. Different canonical IDs never collapse solely because prose is similar.
+**Pre-render classification.** Before freezing the canonical packet, the engine
+runs the trusted helper's `classify-feedback <host> <owner> <repo> <n>
+<canonical_json>` command. It reads the provisional packet without modifying it
+and emits reconciled JSON on stdout using the same candidate classifier as the
+post-time refresh. Build the summary, source, inline inventory and approval
+from that output. Known unchanged findings retain their original identities
+and severity in Earlier feedback instead of being delivered again; explicit
+reintroduction and serious-history approval rules remain unchanged. This
+read-only preparation also applies with `post: false` and performs no review
+submission or resolution. A classification failure does not authorize an
+unfiltered post or a renderer/reviewer retry.
+
+**Prior-feedback continuity.** Before review, the engine fetches every root review thread with open/resolved/outdated state, replies from the PR author, and findings from earlier review-anvil review bodies and fallback comments. Reviewers must account for every ledger item and validate author explanations against the current code; GitHub `resolved` means only that the discussion closed, not that the code was proven fixed. Immediately before posting, the helper refreshes this paginated history. Rows explicitly marked `disposition=deferred` or `disposition=outside` are historical/context dispositions, not active delivery or reintroduction candidates; preserve them without demoting them again. They still delimit finding blocks, and unresolved critical/high prior feedback still restricts approval. If that refresh would remove, demote, or suppress an active item from a compact report, posting fails closed and leaves the artifacts for a rerun so the visible summary can be rendered from the refreshed inventory; the helper never leaves a stale summary over a changed finding set. Legacy report forms retain compatible duplicate suppression. Different canonical IDs never collapse solely because prose is similar.
 
 Only the PR author resolving a GitHub review thread creates `author-resolved` status. This requires the API-confirmed `resolvedBy` identity to match the PR author; ordinary thread resolution remains `resolved` and is revalidated. After a successful review delivery, the helper also processes `<REPORT_PATH>.resolutions.json`. The artifact binds its dispositions to the `HEAD_SHA` captured by `init`; a non-empty artifact is rejected if the live PR head differs. The helper resolves only still-open roots with a live terminal review-anvil finding marker and the exact requested finding ID. Allowed dispositions are `fixed`, `stale`, and `author-explanation-accepted`; the last also requires a live PR-author reply. Human-authored/non-anvil threads are never resolved, and an `outdated` anchor alone does not qualify.
 
@@ -156,9 +449,28 @@ Only the PR author resolving a GitHub review thread creates `author-resolved` st
 
 **Cleanup on success.** After a successful post (comment or approval), the helper removes `<REPORT_PATH>`, `<REPORT_PATH>.inline.json`, `<REPORT_PATH>.resolutions.json`, `<REPORT_PATH>.approval.json`, `<REPORT_PATH>.followups.json`, and `<REPORT_PATH>.context.json`, then removes the self-ignored parent directory when no other report artifacts remain. If review delivery succeeds but thread resolution fails, it keeps `.resolutions.json` for retry with `bash <helper-path> resolve "$HOST" "$OWNER" "$REPO" "$N" "<resolutions-path>"` and cleans the other transient artifacts. Retained proof bundles live in a separate host-created private directory outside the worktree and are unchanged. On any abort (`die`), report artifacts are also left in place so the user can inspect or post manually.
 
+The helper also removes successful-run `.rule-coverage` and `.no-post`
+markers. It deliberately retains the private signed `.coverage.json`
+per-rule audit; never publish its full contents or treat a historical report
+as current coverage after the catalog or evidence changes.
+Retain `<REPORT_PATH>.delivery.json`, signature diagnostics and any actual
+`.file-comments-result.json` receipt, including partial/unknown outcomes.
+The selected pre-publication source remains in `.full.md` and
+`.inline.source.json`; `.posting.md`/`.posting.inline.json`/`.posting.files.json`
+are transient publication projections. Retain source evidence and actual receipts
+without treating them as permission to resend.
+Local artifact delivery never implies exhaustive knowledge or complete publication.
+Keep event/approval reasons, overall status and second-check mechanics in private
+metadata/delivery artifacts. They are not mandatory visible Review context.
+Show the author only concrete code outcomes, scope, actual checks and useful
+limitations; omit generic sentences that old suggestions or questions remain.
+
 ### 5. Report back
 
-Surface the URL (or `posted (URL unavailable)`) to the user. If the helper script exited non-zero from `post`, surface its stderr; the report still exists on disk at `<REPORT_PATH>` for manual posting.
+Surface the confirmed review URL even when a later file comment failed. Inspect
+the actual file receipt and report partial delivery separately. A nonzero helper
+exit does not imply that nothing was posted. Retain local evidence; do not
+recommend automatic or manual resubmission of an already attempted review.
 
 ## Examples
 
@@ -171,8 +483,12 @@ Surface the URL (or `posted (URL unavailable)`) to the user. If the helper scrip
 ## Constraints
 
 - Requires `gh`, `uuidgen`, `jq` (a real binary — gh's `--jq` is built-in gojq and doesn't count), and `uv` (preferred; falls back to `python3`) for PR-feedback history handling. `init` preflights all of these so a missing dependency fails before the expensive review, not after.
-- Environment switches honored by the helper: `REVIEW_ANVIL_NO_APPROVE=1` (never submit an approval), `REVIEW_ANVIL_POST_INFRA_FAILURES=1` (manual-debug escape hatch that allows posting infrastructure-failure reports; default is to refuse them so watchdogs retry instead of notifying authors), `REVIEW_ANVIL_SKIP_DISMISSED=1` (legacy name: skip the full PR-history lookup for hosts without GraphQL access — degraded mode that also forces COMMENT), `REVIEW_ANVIL_DISMISSALS=<path>` (local-suppressions file, default `~/.review-anvil/dismissed-findings.json`; record entries with `pr-helper.sh dismiss <host> <owner> <repo> <n> <path> <pattern> [<reason>]`), `REVIEW_ANVIL_INLINE_MIN_SEVERITY=<critical|high|medium|low|nit>` (minimum severity posted inline; default `medium`), and `REVIEW_ANVIL_ENABLE_SUGGESTIONS=0` (disable helper-added GitHub suggestion blocks).
-- **An `APPROVE` decision submits a real GitHub approval from your authenticated `gh` account.** It counts toward branch-protection required reviews and reads to collaborators as your judgment — while the gate behind it is the engine's LLM classification. If that posture isn't acceptable for a repo or org, pass `approve: never` (or "never approve" / "comment only") and the run always posts plain `COMMENT` reviews. `REQUEST_CHANGES` is deliberately unsupported: blocking someone's merge on LLM judgment is a different risk class from commenting or approving.
+- Environment switches honored by the helper: `REVIEW_ANVIL_NO_APPROVE=1` (never approve), `REVIEW_ANVIL_POST_INFRA_FAILURES=1` (manual-debug escape hatch; ordinarily infrastructure reports stay local), `REVIEW_ANVIL_SKIP_DISMISSED=1` (legacy name: skip full PR-history lookup, forcing COMMENT), `REVIEW_ANVIL_DISMISSALS=<path>` (local suppression file), and `REVIEW_ANVIL_ENABLE_SUGGESTIONS=0` (disable helper-added executable suggestions). Comment placement follows verified anchors, not a severity threshold.
+- Use the engine's normal approval policy: a clean or low/nit-only review can
+  submit `APPROVE` once its existing safety gates pass. Explicit no-approve
+  requests, `post: false` and the helper's existing approval restrictions still
+  apply. Do not promise COMMENT-only delivery before assessing the review unless
+  an actual restriction requires it. `REQUEST_CHANGES` remains unsupported.
 - What lands on the PR has passed the engine's reproduction/verification gates:
   uncertain `medium`+ findings are checked against the actual reviewed snapshot
   before posting. When a trusted `proof_runner` is configured, behavior claims
@@ -191,11 +507,12 @@ Surface the URL (or `posted (URL unavailable)`) to the user. If the helper scrip
   approval downgrades.
 - Read-only by design — the PR's branch may not be checked out locally, and pushing fix commits to a PR you don't own is rarely the intent. If you want to fix-and-commit on a PR you have checked out, activate `review-anvil` directly with `target: branch` (your checked-out PR branch) and `commit_mode=per_fix` — the local working tree becomes the source of truth and the diff against the merge base is unambiguous.
 - Supports github.com and GitHub Enterprise — the script extracts the host from the URL and sets `GH_HOST` internally for all `gh` invocations.
-- Bare-integer PR locators are rejected — pass a URL or `<owner>/<repo>#<N>` slug to be unambiguous about repo identity.
+- Short PR numbers are canonicalized against the current repository before
+  reaching the existing posting helper; always show the complete target.
 
 ## Recovery: orphaned artifacts
 
-If the orchestrator dies between the engine finishing and the post step, report artifacts remain under the artifact-local, self-ignored `.review-anvil/` directory. Re-run step 4's `post` with the captured values to publish them: the helper's head-SHA check downgrades a stale APPROVE if the PR moved in the meantime, and the marker lookup prevents duplicate posts after partial success. Successful posting removes transient report artifacts but deliberately keeps proof bundles in their separate host-created private directory. Delete retained proof bundles manually when they are no longer useful.
+If the orchestrator stops, retain the local report, selected source and publication receipts. An existing attempt receipt forbids another submission, whether delivery is confirmed, rejected or unknown. Report any confirmed URL and partial file-comment outcomes; otherwise report the unknown outcome locally. A marker or missing receipt alone does not prove that no submission occurred, especially for artifacts from older helpers. Only a report known never to have reached submission may receive its first post, after the normal target, history, report and no-post checks. Never rerun `post` to discover an earlier outcome or repeat an attempted review. Retained proof bundles remain outside the worktree until explicitly removed.
 
 ## Pairing
 
