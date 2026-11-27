@@ -1035,6 +1035,30 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         draft["report_markdown"] = opening + "\n\n- " + finding + separator + sections
         self.assertNotEqual(self.assemble_source(canonical, draft).returncode, 0)
 
+    def test_structured_source_omits_sections_removed_by_classification(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        removed = canonical["findings"].pop(0)
+        canonical["earlier_feedback"] = [{
+            "id": removed["id"], "status": "still-open", "text": "The parser concern remains.",
+        }]
+        canonical["findings"][0]["request_mode"] = "suggested"
+        for field in ("report_markdown", "metadata_inventory", "predicate_inventory", "disposition_items"):
+            draft.pop(field)
+        draft["report_items"].pop(0)
+        draft["inline_comments"].pop(0)
+        draft["summary"] = "Partial review: export was not tested.\n\nThe numeric check remains useful."
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bundle = json.loads(result.stdout)
+        report = bundle["report_markdown"]
+        self.assertTrue(report.startswith("Partial review: export was not tested. The numeric check remains useful.\n"))
+        self.assertNotIn("<summary>Issues and fixes</summary>", report)
+        self.assertIn("<summary>Optional suggestions</summary>", report)
+        self.assertIn("The parser concern remains.", report)
+        self.assertEqual(bundle["inline_comments"], draft["inline_comments"])
+        self.assertEqual(self.validate(bundle, canonical).returncode, 0)
+        self.assertNotEqual(self.assemble_source(canonical, {**draft, "inline_comments": []}).returncode, 0)
+
     def test_source_assembly_extends_existing_context_without_duplicate_metadata(self) -> None:
         canonical, draft = self.human_source_bundle()
         canonical["run_details"] = ["Two concerns checked.", "The browser check was not run."]

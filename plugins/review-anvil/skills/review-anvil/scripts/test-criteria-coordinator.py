@@ -690,6 +690,29 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         self.assertEqual(later["status"], "incomplete")
         self.assertEqual(retained, {str(path): path.read_bytes() for path in raw_paths})
 
+    def test_duplicate_group_index_preserves_ordinary_report_and_names_both_groups(self):
+        self.begin(6)
+        adapter = NativeFixture(verdict="not_applicable")
+        original = adapter.wait_one
+
+        def duplicate(handles):
+            handle, response = original(handles)
+            if len(adapter.waited) == 1:
+                group = response["result_groups"][0]
+                response["result_groups"].append(
+                    {**group, "indices": [0], "evidence": "A separate applicability argument."})
+            return handle, response
+
+        adapter.wait_one = duplicate
+        summary = self.coordinator(adapter).run(self.reviewers)
+        self.assertEqual(summary["status"], "incomplete")
+        self.assertEqual(len(summary["normal_review_paths"]), 6)
+        self.assertEqual(len(summary["acknowledged_review_paths"]), 5)
+        self.assertEqual(len(adapter.requests), 6)
+        self.assertEqual(len(summary["errors"]), 1)
+        self.assertIn("Duplicate coverage assignment index 0 in groups 0 and 1",
+                      summary["errors"][0])
+
     def test_supplemental_failure_cannot_rescue_foreign_or_unfinished_ordinary_reports(self):
         for invalid in ({"reviewer_id": "foreign"}, {"review_markdown": "Plan only; no review."}):
             with self.subTest(invalid=invalid):

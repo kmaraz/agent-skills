@@ -854,6 +854,12 @@ if mode == "classify":
         for field in ("findings", "earlier_feedback", "report_ids")
     ):
         raise SystemExit("pr-helper: classify-feedback requires findings, earlier_feedback and report_ids arrays")
+    # Normalize the unsealed draft only. Frozen and rendered bundles remain strict.
+    for finding in packet["findings"]:
+        if isinstance(finding, dict) and finding.get("request_mode") == "optional":
+            finding["request_mode"] = "suggested"
+        elif isinstance(finding, dict) and "request_mode" in finding and finding["request_mode"] not in ("required", "suggested"):
+            raise SystemExit(f"pr-helper: unsupported request_mode for {finding.get('id')}")
     if os.environ.get("REVIEW_ANVIL_SKIP_DISMISSED") == "1":
         print("warning: REVIEW_ANVIL_SKIP_DISMISSED=1 — skipping prior-feedback classification (degraded mode)", file=sys.stderr)
         if packet.get("decision") == "APPROVE":
@@ -1028,6 +1034,7 @@ HUMAN_REPORT_TABLE_RE = re.compile(
     r"(?P<location>(?:\\\||[^|\n])+?)\s*\|\s*"
     r"(?P<issue>(?:\\\||[^|\n])+?)\s*\|\s*"
     r"(?P<action>(?:\\\||[^|\n])+?)\s+"
+    rf"(?:(?P<reintroduced>{re.escape(REINTRODUCED_MARKER)})\s+)?"
     rf"<!--\s*review-anvil-report:\s*id=(?P<finding_id>{FINDING_ID_PATTERN})\s+"
     r"severity=(?P<severity>critical|high|medium|low|nit)\s+"
     r"area=(?P<area>[A-Za-z0-9][A-Za-z0-9._/-]*)\s+"
@@ -1036,6 +1043,16 @@ HUMAN_REPORT_TABLE_RE = re.compile(
     r"\s*\|\s*$",
     re.I,
 )
+
+def report_has_reintroduction(line, following=""):
+    if following.strip() == REINTRODUCED_MARKER:
+        return True
+    if REINTRODUCED_MARKER not in line:
+        return False
+    row = HUMAN_REPORT_TABLE_RE.fullmatch(line)
+    return bool(row and row.group("reintroduced"))
+
+
 EARLIER_FEEDBACK_RE = re.compile(
     r"^\s*[-*]\s+\*\*(?P<status>open|resolved|still-present|fixed|stale|reported|deferred|outside|review-dismissed|suppressed|author-resolved|author-explanation-accepted)\*\*"
     r"\s*[-—:]+\s*(?P<text>.+?)\s*$",
@@ -1761,7 +1778,7 @@ def report_findings(node):
                           "source": node.get("url") or "prior-review-anvil-report",
                           "status": status,
                           "severity": severity_from_body(finding_body),
-                          "prior_feedback": None,
+                          "prior_feedback": "reintroduced" if report_has_reintroduction(line) else None,
                           "outdated": False,
                           **identity})
             last_finding = found[-1]
@@ -1979,8 +1996,8 @@ if report is not None and report.exists():
                 **identity_from_body(line),
             }
             delivery_candidates.append(candidate)
-            if (index + 1 < len(report_lines)
-                    and report_lines[index + 1].strip() == REINTRODUCED_MARKER):
+            following = report_lines[index + 1] if index + 1 < len(report_lines) else ""
+            if report_has_reintroduction(line, following):
                 reintroduced_candidates.append(candidate)
 
 def canonical_candidate(item):
@@ -2244,14 +2261,9 @@ if report.exists():
             cand = {"path": path_from_block(block), "start_line": start_line,
                     "line": end_line, "sig": signature(block_body),
                     **identity_from_body(block_body)}
-            hit, reintroduced, bypass_closed_feedback, disposition = classify_candidate(
-                cand, False,
-                len(block) > 1 and block[1].strip() == REINTRODUCED_MARKER,
-            )
-            marked_block = (
-                block if len(block) > 1 and block[1].strip() == REINTRODUCED_MARKER
-                else [block[0], REINTRODUCED_MARKER, *block[1:]]
-            )
+            already_marked = report_has_reintroduction(block[0], block[1] if len(block) > 1 else "")
+            hit, reintroduced, bypass_closed_feedback, disposition = classify_candidate(cand, False, already_marked)
+            marked_block = block if already_marked else [block[0], REINTRODUCED_MARKER, *block[1:]]
             report_reintroduced |= reintroduced and marked_block != block
             if hit:
                 matched_history.append((hit, severity_from_body("\n".join(block)), bypass_closed_feedback))
@@ -2460,7 +2472,7 @@ cmd_next_run() {
         [[ -n "${!v}" ]] || die "next-run: missing <$v>"
     done
     if [[ "${REVIEW_ANVIL_SKIP_DISMISSED:-}" == "1" ]]; then
-        printf 'pr-helper: warning: PR run ordinal unavailable; REVIEW_ANVIL_SKIP_DISMISSED=1 enables degraded mode; IDs will omit RUN\n' >&2
+        printf 'pr-helper: warning: PR run ordinal unavailable; REVIEW_ANVIL_SKIP_DISMISSED=1 enables degraded mode\n' >&2
         printf 'unavailable\n'
         return 0
     fi
@@ -2469,7 +2481,7 @@ cmd_next_run() {
     if ordinal=$(_review_history_py next-run "$owner" "$repo" "$n"); then
         printf '%s\n' "$ordinal"
     else
-        printf 'pr-helper: warning: PR run ordinal unavailable; IDs will omit RUN\n' >&2
+        printf 'pr-helper: warning: PR run ordinal unavailable\n' >&2
         printf 'unavailable\n'
     fi
 }
@@ -2673,8 +2685,11 @@ cmd_init() {
     # are not inside a git worktree (degenerate but tolerated).
     local anchor
     anchor=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-    local marker report_path
+    local marker report_path finding_namespace
     marker=$(uuidgen | tr '[:upper:]' '[:lower:]')
+    # A history count is not unique among concurrent invocations.
+    finding_namespace=$(_py -c 'import sys, uuid; print(uuid.UUID(sys.argv[1]).int)' "$marker") \
+        || die "init: invalid review marker"
     _ensure_artifact_dir "$anchor/.review-anvil"
     # Emit an absolute path so the engine writes to and the post step
     # reads from the same file regardless of CWD changes between
@@ -2694,6 +2709,7 @@ cmd_init() {
     printf 'REPO=%s\n' "$repo"
     printf 'N=%s\n' "$n"
     printf 'RUN_ORDINAL=%s\n' "$run_ordinal"
+    printf 'FINDING_NAMESPACE=%s\n' "$finding_namespace"
     printf 'HEAD_SHA=%s\n' "$head_sha"
     printf 'MARKER=%s\n' "$marker"
     printf 'REPORT_PATH=%s\n' "$report_path"
@@ -2837,6 +2853,22 @@ cmd_post() {
     if jq -e 'length > 0' "$posting_inline" >/dev/null; then
         submission_inline="$posting_inline"
     fi
+    if [[ -n "${REVIEW_ANVIL_FROZEN_TARGET:-}" ]]; then
+        local reviewed_body live_target live_body
+        if reviewed_body=$(jq -ce --arg n "$n" \
+                'select((.number | tostring) == $n) | .body | strings' "$REVIEW_ANVIL_FROZEN_TARGET") \
+            && live_target=$(gh pr view "$n" -R "$owner/$repo" --json body) \
+            && live_body=$(jq -ce '.body | strings' <<<"$live_target"); then
+            if [[ "$reviewed_body" != "$live_body" ]]; then
+                append_review_context_note "$posting_report" \
+                    "The PR description changed during review. This review is based on the earlier version of the description." \
+                    || printf 'warning: could not add PR description change notice\n' >&2
+            fi
+        else
+            printf 'warning: could not compare the current PR description with the reviewed version\n' >&2
+        fi
+    fi
+
     # Claim this publication exclusively for every payload shape. Even an
     # unconfirmed response is terminal: a later invocation must not resend it.
     (umask 077; set -o noclobber

@@ -43,11 +43,13 @@ HUMAN_REPORT_ITEM_RE = re.compile(
     r"line=(?P<line>\d+|-)\s+"
     r"disposition=(?P<disposition>active|deferred|outside)\s*-->\s*$"
 )
+REINTRODUCED_MARKER = "<!-- review-anvil: prior_feedback=reintroduced -->"
 HUMAN_REPORT_TABLE_ROW_RE = re.compile(
     r"^\|\s*(?P<visible_severity>Critical|High|Medium|Low|Nit)\s*\|\s*"
     r"(?P<location>(?:\\\||[^|\n])+?)\s*\|\s*"
     r"(?P<issue>(?:\\\||[^|\n])+?)\s*\|\s*"
     r"(?P<action>(?:\\\||[^|\n])+?)\s+"
+    rf"(?:(?P<reintroduced>{re.escape(REINTRODUCED_MARKER)})\s+)?"
     rf"<!--\s*review-anvil-report:\s*id=(?P<id>{FINDING_ID_PATTERN})\s+"
     r"severity=(?P<severity>critical|high|medium|low|nit)\s+"
     r"area=(?P<area>[A-Za-z0-9][A-Za-z0-9._/-]*)\s+"
@@ -494,9 +496,12 @@ def validate_report_items(
             if shape.group("location") != expected_location:
                 raise InvalidBundle(f"{finding_id} report location changed")
         metadata = shape
-        if prior_feedback == "reintroduced":
-            reintroduced = body + "\n<!-- review-anvil: prior_feedback=reintroduced -->"
-            if report.count(reintroduced) != 1:
+        if human_style:
+            marked = prior_feedback == "reintroduced"
+            if bool(shape.group("reintroduced")) != marked or body.count(REINTRODUCED_MARKER) != int(marked):
+                raise InvalidBundle(f"{finding_id} prior-feedback metadata changed")
+        elif prior_feedback == "reintroduced":
+            if report.count(body + "\n" + REINTRODUCED_MARKER) != 1:
                 raise InvalidBundle(f"{finding_id} prior-feedback metadata changed")
         finding = findings[finding_id]
         if metadata.group("severity") != finding.get("severity"):
@@ -779,6 +784,65 @@ def prepare_action_audit_rows(
                             original["rendered_body"], item["rendered_body"], disposition=True))
     return rows
 
+def _assemble_source_layout(canonical: dict[str, Any], source: dict[str, Any]) -> str:
+    """Place authored prose and rows in sections owned by the classified packet."""
+    summary = source.pop("summary")
+    if not isinstance(summary, str):
+        raise InvalidBundle("source summary must be a string")
+    findings = indexed_findings(canonical)
+    source.setdefault("decision", canonical.get("decision"))
+    source.setdefault("predicate_inventory", [
+        {"id": finding_id, "requested_work": finding.get("requested_work")}
+        for finding_id, finding in findings.items()
+    ])
+    sections: dict[str, list[str]] = {
+        "Issues and fixes": [],
+        "Optional suggestions": [],
+        "Set aside": [],
+        "Outside this change": [],
+    }
+    for field in ("report_items", "disposition_items"):
+        items = source.get(field)
+        if not isinstance(items, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("rendered_body"), str)
+            for item in items
+        ):
+            raise InvalidBundle(f"{field} must contain complete report rows")
+    report_items = []
+    for item in source["report_items"]:
+        finding_id = item.get("id")
+        if not isinstance(finding_id, str) or finding_id not in findings:
+            raise InvalidBundle("source row does not belong to the classified findings")
+        finding = findings[finding_id]
+        body = item["rendered_body"]
+        if (finding.get("prior_feedback") == "reintroduced" and REINTRODUCED_MARKER not in body
+                and (row := HUMAN_REPORT_TABLE_ROW_RE.fullmatch(body))):
+            end = row.end("action")
+            body = body[:end] + " " + REINTRODUCED_MARKER + body[end:]
+            item = {**item, "rendered_body": body}
+        report_items.append(item)
+        label = "Issues and fixes" if finding_request_mode(finding) == "required" else "Optional suggestions"
+        sections[label].append(body)
+    source["report_items"] = report_items
+    dispositions = structured_dispositions(canonical)
+    if len(dispositions) != len(source["disposition_items"]):
+        raise InvalidBundle("disposition item inventory changed")
+    for expected, item in zip(dispositions, source["disposition_items"], strict=True):
+        label = "Set aside" if expected["disposition"] == "deferred" else "Outside this change"
+        sections[label].append(item["rendered_body"])
+    blocks = [" ".join(line.strip() for line in summary.splitlines() if line.strip())]
+    for label, rows in sections.items():
+        if not rows:
+            continue
+        if label == "Issues and fixes":
+            rows = [ISSUES_TABLE_HEADER, TABLE_SEPARATOR, *rows]
+        elif label == "Optional suggestions":
+            rows = [SUGGESTIONS_TABLE_HEADER, TABLE_SEPARATOR, *rows]
+        content = "\n".join(rows)
+        blocks.append(f"<details>\n<summary>{label}</summary>\n\n{content}\n\n</details>")
+    return "\n\n".join([*blocks, REVIEW_FOOTER]) + "\n"
+
+
 def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
     """Construct initial frozen context; never repair renderer or fallback output."""
     if canonical.get("report_style") != "human-summary":
@@ -787,6 +851,10 @@ def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[st
     if "disposition_items" not in source and not structured_dispositions(canonical):
         source["disposition_items"] = []
     source.setdefault("metadata_inventory", {field: canonical.get(field) for field in METADATA_FIELDS})
+    if "summary" in source:
+        if "report_markdown" in source:
+            raise InvalidBundle("source draft cannot supply both summary and report_markdown")
+        source["report_markdown"] = _assemble_source_layout(canonical, source)
     report = source.get("report_markdown")
     if not isinstance(report, str):
         raise InvalidBundle("report_markdown must be a string")

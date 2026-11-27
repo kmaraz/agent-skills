@@ -316,6 +316,10 @@ python3 <memory-helper> coverage-check --report <REPORT_PATH>.coverage.json --re
 ```
 
 These commands authenticate complete knowledge accounting against the actual frozen strategy/phase, source/catalog/checkpoint and fresh target. They are private diagnostics, not publication prerequisites. Preserve historical report shapes/signatures and never fabricate successful completion.
+The signed target retains the original description. A live description edit
+does not invalidate coverage of that snapshot; both commands report it as
+`description_changed` in their unsigned diagnostics. This does not certify
+coverage of the new description or relax any other freshness check.
 
 Keep existing root-cause deduplication, scope/confidence checks, exhaustive synthesis, selective reproduction, adversarial review, clarity, freshness, rendering and action-lock validation. Adjudicate every candidate as confirmed/dismissed/deferred; a rule verdict alone is not an actionable defect. Do not expose private rule/discussion text to isolated rendering or GitHub.
 
