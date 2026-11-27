@@ -457,11 +457,11 @@ class CriteriaCoordinatorTests(unittest.TestCase):
         self.assertIn("pending", pending)
         self.assertNotIn("rejected", pending)
 
-    def test_indented_terminal_findings_preserve_actual_report_without_redispatch(self):
+    def test_longer_terminal_findings_fence_preserves_actual_report_without_redispatch(self):
         self.begin(1)
         adapter = NativeFixture()
         original = adapter.wait_one
-        markdown = "# Actual ordinary review\n  ```findings\n  []\n  ```\n"
+        markdown = "# Actual ordinary review\n  ```findings\n  []\n  ````\n"
         def indented(handles):
             handle, response = original(handles)
             if response.get("reviewer_id"):
@@ -615,6 +615,31 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         self.assertEqual(summary["status"], "stopped")
         self.assertEqual(adapter.requests, [])
         self.assertEqual(summary["target_observation"]["relation"], "unknown")
+        self.assertNotIn("interruption_reason", summary)
+
+    def test_pre_dispatch_target_movement_is_classified_for_preparation_retry(self):
+        self.begin(6)
+        adapter = NativeFixture()
+        summary = CriteriaCoordinator(
+            self.backend, adapter, self.run_id, self.context,
+            observe_target=lambda: {"relation": "unknown", "github_error": {
+                "category": "target_moved", "changed_fields": ["body"]}},
+        ).run(self.reviewers)
+        self.assertEqual(adapter.requests, [])
+        self.assertEqual(summary.get("interruption_reason"), "target_unverifiable_before_dispatch")
+
+    def test_target_movement_after_dispatch_is_not_retryable(self):
+        self.begin(6)
+        adapter = NativeFixture()
+        observations = iter([{"relation": "same"}, {"relation": "same"}, {
+            "relation": "unknown", "github_error": {"category": "target_moved"},
+        }])
+        summary = CriteriaCoordinator(
+            self.backend, adapter, self.run_id, self.context, workers=2,
+            observe_target=lambda: next(observations),
+        ).run(self.reviewers)
+        self.assertTrue(adapter.requests)
+        self.assertNotIn("interruption_reason", summary)
 
     def test_nonfinite_candidate_json_does_not_abandon_original_queue(self):
         self.begin(6)
@@ -664,6 +689,29 @@ class SinglePassCoordinatorTests(unittest.TestCase):
         self.assertEqual(collector.requests, [])
         self.assertEqual(later["status"], "incomplete")
         self.assertEqual(retained, {str(path): path.read_bytes() for path in raw_paths})
+
+    def test_duplicate_group_index_preserves_ordinary_report_and_names_both_groups(self):
+        self.begin(6)
+        adapter = NativeFixture(verdict="not_applicable")
+        original = adapter.wait_one
+
+        def duplicate(handles):
+            handle, response = original(handles)
+            if len(adapter.waited) == 1:
+                group = response["result_groups"][0]
+                response["result_groups"].append(
+                    {**group, "indices": [0], "evidence": "A separate applicability argument."})
+            return handle, response
+
+        adapter.wait_one = duplicate
+        summary = self.coordinator(adapter).run(self.reviewers)
+        self.assertEqual(summary["status"], "incomplete")
+        self.assertEqual(len(summary["normal_review_paths"]), 6)
+        self.assertEqual(len(summary["acknowledged_review_paths"]), 5)
+        self.assertEqual(len(adapter.requests), 6)
+        self.assertEqual(len(summary["errors"]), 1)
+        self.assertIn("Duplicate coverage assignment index 0 in groups 0 and 1",
+                      summary["errors"][0])
 
     def test_supplemental_failure_cannot_rescue_foreign_or_unfinished_ordinary_reports(self):
         for invalid in ({"reviewer_id": "foreign"}, {"review_markdown": "Plan only; no review."}):

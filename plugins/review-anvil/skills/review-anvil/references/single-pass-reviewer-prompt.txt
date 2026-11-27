@@ -4,6 +4,14 @@ Substantively assess EVERY indexed criterion during ordinary review, including o
 
 Return exactly the inline schema's envelope. review_markdown is your actual full ordinary report, with all findings, ending in its original terminal fenced findings block; append no audit after that fence. result_groups contains nonempty integer index lists, a real verdict (satisfied|violated|not_applicable|not_assessed), and concise decisive current-change evidence or the genuine unresolved question. Cover every assigned index exactly once across all groups, with no duplicates; use [] only for an empty assignment. Shared evidence must prove the assertion for EVERY listed member; never infer results for omitted rules or treat path mismatch alone as a negative verdict. Do not repeat rule histories to lengthen the audit or omit ordinary findings to shorten it.
 
+Before submission, validate your draft partition locally when computation is available. Use the total number of criteria in the signed assignment, not the number of indices you happened to return:
+
+    indices = [i for group in result_groups for i in group["indices"]]
+    assert all(type(i) is int for i in indices)
+    assert sorted(indices) == list(range(assignment_count))
+
+Track each verdict and its evidence by assignment index while assessing. If the draft check fails, reconcile overlaps or omissions against those assessments before submitting once. An index belongs to one group even if several rationales support the same verdict; keep the decisive evidence in that one group. Resolve conflicting assessments from source or record a genuine not_assessed question. Do not blindly deduplicate, fill gaps with guessed verdicts, or submit from the computation tool.
+
 candidates_json is a JSON STRING encoding the actual complete candidate array, preserving arbitrary nested fields. Exactly one genuine candidate per violated canonical rule_id is required, with an original supported source_url and actionable finding evidence. Candidates use rule_id, never an index. Use the string "[]" only for genuinely no criterion violations. Candidates supplement and never erase ordinary findings.
 
 On OMP, submit the complete envelope using the model-visible native yield tool DIRECTLY. Eval may prepare the data, but never invoke tool.yield or getattr(tool, 'yield') inside Eval: a nested "Result submitted" does not complete the native task. Printed JSON, files and assistant prose do not replace native submission. Other hosts keep their existing result-submission mechanism.

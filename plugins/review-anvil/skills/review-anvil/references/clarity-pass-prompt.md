@@ -193,8 +193,10 @@ still shows the unencoded path. Do not show hidden fields in visible prose.
 `report_items` and `disposition_items` contain the complete byte-identical
 line, including the marker.
 
-For a reintroduced finding, copy `"prior_feedback": "reintroduced"` into the
-report and inline items and keep the existing reintroduction marker contract.
+For a reintroduced finding, preserve `"prior_feedback": "reintroduced"` in
+the report and inline items. Keep `<!-- review-anvil: prior_feedback=reintroduced -->`
+immediately before the terminal `review-anvil-report` marker in the same table
+row. Do not put it on a separate line, which would break the table.
 
 ## Human language rules
 

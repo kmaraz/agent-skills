@@ -688,6 +688,15 @@ class NativeDeadlineTests(unittest.TestCase):
         self.clock.start()
         self.addCleanup(self.clock.stop)
 
+    def test_inline_loading_preserves_the_hosts_wait(self):
+        adapter_path = HERE.parent / "references" / "coverage-omp-adapter.py"
+        native_wait = object()
+        eval_globals = {"wait": native_wait}
+
+        exec(compile(adapter_path.read_bytes(), str(adapter_path), "exec"), eval_globals)
+
+        self.assertIs(eval_globals["wait"], native_wait)
+
     def handle(self, name, *, ready=False, elapsed=0, failure=None):
         owner = self
         class Handle:
@@ -862,7 +871,7 @@ class NativeDeadlineTests(unittest.TestCase):
                 first = self.handle("first")
                 sibling = self.handle("sibling")
                 adapter = self.module.OMPNativeAdapter(lambda *args, **kwargs: None, timeout=10)
-                with patch.object(self.module, "wait", side_effect=interrupt):
+                with patch.object(self.module, "wait_for_futures", side_effect=interrupt):
                     with self.assertRaises(interrupt):
                         adapter.wait_one([first, sibling])
                 pending, outputs = [first, sibling], []

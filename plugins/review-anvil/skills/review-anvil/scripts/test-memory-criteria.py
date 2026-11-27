@@ -334,6 +334,7 @@ class CriteriaTests(unittest.TestCase):
         original = phase.read_bytes()
         valid = self.response(assignment)
         for markdown in ("success", "```json\n[]\n```", "```findings\n[]",
+                         "````findings\n[]\n```", "````text\n```findings\n[]\n````",
                          "```findings\n[]\n```\nPlease confirm before I review."):
             with self.subTest(markdown=markdown):
                 with self.assertRaises(MemoryError):

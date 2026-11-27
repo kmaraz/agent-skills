@@ -15,7 +15,7 @@ import re
 import uuid
 
 from coverage_coordinator import CoordinatorError, WorkerFailure, _Directory, _bytes, _digest
-from memory_criteria import CriteriaResponseRejected
+from memory_criteria import CriteriaResponseRejected, _has_terminal_findings
 from memory_coverage import expand_result_groups
 from memory_store import MemoryError
 
@@ -155,17 +155,7 @@ class CriteriaCoordinator:
         if not isinstance(response, dict) or response.get("reviewer_id") != reviewer_id:
             raise CoordinatorError("Ordinary review belongs to another reviewer")
         markdown = response.get("review_markdown")
-        if not isinstance(markdown, str):
-            raise CoordinatorError("Actual ordinary markdown must retain its terminal fenced findings block")
-        in_findings, findings_close, last_nonblank = False, None, None
-        for index, line in enumerate(markdown.splitlines()):
-            if line.strip():
-                last_nonblank = index
-            if re.fullmatch(r"\s*```findings\s*", line):
-                in_findings = True
-            elif in_findings and re.fullmatch(r"\s*```\s*", line):
-                findings_close, in_findings = index, False
-        if in_findings or findings_close is None or findings_close != last_nonblank:
+        if not isinstance(markdown, str) or not _has_terminal_findings(markdown):
             raise CoordinatorError("Actual ordinary markdown must retain its terminal fenced findings block")
         return markdown
 
@@ -803,6 +793,13 @@ class CriteriaCoordinator:
                 summary["target_observation"] = self.target_observation
                 if self.target_observation["relation"] == "changed":
                     summary["status"] = "superseded"
+                elif (
+                    not resume and self.strategy == "single-pass" and not self.state["tasks"]
+                    and self.target_observation["relation"] == "unknown"
+                    and isinstance(self.target_observation.get("github_error"), dict)
+                    and self.target_observation["github_error"].get("category") == "target_moved"
+                ):
+                    summary["interruption_reason"] = "target_unverifiable_before_dispatch"
             self.archive.write("last-summary.json", summary)
             return summary
         finally:

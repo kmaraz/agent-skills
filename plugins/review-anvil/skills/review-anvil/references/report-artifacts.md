@@ -104,9 +104,11 @@ reserved blocks, changed decision/metadata and unsupported fields; inserts exact
 canonical context/history through the shared visible-metadata projection; and
 runs the existing complete validator. It does not generate findings, recover
 missing rows or relax anchors. Action auditors and publication consume only the
-assembled bundle, never the raw draft. Initial `--assemble-source`, standalone
-validation, type-only renderer schemas and byte-exact fallback are unchanged.
-This is normal assembly, not a repair attempt.
+assembled bundle, never the raw draft. For initial `--assemble-source`, supply
+authored summary prose and row bodies separately from layout; the helper
+builds sections from the classified packet. Standalone validation, type-only
+renderer schemas and byte-exact fallback are unchanged. Assembly is not a
+repair attempt.
 If rendering, structural validation, or an audit verdict fails or is
 unverifiable, restore complete already-validated same-surface source bodies,
 not isolated request fragments. For malformed formatting or an invalid combined

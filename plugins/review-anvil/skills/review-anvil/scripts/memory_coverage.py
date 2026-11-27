@@ -41,7 +41,7 @@ def expand_result_groups(rule_ids: list[str], groups: list[dict]) -> list[dict]:
             raise MemoryError("Malformed or duplicate canonical coverage rule ID")
         seen_ids.add(rid)
     rows = {}
-    for group in groups:
+    for group_index, group in enumerate(groups):
         _fields(group, {"indices", "verdict", "evidence"}, "coverage result group")
         indices = group["indices"]
         if not isinstance(indices, list) or not indices:
@@ -51,8 +51,13 @@ def expand_result_groups(rule_ids: list[str], groups: list[dict]) -> list[dict]:
         _text(group["evidence"], "specific coverage evidence", 16000)
         _json(group)
         for index in indices:
-            if type(index) is not int or not 0 <= index < len(rule_ids) or index in rows:
-                raise MemoryError("Unknown, duplicate or invalid coverage group index")
+            if type(index) is not int:
+                raise MemoryError(f"Coverage group {group_index} contains a non-integer assignment index")
+            if not 0 <= index < len(rule_ids):
+                raise MemoryError(f"Coverage group {group_index} assignment index {index} is out of range")
+            if index in rows:
+                first = next(i for i in range(group_index + 1) if index in groups[i]["indices"])
+                raise MemoryError(f"Duplicate coverage assignment index {index} in groups {first} and {group_index}")
             rows[index] = {"rule_id": rule_ids[index], "verdict": group["verdict"],
                            "evidence": group["evidence"]}
     if len(rows) != len(rule_ids):
@@ -530,13 +535,14 @@ class RuleCoverage(MemoryStore):
     def _current_target(self, target, manifest):
         if not isinstance(target, dict):
             raise MemoryError("Fresh complete PR metadata is required to finalize coverage")
-        # The normal packet validator checks full PR/repository identity and sizes;
-        # comparison still includes every field rather than only head/base SHAs.
+        # Validate the full live packet. The seal authenticates the frozen body,
+        # not subsequent edits to that body. Other target fields must still match.
         host, owner, name = self.repository.split("/")
         self._packet({"schema_version": 1,
                       "repository": {"host": host, "name": owner + "/" + name, "id": manifest["repository_id"]},
                       "pr": target, "sources": []}, {"repository_id": manifest["repository_id"], "sources": {}})
-        if not _same(target, manifest["target"]):
+        frozen = manifest["target"]
+        if not _same({**target, "body": frozen["body"]}, frozen):
             raise MemoryError("Fresh PR metadata differs from the frozen coverage target; start again")
 
     def _report(self, directory, run_id, run, completed_at):

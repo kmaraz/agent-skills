@@ -37,6 +37,10 @@ Before assignment bind complete common context: verified canonical `repository`;
 
 During the existing preparation, use trusted `memory_github.read_pull_target` and
 `review_target.capture_pull_diff(..., cache_root=<owner-only-private-directory>)`.
+Run this preparation in an OMP Eval cell with `timeout: 0`; the helper's Git
+and GitHub request limits and the runner's whole-job limit still apply.
+An optional `object_repo` is used only if it contains both pinned commits
+(merge base and head); otherwise capture uses the same immutable GitHub IDs.
 Retain the complete snapshot, use its exact `diff` and frozen source identities,
 and put it in common context as `diff_snapshot`. This helper reads immutable
 objects without checkout/fetch; remote trees/blobs are verified and incomplete
@@ -81,7 +85,13 @@ Evidence-index version 2 retains `rules` and `packet_paths`, identifies `assessm
 
 ## Native OMP invocation
 
-Read `xd://eval/agents` before native use. Persistent coordinator/recovery Eval cells use `timeout: 0`; print-mode OMP uses `--wait-async`. Resolve the trusted installed engine first:
+Read `xd://eval/agents` before native use. Persistent coordinator/recovery Eval
+cells use `timeout: 0`; print-mode OMP uses `--wait-async`.
+
+Resolve the trusted installed engine and load the adapter as a separate module
+via `spec.loader.exec_module` for every native stage, including runs with memory
+off. Do not `exec` its source into Eval globals; imported names can overwrite
+OMP runtime helpers.
 
 ```python
 import importlib.util
@@ -306,6 +316,10 @@ python3 <memory-helper> coverage-check --report <REPORT_PATH>.coverage.json --re
 ```
 
 These commands authenticate complete knowledge accounting against the actual frozen strategy/phase, source/catalog/checkpoint and fresh target. They are private diagnostics, not publication prerequisites. Preserve historical report shapes/signatures and never fabricate successful completion.
+The signed target retains the original description. A live description edit
+does not invalidate coverage of that snapshot; both commands report it as
+`description_changed` in their unsigned diagnostics. This does not certify
+coverage of the new description or relax any other freshness check.
 
 Keep existing root-cause deduplication, scope/confidence checks, exhaustive synthesis, selective reproduction, adversarial review, clarity, freshness, rendering and action-lock validation. Adjudicate every candidate as confirmed/dismissed/deferred; a rule verdict alone is not an actionable defect. Do not expose private rule/discussion text to isolated rendering or GitHub.
 
@@ -336,6 +350,17 @@ Before every report-path delivery, write a bounded owner-only sibling
 - `local_delivery`: actual artifact-delivery/validation state and report path.
 - `overall_review`: actual `incomplete`, `failed` or `completed` state, separate
   from local delivery.
+- `interruption_reason`: copy `target_unverifiable_before_dispatch` only
+  when present in the trusted coordinator summary. This denotes structured
+  GitHub target movement before any reviewer attempt; never infer it from
+  empty reviewer results or blocker text. Preserve `overall_review` and
+  the actual publication state. A runner may requeue preparation once
+  under its independent process, publication, and eligibility guards.
+- `diff_checkpoint_error` when an observation returns `github_error`: copy
+  that object unchanged and add `phase` identifying the checkpoint (for example
+  `final_diff_check`). Keep this local; do not include command arguments, raw
+  stderr, or headers. An unknown diff still blocks publication and does not
+  authorize an in-session restart.
 - `coverage`: helper-issued `run_id`, authenticated `assessment_strategy`,
   repository and frozen PR/base/head identity; actual status, determinate,
   total, remaining, attempted/unvisited/unassessed and verdict counts,

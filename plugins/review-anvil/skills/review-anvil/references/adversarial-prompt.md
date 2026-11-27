@@ -107,6 +107,13 @@ Rules:
   lost edge cases, unnecessary abstractions, new dependencies, compatibility
   breaks, unsafe deletions, or tests that would become brittle or still be
   missing.
+  For substantial fixes, independently check whether the cited evidence requires
+  the proposed behavior under the exact affected conditions. Reproducing a
+  failure or citing what a platform allows does not establish that contract.
+  Use `modify` to retain a narrower, independently justified fix or suggestion,
+  or `defer` the unsupported plan when no useful narrower option remains.
+  Preserve independently supported findings; do not turn an unverified support
+  requirement into a new review defect.
 
 `second-order-bug-hunter`
 : Look only for problems introduced by following the proposed guidance or by

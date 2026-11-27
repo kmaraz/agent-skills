@@ -10,7 +10,7 @@ import re
 import subprocess
 import tempfile
 
-from memory_github import github_api, read_pull_target
+from memory_github import GitHubError, github_api, read_pull_target
 
 
 class TargetError(ValueError):
@@ -246,6 +246,12 @@ def capture_pull_diff(target, *, object_repo=None, cache_root):
     if not isinstance(comparison, dict) or comparison.get('base_commit', {}).get('sha') != base:
         raise TargetError('Foreign or incomplete comparison ancestor')
     ancestor = _oid(comparison.get('merge_base_commit', {}).get('sha'))
+    if object_repo is not None:
+        try:
+            _git(object_repo, 'cat-file', '-e', ancestor + '^{commit}')
+            _git(object_repo, 'cat-file', '-e', head + '^{commit}')
+        except TargetError:
+            object_repo = None
     root = Path(cache_root)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077:
@@ -349,6 +355,7 @@ def capture_pull_diff(target, *, object_repo=None, cache_root):
 def observe_pull_target(frozen, *, object_repo=None, cache_root):
     try:
         _snapshot_identity(frozen)
+        operation = 'read_pull_target'
         current = read_pull_target(frozen['target']['url'])
         if current['repository'] != frozen['repository'] or current['head_repository'] != frozen['head_repository']:
             return {'relation': 'integrity_failure', 'metadata_equal': False, 'snapshot': None,
@@ -358,8 +365,15 @@ def observe_pull_target(frozen, *, object_repo=None, cache_root):
             snapshot = {**frozen, **current}
             snapshot['snapshot_digest'] = _digest({key: value for key, value in snapshot.items() if key != 'snapshot_digest'})
             return compare_diff_snapshots(frozen, snapshot)
+        operation = 'capture_pull_diff'
         snapshot = capture_pull_diff(current, object_repo=object_repo, cache_root=cache_root)
         return compare_diff_snapshots(frozen, snapshot)
+    except GitHubError as exc:
+        return {'relation': 'unknown', 'metadata_equal': None, 'snapshot': None,
+                'diagnostic': ('GitHub request failed during ' + operation),
+                'github_error': {'operation': operation, 'exit_code': exc.exit_code,
+                                 'http_status': exc.http_status, 'category': exc.category,
+                                 **({'changed_fields': exc.changed_fields} if exc.changed_fields else {})}}
     except Exception as exc:
         return {'relation': 'unknown', 'metadata_equal': None, 'snapshot': None,
                 'diagnostic': f'{type(exc).__name__}: {exc}'}

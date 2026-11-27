@@ -90,15 +90,15 @@ Do not change user memory settings, replay reviewers or expose private errors.
 
 ### 0. Reject overrides of pinned params
 
-Pins for this preset: `commit_mode`, `target`, `report_path`, `run_ordinal`, `memory_snapshot`, `coverage_run`. Approval remains user-configurable. Enforce mechanically — after resolving the helper (step 1), run:
+Pins for this preset: `commit_mode`, `target`, `report_path`, `run_ordinal`, `finding_namespace`, `memory_snapshot`, `coverage_run`. Approval remains user-configurable. Enforce mechanically — after resolving the helper (step 1), run:
 
 ```bash
-bash <helper-path> check-pins review-anvil-pr "commit_mode,target,report_path,run_ordinal,memory_snapshot,coverage_run" "$ARGUMENTS"
+bash <helper-path> check-pins review-anvil-pr "commit_mode,target,report_path,run_ordinal,finding_namespace,memory_snapshot,coverage_run" "$ARGUMENTS"
 ```
 
 Non-zero exit means a pinned param was overridden in the args: surface the script's error verbatim and stop. (The engine's prose pin-rejection in "Parsing" remains as the description of the algorithm; the script is the binding layer.)
 
-The pins are non-overridable for safety: `commit_mode` enforces read-only; `target` and `report_path` are mechanically tied to the user's locator; and `run_ordinal` carries the helper's observed PR history into identifier generation. Defense in depth against the engine's prose parser being talked into accepting overrides (e.g. via prompt injection in the focus text).
+These pins preserve read-only mode, target and report identity, and the helper's trusted invocation context.
 
 ### 1. Resolve the helper script
 
@@ -186,6 +186,7 @@ OWNER=acme
 REPO=widgets
 N=137
 RUN_ORDINAL=3
+FINDING_NAMESPACE=<decimal UUID of MARKER>
 HEAD_SHA=<the PR head commit at review time>
 MARKER=<uuidv4>
 REPORT_PATH=<absolute-path>/.review-anvil/final-report-<uuidv4>.md
@@ -195,7 +196,7 @@ RULE_COVERAGE=scoped
 
 If the locator was auto-detected, the script also prints `auto-detected PR: <url>` to stderr before the KEY=VALUE block, so the agent can echo that to the user before proceeding.
 
-Capture all values, including `RUN_ORDINAL`. Echo to the user: `review target: $HOST/$OWNER/$REPO#$N — $TITLE`.
+Capture all values, including `FINDING_NAMESPACE`. Echo to the user: `review target: $HOST/$OWNER/$REPO#$N — $TITLE`.
 
 On non-zero exit, surface the script's stderr verbatim and stop. Do not dispatch reviewers.
 
@@ -204,7 +205,7 @@ On non-zero exit, surface the script's stderr verbatim and stop. Do not dispatch
 Activate the `review-anvil` skill with this argument string (extra user args go between the pinned params and the rounds default):
 
 ```
-commit_mode: none, target: <canonical-PR-URL>, report_path: <REPORT_PATH>, run_ordinal: <RUN_ORDINAL>, memory_snapshot: <private-snapshot-path>, <extra-user-args>, adversarial: auto, rounds: 1
+commit_mode: none, target: <canonical-PR-URL>, report_path: <REPORT_PATH>, run_ordinal: <RUN_ORDINAL>, finding_namespace: <FINDING_NAMESPACE>, memory_snapshot: <private-snapshot-path>, <extra-user-args>, adversarial: auto, rounds: 1
 ```
 
 For all mode, add the trusted `rule_coverage: all, coverage_run: <helper-run-id>`
@@ -213,9 +214,9 @@ the preset worker-control segment before assembling the engine invocation.
 For scoped mode use `rule_coverage: scoped`, omit `coverage_run` and do not pass
 an explicit worker control. Never replace the helper-issued run identity.
 
-The user may override `rounds:` or `adversarial:` in their args (they are defaults, not pins). They cannot override the observed value of `run_ordinal`, or the `commit_mode`, `target`, and `report_path` pins; the step-0 segment-rejection above blocks override attempts.
+The user may override `rounds:` or `adversarial:` (defaults, not pins). Reject overrides of the step-0 pins.
 
-`RUN_ORDINAL` comes from the `init` preflight. When it is a positive integer, the engine includes the corresponding `RUN` segment in new provenance IDs. The value `unavailable` makes the engine emit IDs without the `RUN` segment; degraded history must not invent a run number.
+Use the exact `FINDING_NAMESPACE` for the `RUN` segment of newly assigned IDs. `RUN_ORDINAL` describes observed history; concurrent invocations can see the same ordinal. Keep existing IDs when carrying earlier feedback forward.
 
 The engine's default `reproduction: auto` runs before adversarial review and
 reproduces uncertain material findings in one batched confidence pass. The user
@@ -266,6 +267,12 @@ Native finalization follows the single concrete transport recipe in
 `timeout: 0`, Eval-thread start/wait, synchronous Python writes and complete
 schema-parsed `.wait()` values durably stored before display. Never use
 `agent://` display text as output transport or redispatch completed work.
+Finish the engine's normal synthesis and clarity path before recording
+observation dispositions or taking either the local-only or posting exit.
+Incomplete knowledge and `post: false` do not permit an early handwritten
+report. If the engine cannot continue, retain its exact failed stage and
+diagnostic in the delivery manifest. A renderer that was never started is
+not a renderer failure or the exact-source fallback.
 
 Valid `not_assessed` results remain open knowledge questions while other original
 work finishes. Missing reviewer output, rejected rule data, unavailable knowledge
@@ -284,7 +291,9 @@ Preserve knowledge gaps in diagnostics and deliver the ordinary report under
 the original local/posting policy without waiting for user intervention.
 Use the engine's actual-diff observer/cancellation branch: a verified changed
 diff immediately supersedes current work and permits one fresh ordinary run.
-Metadata-only drift, unknown comparison and any failure never authorize retries.
+Metadata-only drift, unknown comparison and failures do not authorize an
+in-session restart. A runner can separately requeue preparation once when the
+trusted coordinator confirms target movement before any reviewer attempt.
 
 For all-mode delivery, retain a bounded owner-only `<REPORT_PATH>.delivery.json`
 following the engine reference's diagnostic contract: separate local-delivery
@@ -297,6 +306,10 @@ existing `blocked-signature-verification.json` diagnostic. Only actual successfu
 finish/check permits verified knowledge coverage. These diagnostics neither
 authorize nor block ordinary publication; record the ordinary review/publication
 outcome separately from knowledge completeness.
+Copy `interruption_reason: target_unverifiable_before_dispatch` from the trusted
+coordinator summary into the delivery manifest when present. Never derive it
+from blocker prose or missing reviewer output. Keep the actual ordinary review
+and publication states unchanged.
 
 
 When an authenticated memory snapshot is available, after the engine finishes
@@ -367,8 +380,15 @@ Record deferred learning only when its original success/evidence conditions hold
 
 ### 4. Post
 
+Before dispatch, retain the exact PR target object used for the ordinary reviewer
+context (including `number` and `body`) as owner-only JSON. In all mode use the
+`target` object from the verified frozen diff snapshot. Carry its absolute path
+through any verified diff replacement, using only the replacement's reviewed
+target when posting. Never substitute a fresh PR description for this baseline.
+
 ```bash
-bash <helper-path> post "$HOST" "$OWNER" "$REPO" "$N" "$MARKER" "$REPORT_PATH"
+REVIEW_ANVIL_FROZEN_TARGET="$FROZEN_TARGET_JSON" \
+  bash <helper-path> post "$HOST" "$OWNER" "$REPO" "$N" "$MARKER" "$REPORT_PATH"
 ```
 
 The posting helper preserves the original report/history/event controls; it does
@@ -377,6 +397,9 @@ receipts remain private diagnostics, never inputs to the PR body or a publicatio
 prerequisite. Do not freeze an internal-audit notice into the renderer input or
 public summary. Only concrete author-relevant code limitations belong there.
 Verify the current review target through the existing engine freshness checks.
+The helper compares the live description with the frozen one immediately before
+submission. A mismatch adds a note to the main publication body only; it does
+not change the event, start a new review, or affect the validated report.
 Persisted `.no-post` or `REVIEW_ANVIL_NO_POST=1` remains a mechanical veto even
 when the post helper is called accidentally.
 

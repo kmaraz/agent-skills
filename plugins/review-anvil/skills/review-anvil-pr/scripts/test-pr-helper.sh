@@ -245,6 +245,8 @@ case "$1 $2" in
   "pr view")
     if [[ "$*" == *"--json title,headRefOid"* ]]; then
       printf 'head-sha\tFixture PR\n'
+    elif [[ "$*" == *"--json body"* ]]; then
+      jq -n --arg body "${GH_MOCK_LIVE_BODY:?missing live body fixture}" '{body:$body}'
     elif [[ "$*" == *"--json url"* ]]; then
       printf 'https://github.com/acme/widgets/pull/42\n'
     else
@@ -1529,7 +1531,7 @@ GH
 
     [[ "$(cat "$output")" == "unavailable" ]] \
       || fail "expected unavailable next run in degraded mode"
-    grep -Fq 'PR run ordinal unavailable; REVIEW_ANVIL_SKIP_DISMISSED=1 enables degraded mode; IDs will omit RUN' "$warning"
+    grep -Fq 'PR run ordinal unavailable; REVIEW_ANVIL_SKIP_DISMISSED=1 enables degraded mode' "$warning"
     [[ ! -e "$call_marker" ]] \
       || fail "next-run invoked GraphQL despite REVIEW_ANVIL_SKIP_DISMISSED=1"
 }
@@ -2018,6 +2020,10 @@ JSON
     GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
       "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/classified.json" >"$tmp/again.json"
     jq -e --slurpfile original "$tmp/classified.json" '. == $original[0]' "$tmp/again.json" >/dev/null
+    jq '.earlier_feedback[0] |= (.title = .text | del(.text))' "$tmp/classified.json" >"$tmp/provisional-history.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/provisional-history.json" >"$tmp/normalized-history.json"
+    jq -e --slurpfile original "$tmp/classified.json" '. == $original[0]' "$tmp/normalized-history.json" >/dev/null
     jq 'del(.findings[0].title) | .findings[0].source_context = "PRIVATE-EVIDENCE-NOT-FOR-PUBLICATION"' "$packet" >"$tmp/private.json"
     GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
       "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/private.json" >"$tmp/public.json"
@@ -2028,6 +2034,13 @@ JSON
       .decision == "COMMENT" and .findings == $original[0].findings
       and .earlier_feedback == $original[0].earlier_feedback
     ' "$tmp/degraded.json" >/dev/null
+    jq '.findings[0].id = "RAV-RUN395474259923-R1-F001"
+        | .report_ids = [.findings[0].id] | .findings[0].request_mode = "optional"' \
+        "$packet" >"$tmp/new-optional.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$fixture" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/new-optional.json" >"$tmp/optional.json"
+    jq -e '.findings[0] | .id == "RAV-RUN395474259923-R1-F001" and .request_mode == "suggested"' \
+        "$tmp/optional.json" >/dev/null
     local validator report severity event
     validator="$ROOT/../../review-anvil/scripts/validate-clarity-output.py"
     for severity in low high; do
@@ -2037,11 +2050,8 @@ JSON
         event=APPROVE
         [[ "$severity" != high ]] || event=COMMENT
         jq -e --arg event "$event" '.decision == $event' "$tmp/canonical-$severity.json" >/dev/null
-        jq '{
-          decision,
-          report_markdown:(.result + "\n\n_Reviewed with [review-anvil](https://github.com/mrshu/agent-skills/#review-anvil)._"),
-          report_items:[],disposition_items:[],inline_comments:[],predicate_inventory:[]
-        }' "$tmp/canonical-$severity.json" >"$tmp/draft-$severity.json"
+        jq '{summary:.result, report_items:[],inline_comments:[]}' \
+            "$tmp/canonical-$severity.json" >"$tmp/draft-$severity.json"
         python3 "$validator" --assemble-source "$tmp/canonical-$severity.json" "$tmp/draft-$severity.json" >"$tmp/source-$severity.json"
         python3 "$validator" "$tmp/canonical-$severity.json" "$tmp/source-$severity.json" >/dev/null
         report="$tmp/report-$severity.md"
@@ -2109,6 +2119,49 @@ JSON
     GH_MOCK_GRAPHQL_RESPONSE="$tmp/closed.json" PATH="$bin:$PATH" \
       "$HELPER" classify-feedback github.com acme widgets 42 "$tmp/reintroduced.json" >"$tmp/reintroduced-classified.json"
     jq -e '.decision == "COMMENT" and .findings[0].prior_feedback == "reintroduced" and .findings[0].severity == "high" and .earlier_feedback == []' "$tmp/reintroduced-classified.json" >/dev/null
+    # Exercise summary-only delivery so the compact table row itself must
+    # carry the reintroduction through the independent posting-time refresh.
+    jq 'del(.findings[0].path, .findings[0].line, .findings[0].side)' \
+        "$tmp/reintroduced.json" >"$tmp/reintroduced-summary.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$tmp/closed.json" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 \
+        "$tmp/reintroduced-summary.json" >"$tmp/reintroduced-packet.json"
+    cat >"$tmp/reintroduced-draft.json" <<'JSON'
+{
+  "summary": "The visible surface remains opaque during dismissal.",
+  "report_items": [{
+    "id": "RAV-RUN1-R1-F001",
+    "prior_feedback": "reintroduced",
+    "rendered_body": "| High | `src/dialog.ts:12` | The visible surface remains opaque during dismissal. | Consider animating the visible surface. <!-- review-anvil-report: id=RAV-RUN1-R1-F001 severity=high area=animation path=src%2Fdialog.ts start_line=- line=12 disposition=active --> |"
+  }],
+  "inline_comments": []
+}
+JSON
+    python3 "$validator" --assemble-source "$tmp/reintroduced-packet.json" \
+        "$tmp/reintroduced-draft.json" >"$tmp/reintroduced-source.json"
+    python3 "$validator" "$tmp/reintroduced-packet.json" "$tmp/reintroduced-source.json" >/dev/null
+    report="$tmp/reintroduced-report.md"
+    jq -r '.report_markdown' "$tmp/reintroduced-source.json" >"$report"
+    jq '.inline_comments' "$tmp/reintroduced-source.json" >"$report.inline.json"
+    printf '{"event":"COMMENT","head_sha":"head-sha","approval_allowed":false}\n' >"$report.approval.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$tmp/closed.json" GH_MOCK_REVIEW_PAYLOAD="$tmp/reintroduced-payload.json" \
+      GH_MOCK_WRITE_LOG="$tmp/reintroduced-writes.jsonl" PATH="$bin:$PATH" \
+      "$HELPER" post github.com acme widgets 42 reintroduced "$report" >/dev/null
+    jq -e '.event == "COMMENT" and (.body | split("\n") | any(
+      startswith("| High |") and contains("prior_feedback=reintroduced")
+      and contains("id=RAV-RUN1-R1-F001")))' "$tmp/reintroduced-payload.json" >/dev/null
+    jq -s -e 'length == 1' "$tmp/reintroduced-writes.jsonl" >/dev/null
+    jq --slurpfile posted "$tmp/reintroduced-payload.json" '
+      .data.repository.pullRequest.reviews.nodes += [{
+        state:"COMMENTED", body:$posted[0].body, url:"https://example.invalid/reintroduced-summary"
+      }]
+    ' "$tmp/closed.json" >"$tmp/reintroduced-history.json"
+    GH_MOCK_GRAPHQL_RESPONSE="$tmp/reintroduced-history.json" PATH="$bin:$PATH" \
+      "$HELPER" classify-feedback github.com acme widgets 42 "$packet" >"$tmp/reintroduced-reloaded.json"
+    jq -e '.decision == "COMMENT" and .findings == []
+      and .earlier_feedback[0].severity == "high"
+      and .earlier_feedback[0].url == "https://example.invalid/reintroduced-summary"' \
+        "$tmp/reintroduced-reloaded.json" >/dev/null
     jq --slurpfile reported "$fixture" '
       .data.repository.pullRequest.reviewThreads.nodes[0].comments.nodes[0].body |= sub("severity=low";"severity=high")
       | .data.repository.pullRequest.reviews.nodes = $reported[0].data.repository.pullRequest.reviews.nodes
@@ -3132,23 +3185,32 @@ test_coverage_controls_reject_invalid_and_duplicates() {
     if "$HELPER" check-pins review-anvil-pr "coverage_run" 'coverage_run: forged' >/dev/null 2>&1; then
         fail "untrusted coverage run accepted"
     fi
+    if "$HELPER" check-pins review-anvil-pr "finding_namespace" 'finding_namespace: 42' >/dev/null 2>&1; then
+        fail "untrusted finding namespace accepted"
+    fi
 }
 
 test_init_persists_coverage_and_no_post_modes() {
-    local tmp helper output report args
+    local tmp helper output report args first_namespace second_namespace
     tmp="$(mktemp -d)"
     trap "rm -rf '$tmp'" RETURN
     make_coverage_install "$tmp"
     helper="$tmp/install/review-anvil-pr/scripts/pr-helper.sh"
-    output=$(cd "$tmp" && PATH="$tmp/bin:$PATH" REVIEW_ANVIL_NO_POST=1 REVIEW_ANVIL_SKIP_DISMISSED=1 \
+    output=$(cd "$tmp" && PATH="$tmp/bin:$PATH" REVIEW_ANVIL_NO_POST=1 REVIEW_ANVIL_SKIP_DISMISSED= \
         bash "$helper" init 'acme/widgets#42' --rule-coverage all)
+    first_namespace=$(printf '%s\n' "$output" | awk -F= '$1=="FINDING_NAMESPACE"{print $2}')
+    [[ "$output" == *RUN_ORDINAL=1* ]] || fail "first init did not see empty history"
     report=$(printf '%s\n' "$output" | while IFS='=' read -r key value; do
         [[ "$key" != REPORT_PATH ]] || printf '%s\n' "$value"
     done)
     [[ -n "$report" && "$(cat "${report}.rule-coverage")" == all ]] || fail "all-mode not persisted"
     [[ -f "${report}.no-post" ]] || fail "no-post mode not persisted"
     output=$(cd "$tmp" && PATH="$tmp/bin:$PATH" REVIEW_ANVIL_NO_POST= UUID_MOCK=00000000-0000-4000-8000-000000000002 \
-        REVIEW_ANVIL_SKIP_DISMISSED=1 bash "$helper" init)
+        REVIEW_ANVIL_SKIP_DISMISSED= bash "$helper" init)
+    second_namespace=$(printf '%s\n' "$output" | awk -F= '$1=="FINDING_NAMESPACE"{print $2}')
+    [[ "$output" == *RUN_ORDINAL=1* ]] || fail "second init did not see the same history"
+    [[ "$first_namespace" =~ ^[1-9][0-9]*$ && "$second_namespace" =~ ^[1-9][0-9]*$ &&
+        "$first_namespace" != "$second_namespace" ]] || fail "independent PR inits reused a finding namespace"
     report=$(printf '%s\n' "$output" | while IFS='=' read -r key value; do
         [[ "$key" != REPORT_PATH ]] || printf '%s\n' "$value"
     done)
@@ -3466,6 +3528,26 @@ test_post_current_changes_requested_downgrades_only_the_event() {
           || fail "current review gate repeated publication for $mode"
     done
 }
+test_description_drift_preserves_review_event() (
+    local tmp reviewed report
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    install_fake_gh "$tmp"
+    for reviewed in previous current; do
+        report="$tmp/$reviewed.md"
+        make_author_comment_bundle "$report"
+        jq -n --arg body "$reviewed" '{number:42,body:$body}' >"$tmp/target.json"
+        GH_MOCK_GRAPHQL_RESPONSE= GH_MOCK_LIVE_BODY=current \
+        GH_MOCK_WRITE_LOG="$tmp/writes" GH_MOCK_REVIEW_PAYLOAD="$tmp/review" \
+        GH_MOCK_FILE_PAYLOAD="$tmp/file" PATH="$tmp:$PATH" \
+        REVIEW_ANVIL_FROZEN_TARGET="$tmp/target.json" \
+          "$HELPER" post github.com acme widgets 42 description-drift "$report" >/dev/null
+        jq -e --arg reviewed "$reviewed" '
+          .event == "COMMENT" and (.comments | length == 1) and
+          ((.body | contains("The PR description changed during review.")) == ($reviewed != "current"))
+        ' "$tmp/review" >/dev/null
+    done
+)
 
 main() {
     command -v jq >/dev/null 2>&1 || fail "jq is required"
@@ -3473,7 +3555,8 @@ main() {
     [[ "${1:-}" != --current-reviews-only ]] || return 0
     test_canonical_history_is_classified_before_rendering
     [[ "${1:-}" != --history-classification-only ]] || return 0
-    test_compact_post_preserves_nonactive_history_without_reraising
+    (test_compact_post_preserves_nonactive_history_without_reraising)
+    test_description_drift_preserves_review_event
     test_author_comment_processing_preserves_nit_and_file_subject
     test_author_comment_rejects_malformed_file_anchors
     test_author_comment_publication_and_partial_receipts

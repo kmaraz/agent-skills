@@ -740,6 +740,24 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         )
         return canonical, rendered
 
+    def test_human_report_collapses_single_line_range_without_moving_anchor(self) -> None:
+        canonical, source = self.human_source_bundle()
+        finding = next(item for item in canonical["findings"] if item["id"] == "RAV-RUN2-R1-F005")
+        finding["report_start_line"] = finding["report_line"]
+        row = source["report_items"][1]
+        old = row["rendered_body"]
+        new = old.replace(":300-302`", ":302`").replace("start_line=300", "start_line=302")
+        row["rendered_body"] = new
+        source["report_markdown"] = source["report_markdown"].replace(old, new)
+        result = self.validate(source, canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        row["rendered_body"] = new.replace(":302`", ":303`")
+        source["report_markdown"] = source["report_markdown"].replace(new, row["rendered_body"])
+        result = self.validate(source, canonical)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("visible report location changed", result.stderr)
+
     def renderer_operation(self, mode: str, canonical: dict, bundle: dict) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             paths = [Path(directory) / name for name in ("canonical.json", "bundle.json")]
@@ -993,6 +1011,53 @@ class ClarityOutputValidatorTests(unittest.TestCase):
             {key: value for key, value in source.items() if key not in {"report_markdown", "metadata_inventory"}},
             {key: value for key, value in draft.items() if key != "report_markdown"},
         )
+
+    def test_source_assembly_fills_only_an_omitted_empty_disposition_inventory(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        draft.pop("disposition_items")
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["disposition_items"], [])
+        invalid = self.assemble_source(canonical, {**draft, "disposition_items": None})
+        self.assertIn("disposition item inventory changed", invalid.stderr)
+
+    def test_source_assembly_preserves_multiline_opening_as_one_summary(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        _, separator, sections = draft["report_markdown"].partition("\n\n<details>\n")
+        opening = "Partial review: the live export was not tested."
+        finding = "The settings lookup can block an authorized export."
+        marker = "<!-- review-anvil-marker: example -->\n\n"
+        draft["report_markdown"] = marker + opening + "\n\n" + finding + separator + sections
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["report_markdown"].startswith(
+            marker + opening + " " + finding + separator))
+        draft["report_markdown"] = opening + "\n\n- " + finding + separator + sections
+        self.assertNotEqual(self.assemble_source(canonical, draft).returncode, 0)
+
+    def test_structured_source_omits_sections_removed_by_classification(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        removed = canonical["findings"].pop(0)
+        canonical["earlier_feedback"] = [{
+            "id": removed["id"], "status": "still-open", "text": "The parser concern remains.",
+        }]
+        canonical["findings"][0]["request_mode"] = "suggested"
+        for field in ("report_markdown", "metadata_inventory", "predicate_inventory", "disposition_items"):
+            draft.pop(field)
+        draft["report_items"].pop(0)
+        draft["inline_comments"].pop(0)
+        draft["summary"] = "Partial review: export was not tested.\n\nThe numeric check remains useful."
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bundle = json.loads(result.stdout)
+        report = bundle["report_markdown"]
+        self.assertTrue(report.startswith("Partial review: export was not tested. The numeric check remains useful.\n"))
+        self.assertNotIn("<summary>Issues and fixes</summary>", report)
+        self.assertIn("<summary>Optional suggestions</summary>", report)
+        self.assertIn("The parser concern remains.", report)
+        self.assertEqual(bundle["inline_comments"], draft["inline_comments"])
+        self.assertEqual(self.validate(bundle, canonical).returncode, 0)
+        self.assertNotEqual(self.assemble_source(canonical, {**draft, "inline_comments": []}).returncode, 0)
 
     def test_source_assembly_extends_existing_context_without_duplicate_metadata(self) -> None:
         canonical, draft = self.human_source_bundle()

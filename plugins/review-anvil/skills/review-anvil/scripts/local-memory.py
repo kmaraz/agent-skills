@@ -282,6 +282,7 @@ def main(argv=None):
                         or current["repository"]["id"] != report["repository_id"]):
                     raise MemoryError("Coverage repository numeric identity changed")
                 value = coverage.verify_report(report, current["pr"])
+                value["description_changed"] = current["pr"]["body"] != report["target"]["body"]
             else:
                 if args.command != "coverage-finish" and "://" not in args.repository and args.repository.count("/") == 2:
                     # Scheduling authenticates the existing local numeric identity.
@@ -346,6 +347,7 @@ def main(argv=None):
                         raise MemoryError("Coverage repository numeric identity changed")
                     report = coverage.finish(args.run_id, current["pr"])
                     value = coverage.status(args.run_id)
+                    value["description_changed"] = current["pr"]["body"] != report["target"]["body"]
                     value["output"] = str(Path(args.output).absolute())
                     output(report, args.output, summary=value)
                     return 0
