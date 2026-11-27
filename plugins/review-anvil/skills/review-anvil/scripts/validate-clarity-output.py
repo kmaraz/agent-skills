@@ -787,6 +787,8 @@ def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[st
     if canonical.get("report_style") != "human-summary":
         raise InvalidBundle("source assembly requires human-summary")
     source = dict(draft)
+    if "disposition_items" not in source and not structured_dispositions(canonical):
+        source["disposition_items"] = []
     source.setdefault("metadata_inventory", {field: canonical.get(field) for field in METADATA_FIELDS})
     report = source.get("report_markdown")
     if not isinstance(report, str):

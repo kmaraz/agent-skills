@@ -1012,6 +1012,15 @@ class ClarityOutputValidatorTests(unittest.TestCase):
             {key: value for key, value in draft.items() if key != "report_markdown"},
         )
 
+    def test_source_assembly_fills_only_an_omitted_empty_disposition_inventory(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        draft.pop("disposition_items")
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["disposition_items"], [])
+        invalid = self.assemble_source(canonical, {**draft, "disposition_items": None})
+        self.assertIn("disposition item inventory changed", invalid.stderr)
+
     def test_source_assembly_extends_existing_context_without_duplicate_metadata(self) -> None:
         canonical, draft = self.human_source_bundle()
         canonical["run_details"] = ["Two concerns checked.", "The browser check was not run."]
