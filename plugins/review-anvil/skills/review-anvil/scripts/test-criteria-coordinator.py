@@ -457,11 +457,11 @@ class CriteriaCoordinatorTests(unittest.TestCase):
         self.assertIn("pending", pending)
         self.assertNotIn("rejected", pending)
 
-    def test_indented_terminal_findings_preserve_actual_report_without_redispatch(self):
+    def test_longer_terminal_findings_fence_preserves_actual_report_without_redispatch(self):
         self.begin(1)
         adapter = NativeFixture()
         original = adapter.wait_one
-        markdown = "# Actual ordinary review\n  ```findings\n  []\n  ```\n"
+        markdown = "# Actual ordinary review\n  ```findings\n  []\n  ````\n"
         def indented(handles):
             handle, response = original(handles)
             if response.get("reviewer_id"):

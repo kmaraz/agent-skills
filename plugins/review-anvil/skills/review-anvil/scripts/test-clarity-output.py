@@ -1021,6 +1021,20 @@ class ClarityOutputValidatorTests(unittest.TestCase):
         invalid = self.assemble_source(canonical, {**draft, "disposition_items": None})
         self.assertIn("disposition item inventory changed", invalid.stderr)
 
+    def test_source_assembly_preserves_multiline_opening_as_one_summary(self) -> None:
+        canonical, draft = self.human_source_bundle()
+        _, separator, sections = draft["report_markdown"].partition("\n\n<details>\n")
+        opening = "Partial review: the live export was not tested."
+        finding = "The settings lookup can block an authorized export."
+        marker = "<!-- review-anvil-marker: example -->\n\n"
+        draft["report_markdown"] = marker + opening + "\n\n" + finding + separator + sections
+        result = self.assemble_source(canonical, draft)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["report_markdown"].startswith(
+            marker + opening + " " + finding + separator))
+        draft["report_markdown"] = opening + "\n\n- " + finding + separator + sections
+        self.assertNotEqual(self.assemble_source(canonical, draft).returncode, 0)
+
     def test_source_assembly_extends_existing_context_without_duplicate_metadata(self) -> None:
         canonical, draft = self.human_source_bundle()
         canonical["run_details"] = ["Two concerns checked.", "The browser check was not run."]

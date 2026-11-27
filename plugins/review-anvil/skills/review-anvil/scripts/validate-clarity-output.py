@@ -77,6 +77,7 @@ REVIEW_FOOTER = (
     "_Reviewed with [review-anvil]"
     "(https://github.com/mrshu/agent-skills/#review-anvil)._"
 )
+REVIEW_MARKER_PREFIX = re.compile(r"^(?:<!--\s*review-anvil-marker:.*?-->\s*\n)?\n*")
 COMPACT_DETAILS_RE = re.compile(
     r"<details>\n<summary>([^<\n]+)</summary>\n\n"
     r"([\s\S]*?)\n\n?</details>"
@@ -305,12 +306,8 @@ def validate_human_report_envelope(
     ):
         raise InvalidBundle("review footer must be the final nonblank line")
     report_body = stripped_report[: -len(REVIEW_FOOTER)].rstrip()
-    visible_report = re.sub(
-        r"^<!--\s*review-anvil-marker:.*?-->\s*\n",
-        "",
-        report_body,
-        count=1,
-    ).lstrip("\n")
+    # Keep this boundary in sync with initial source assembly.
+    visible_report = REVIEW_MARKER_PREFIX.sub("", report_body, count=1)
     blocks = compact_details_blocks(visible_report)
     summary, separator, _ = visible_report.partition("\n\n<details>\n")
     if (
@@ -808,6 +805,16 @@ def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[st
         elif values or label == "Review context":
             section = f"<details>\n<summary>{label}</summary>\n\n" + "\n\n".join(missing) + "\n\n</details>"
             report = report.replace(REVIEW_FOOTER, section + "\n\n" + REVIEW_FOOTER, 1)
+    # The marker is not visible prose and must be retained byte-for-byte.
+    # Reflow only initial prose; keep frozen sections and renderer output exact.
+    start = REVIEW_MARKER_PREFIX.match(report).end()
+    prefix, separator, sections = report[start:].partition("\n\n<details>\n")
+    lines = [line for line in prefix.splitlines() if line.strip()]
+    if separator and len(lines) > 1 and all(
+        re.match(r" {0,3}[\w\"'“‘(]", line) and not re.match(r"\s*\d+[.)]\s", line)
+        for line in lines
+    ):
+        report = report[:start] + " ".join(line.strip() for line in lines) + separator + sections
     report = assemble_table_headers(report)
     source["report_markdown"] = report
     validate(canonical, source)

@@ -812,6 +812,8 @@ scope, checks and author-relevant limitations into Review context and exact
 history lines into Earlier feedback, without duplicating present values or
 changing findings/inline bodies. The draft may omit `metadata_inventory`; the
 helper constructs it from the frozen packet. Supplied inventory must still match.
+The helper reflows a plain-prose opening to one summary line, preserving its
+wording and any partial-review limitation. Do not add headings or lists to it.
 The helper emits a source only after full validation. Check its exit status.
 Never use `--assemble-source` to repair an already frozen source, renderer output
 or fallback; subsequent standalone validation and `--emit-validated` remain read-only.

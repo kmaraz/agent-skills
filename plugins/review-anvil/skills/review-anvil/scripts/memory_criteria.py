@@ -13,6 +13,24 @@ _PHASE_FIELDS = {"schema_version", "assessment_strategy", "repository", "reposit
                  "reviewer_ids", "partitions", "routing_digest", "reviews", "signature", "digest"}
 
 
+def _has_terminal_findings(markdown: str) -> bool:
+    fence_len, fence_char, findings = 0, "", False
+    closed_findings = False
+    for line in markdown.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        closed_findings = False
+        if fence_len:
+            if len(line) >= fence_len and not line.strip(fence_char):
+                closed_findings = findings
+                fence_len = 0
+        elif match := re.fullmatch(r"(`{3,}|~{3,})(.*)", line):
+            fence_len, fence_char = len(match[1]), match[1][0]
+            findings = fence_char == "`" and match[2].strip() == "findings"
+    return closed_findings
+
+
 class CriteriaResponseRejected(MemoryError):
     """A new unacknowledged worker response failed deterministic prewrite validation."""
 
@@ -335,15 +353,7 @@ class CriteriaCoverage(RuleCoverage):
         _text(response["review_markdown"], "preserved normal review markdown", 4 * 1024 * 1024)
         # Match the ordinary reviewer protocol: a complete findings fence must
         # be the terminal nonblank content, not a plan or confirmation request.
-        in_findings, findings_close, last_nonblank = False, None, None
-        for index, line in enumerate(response["review_markdown"].splitlines()):
-            if line.strip():
-                last_nonblank = index
-            if re.fullmatch(r"\s*```findings\s*", line):
-                in_findings = True
-            elif in_findings and re.fullmatch(r"\s*```\s*", line):
-                findings_close, in_findings = index, False
-        if in_findings or findings_close is None or findings_close != last_nonblank:
+        if not _has_terminal_findings(response["review_markdown"]):
             raise MemoryError("Normal reviewer output requires a complete terminal fenced findings block")
         if not isinstance(response["candidates_json"], str):
             raise MemoryError("Candidates require the trusted typed JSON-string transport")
