@@ -172,6 +172,32 @@ case "$1 $2" in
     printf 'https://example.invalid/comment/123\n'
     ;;
   "api graphql")
+    if [[ "$*" == *latestOpinionatedReviews* ]]; then
+      case "${GH_MOCK_CURRENT_REVIEWS:-clear}" in
+        error) printf 'mock current reviews unavailable\n' >&2; exit 1 ;;
+        malformed) printf '{}\n'; exit 0 ;;
+        graphql_error) printf '{"errors":[{"message":"unavailable"}]}\n'; exit 0 ;;
+        blocked) states='["APPROVED","CHANGES_REQUESTED"]' ;;
+        page_blocked|page_clear|bad_cursor)
+          if [[ "$*" != *cursor=next-page* ]]; then
+            jq -n '{data:{repository:{pullRequest:{latestOpinionatedReviews:{
+              nodes:[{state:"APPROVED"}],pageInfo:{hasNextPage:true,endCursor:"next-page"}}}}}}'
+            exit 0
+          fi
+          case "$GH_MOCK_CURRENT_REVIEWS" in
+            page_blocked) states='["CHANGES_REQUESTED"]' ;;
+            page_clear) states='["DISMISSED","APPROVED"]' ;;
+            bad_cursor)
+              jq -n '{data:{repository:{pullRequest:{latestOpinionatedReviews:{
+                nodes:[],pageInfo:{hasNextPage:true,endCursor:"next-page"}}}}}}'
+              exit 0 ;;
+          esac ;;
+        *) states='["APPROVED","DISMISSED"]' ;;
+      esac
+      jq -n --argjson states "$states" '{data:{repository:{pullRequest:{latestOpinionatedReviews:{
+        nodes:[$states[]|{state:.}],pageInfo:{hasNextPage:false,endCursor:null}}}}}}'
+      exit 0
+    fi
     for arg in "$@"; do
       if [[ "$arg" == query=mutation*resolveReviewThread* ]]; then
         thread_id=""
@@ -3460,6 +3486,35 @@ EXAMPLE
     jq -e --rawfile example "$tmp/example.md" '.body | contains($example)' "$tmp/review.json" >/dev/null
 }
 
+test_post_current_changes_requested_downgrades_only_the_event() {
+    local tmp bin report mode expected selected
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" RETURN
+    bin="$tmp/bin"
+    mkdir "$bin"
+    install_fake_gh "$bin"
+    for mode in blocked clear page_blocked page_clear error malformed graphql_error bad_cursor already_comment; do
+        report="$tmp/$mode.md"
+        make_compact_report "$report"
+        make_inline "$report.inline.json"
+        selected=APPROVE
+        [[ "$mode" != already_comment ]] || selected=COMMENT
+        printf '{"event":"%s","head_sha":"head-sha","approval_allowed":true}\n' "$selected" >"$report.approval.json"
+        : >"$tmp/writes.jsonl"
+        GH_MOCK_CURRENT_REVIEWS="$mode" GH_MOCK_WRITE_LOG="$tmp/writes.jsonl" \
+          GH_MOCK_REVIEW_PAYLOAD="$tmp/payload.json" PATH="$bin:$PATH" \
+          "$HELPER" post github.com acme widgets 42 marker-123 "$report" >"$tmp/stdout" 2>"$tmp/stderr"
+        expected=COMMENT
+        case "$mode" in clear|page_clear) expected=APPROVE ;; esac
+        jq -e --arg event "$expected" \
+          '.event == $event and (.comments | length == 3)
+           and (.body | contains("Review context"))
+           and ([.comments[].path] | index("README.md") != null)' "$tmp/payload.json" >/dev/null \
+          || fail "current review gate chose the wrong event or lost findings for $mode"
+        [[ "$(wc -l <"$tmp/writes.jsonl" | tr -d ' ')" == 1 ]] \
+          || fail "current review gate repeated publication for $mode"
+    done
+}
 test_description_drift_preserves_review_event() (
     local tmp reviewed report
     tmp=$(mktemp -d)
@@ -3483,6 +3538,8 @@ test_description_drift_preserves_review_event() (
 
 main() {
     command -v jq >/dev/null 2>&1 || fail "jq is required"
+    test_post_current_changes_requested_downgrades_only_the_event
+    [[ "${1:-}" != --current-reviews-only ]] || return 0
     test_canonical_history_is_classified_before_rendering
     [[ "${1:-}" != --history-classification-only ]] || return 0
     (test_compact_post_preserves_nonactive_history_without_reraising)

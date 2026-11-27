@@ -2718,6 +2718,66 @@ cmd_init() {
 }
 
 
+current_reviews_allow_approval() {
+    _py - "$1" "$2" "$3" "$4" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+host, owner, repo, number = sys.argv[1:]
+query = """query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){
+    pullRequest(number:$number){
+      latestOpinionatedReviews(first:100,after:$cursor){
+        nodes{state}
+        pageInfo{hasNextPage endCursor}
+      }
+    }
+  }
+}"""
+# GitHub supplies the current opinion per reviewer, including dismissals and
+# later approvals; do not treat every historical CHANGES_REQUESTED as active.
+cursor = None
+seen = set()
+try:
+    while True:
+        args = ["gh", "api", "graphql", "-f", "query=" + query,
+                "-F", "owner=" + owner, "-F", "repo=" + repo, "-F", "number=" + number]
+        if cursor is not None:
+            args += ["-F", "cursor=" + cursor]
+        result = subprocess.run(args, capture_output=True, text=True,
+                                env=dict(os.environ, GH_HOST=host), timeout=30)
+        if result.returncode:
+            raise ValueError("GitHub request failed")
+        response = json.loads(result.stdout)
+        if response.get("errors"):
+            raise ValueError("GitHub returned GraphQL errors")
+        page = response["data"]["repository"]["pullRequest"]["latestOpinionatedReviews"]
+        nodes, info = page["nodes"], page["pageInfo"]
+        if not isinstance(nodes, list) or type(info["hasNextPage"]) is not bool:
+            raise ValueError("Invalid current-review page")
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("state") not in {
+                "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"
+            }:
+                raise ValueError("Invalid current-review state")
+            if node["state"] == "CHANGES_REQUESTED":
+                print("pr-helper: current changes requested; downgrading APPROVE to COMMENT", file=sys.stderr)
+                raise SystemExit(1)
+        if not info["hasNextPage"]:
+            break
+        cursor = info["endCursor"]
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise ValueError("Invalid current-review pagination")
+        seen.add(cursor)
+except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError) as error:
+    print(f"pr-helper: cannot verify current review opinions ({error}); downgrading APPROVE to COMMENT",
+          file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 cmd_post() {
     local host="${1:-}" owner="${2:-}" repo="${3:-}" n="${4:-}" marker="${5:-}" report_path="${6:-}"
     for v in host owner repo n marker report_path; do
@@ -2869,6 +2929,10 @@ cmd_post() {
         fi
     fi
 
+    if [[ "$review_event" == "APPROVE" ]] \
+       && ! current_reviews_allow_approval "$host" "$owner" "$repo" "$n"; then
+        review_event="COMMENT"
+    fi
     # Claim this publication exclusively for every payload shape. Even an
     # unconfirmed response is terminal: a later invocation must not resend it.
     (umask 077; set -o noclobber
