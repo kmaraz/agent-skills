@@ -600,11 +600,11 @@ class CoverageTests(unittest.TestCase):
         self.assertFalse({"rules", "observations", "sources", "results", "excluded_inactive_rule_ids"} & summary.keys())
         self.assertLess(len(json.dumps(summary)), 4000)
 
-    def test_finish_requires_every_fresh_pr_metadata_field_and_exact_repository(self):
+    def test_finish_requires_every_fresh_pr_field_except_body_and_exact_repository(self):
         run = self.coverage.start(self.activate())
         self.assess(run["run_id"])
         for field, value in (("number", 8), ("head_sha", "c" * 40), ("base_sha", "c" * 40),
-                             ("title", "Edited title"), ("body", "Edited description"),
+                             ("title", "Edited title"),
                              ("files", ["src/another.py"]), ("url", "https://github.com/acme/widgets/pull/8")):
             target = copy.deepcopy(self.packet["pr"]); target[field] = value
             before = self.journal_bytes()
@@ -749,9 +749,12 @@ class CoverageTests(unittest.TestCase):
     def test_report_is_authenticated_bound_to_persisted_completion_and_fresh_target(self):
         run = self.coverage.start(self.activate())
         self.assess(run["run_id"])
-        report = self.coverage.finish(run["run_id"], self.packet["pr"])
+        live = {**self.packet["pr"], "body": self.packet["pr"]["body"] + "\nUpdated context"}
+        report = self.coverage.finish(run["run_id"], live)
+        self.assertEqual(report["target"], self.packet["pr"])
         self.assertEqual(self.coverage.status(run["run_id"])["status"], "completed")
         self.assertEqual(self.coverage.verify_report(report, self.packet["pr"])["remaining_rules"], 0)
+        self.assertEqual(self.coverage.verify_report(report, live)["remaining_rules"], 0)
         forged = copy.deepcopy(report); forged["results"][0]["verdict"] = "violated"
         with self.assertRaises(MemoryError): self.coverage.verify_report(forged)
         forged = copy.deepcopy(report); forged["target"]["body"] = "Edited description"

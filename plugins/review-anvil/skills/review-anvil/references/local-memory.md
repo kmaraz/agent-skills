@@ -8,6 +8,8 @@ Resolve `scripts/local-memory.py` relative to the loaded **engine** SKILL.md, no
 
 Memory is private JSON under `~/.local/share/review-anvil/<host>/<owner>/<repo>/`. `REVIEW_ANVIL_MEMORY_HOME` overrides the root for isolated tests. Files are locked and replaced atomically; never edit `state.json` by hand. Memory stays outside the repository's temporary `.review-anvil/` directory. Initializing twice preserves observations and verifies remote repository identity.
 
+On the next successful state write, legacy inline source records move into a compressed `sources-a.json` or `sources-b.json` archive. `state.json` points to the active slot. Anvil stages changes in the inactive slot before replacing the pointer; source versions and signed artifacts retain their original meaning. Back up the entire repository memory directory while writers are stopped. Older helpers cannot read the separated format; update all writers before resuming with the same memory root.
+
 ```bash
 python3 <memory-helper> init sli-do/slido-frontend
 python3 <memory-helper> inspect sli-do/slido-frontend

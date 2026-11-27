@@ -155,7 +155,7 @@ class SeedRunTests(unittest.TestCase):
         self.runs = SeedRuns(REPOSITORY, self.root / 'memory')
         self.runs.init(42)
         self.store = MemoryStore(REPOSITORY, self.root / 'memory')
-        self.patch = patch('memory_seed.collect_feedback', side_effect=lambda locator: packet(int(locator.rsplit('/', 1)[1])))
+        self.patch = patch('memory_seed.collect_feedback', side_effect=lambda locator, **kwargs: packet(int(locator.rsplit('/', 1)[1])))
         self.patch.start()
         self.addCleanup(self.patch.stop)
         preflight = patch('memory_seed.github_api', return_value={'number': 1})
@@ -255,7 +255,7 @@ class SeedRunTests(unittest.TestCase):
         self.assertEqual(self.runs.status(run_id)['processed'], 0)
 
     def test_renamed_file_encounter_order_matches_the_normalized_checkpoint(self):
-        def renamed(locator):
+        def renamed(locator, **kwargs):
             value = packet(int(locator.rsplit('/', 1)[1]))
             value['pr']['files'] = ['src/z.py', 'src/old-z.py', 'src/a.py']
             return value

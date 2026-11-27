@@ -45,11 +45,12 @@ Parse the user's free-form args string into:
 | `rule_coverage` | `scoped` | `scoped` or `all` — exhaustive supported local-rule assessment for a memory-enabled read-only PR review; see `references/rule-coverage.md` |
 | `coverage_workers` | `4` | Integer 1–4 caps simultaneous ordinary reviewers for new single-pass runs, never reviewer count/mix. Historical criteria-first retains its routing-only cap. No hidden provider/backend override. |
 
-`run_ordinal` is trusted invocation context, not a free-form user parameter.
-Use `run_ordinal` only when it is a positive trusted value. Treat an absent
-value or `unavailable` as local/degraded context and omit `RUN` from item IDs.
-Keep UUID markers as the collision-resistant run identity. The ordinal adds
-human-readable provenance; it does not replace the marker.
+`finding_namespace` from trusted `review-anvil-pr` preflight is the decimal
+publication UUID, not a user parameter. Use its exact value as `RUN` for new
+finding and plan IDs. Do not substitute `run_ordinal` when the namespace is
+available. It describes observed PR history, not the identity of an invocation.
+Other presets without a namespace retain their existing `run_ordinal` behavior;
+omit `RUN` when no trusted positive value is available.
 
 `coverage_run` is trusted invocation context issued by `coverage-start`, not a
 free-form user parameter. Only the PR preset may hand off its authenticated
@@ -403,6 +404,7 @@ Plausible-but-wrong findings are the dominant failure mode of LLM review, and bo
   nor its severity. Cite the local ID, source URL and frozen snapshot digest,
   never a fictional checked-in policy line. Explicit conflicting policy wins.
 - **Scope/artifact filter next (orchestrator judgment).** Drop or move to out-of-scope follow-ups before reproduction when the claim is about archived design notes, changelogs, old migration examples, generated fixtures, vendored files, or historical docs that are not the review's live product surface. Do not spend verifier budget proving historical provenance is stale. Conversely, live docs that users rely on — README usage, CLI help, API docs, config reference, plugin metadata, or marketplace copy — are product surface and may become reproduction candidates when they drift from code/runtime behavior.
+- **Support for the requested behavior.** Before recommending a substantial change (such as new persistence, a redesign, or a broader compatibility guarantee), separate evidence that the scenario can fail from evidence that it must work under the stated conditions. In the existing private evidence context, cite the exact support boundary from current policy, docs, acceptance criteria, a settled human decision, or verified baseline behavior that the change would regress. A platform capability, an enabled control, or a reproducible edge case alone does not establish that boundary. For a supported scenario, choose the smallest effective fix. Apply this check even when adversarial review is disabled.
 - **Assign provenance IDs.** Assign IDs after semantic deduplication, prior-feedback classification, and scope filtering, and before reproduction or adversarial dispatch. Use this output recipe:
 
   ```text
@@ -421,8 +423,9 @@ Plausible-but-wrong findings are the dominant failure mode of LLM review, and bo
   `RAV-RUN03-R2-F001`, `RAV-RUN3-R02-F001`, `RAV-RUN3-R2-F0001`,
   `RAV-RUN0-R2-F001`, `RAV-RUN3-R0-F001`, and `RAV-RUN3-R2-F000`.
 
-  ID legend: `RUN` is the observed PR review run, `R` is the immutable origin round, `F` is a finding, and `P` is a plan. Examples are `RAV-RUN3-R2-F001`, `RAV-RUN3-R2-P001`, `RAV-R2-F001`, and `RAV-R2-P001`.
-  Cross-round allocation example: in trusted PR run 3, a history finding with
+  ID legend: `RUN` is the trusted invocation namespace (or a legacy run ordinal),
+  `R` the immutable origin round, `F` a finding, and `P` a plan.
+  Cross-round allocation example with a legacy run value of 3: a history finding with
   `id=RAV-RUN1-R2-F007` keeps that ID. A new round-1 finding receives
   `RAV-RUN3-R1-F001` and keeps it when re-raised in round 2. The next new
   round-2 finding receives `RAV-RUN3-R2-F002`. A round-2 plan covering those
@@ -733,6 +736,12 @@ relationship. Do not promote incidental fixture values, proof citations,
 process instructions, or requested-work predicates into diagnostic locks.
 Retain those in the existing evidence/source context and requested-work fields.
 
+Apply the support check again to the final requested work before freezing
+`request_mode` and the work predicates. Omit any unsupported expansion, including
+tests or docs that would impose the same new guarantee. Keep independently
+supported defects and their required fixes. If only an independently useful
+smaller improvement remains, keep it as a suggestion with a concrete benefit;
+otherwise retain the unsupported proposal only in the private disposition.
 Freeze `request_mode: required|suggested` for every new active finding from its
 source obligation. Use the same mode for report and inline work. Severity is
 priority, not permission to weaken a required fix or strengthen a preference.
@@ -777,6 +786,15 @@ Posting still refreshes history independently: unchanged history must not
 change the frozen inventory; genuinely new classification changes retain the
 existing fail-closed guard. No reviewer retry or second rendering attempt.
 
+With usable ordinary output and a verified current diff, continue through the
+clarity steps below even if supplemental rule coverage is incomplete or unsigned,
+metadata alone drifted, or the preset is local-only. None is a rendering failure.
+Do not replace these steps with a handwritten final report or finish the preset
+handoff early. If the normal path cannot continue, retain the exact failed step
+and diagnostic in the private delivery record; distinguish a renderer that was
+never started from an attempted renderer failure. Use only the failure path
+defined for that step.
+
 Run one clean final clarity pass after the report facts are frozen and before
 emitting any final artifact. First retain a complete pre-clarity report and
 inline-body set for safe fallback. Then build `FROZEN_CLARITY_PACKET` from only
@@ -790,31 +808,32 @@ not this renderer input or its public `run_details`.
 Do not include raw reviewer prose, refuted candidates, superseded plans, or
 repository context.
 
-Build the initial source draft with its summary, complete finding/disposition
-tables, inline bodies, predicate inventory and footer. Construct required frozen
-context exactly once with the trusted helper, before retaining the validated
-source or dispatching the renderer:
+Build the initial source draft from the classified packet. Supply `summary`
+(plain authored opening prose, including any required partial-review limitation),
+`report_items` (one complete row per active finding), `disposition_items` (when
+the frozen disposition inventory is nonempty), and `inline_comments` (the exact
+anchored bodies). Do not supply `report_markdown` or construct Markdown sections.
+Supply `required` or `suggested` as the canonical `request_mode` according to the
+actual obligation. Do not infer it from severity. Construct the validated source
+before dispatching the renderer:
 
 ```bash
 python3 "$ENGINE_ROOT/scripts/validate-clarity-output.py" --assemble-source \
   "$CLARITY_PACKET" "$CLARITY_SOURCE_DRAFT" > "$CLARITY_SOURCE_BUNDLE"
 ```
 
-The helper shares the validator's visible-metadata projection. It inserts exact
-scope, checks and author-relevant limitations into Review context and exact
-history lines into Earlier feedback, without duplicating present values or
-changing findings/inline bodies. The draft may omit `metadata_inventory`; the
-helper constructs it from the frozen packet. Supplied inventory must still match.
+The helper uses the classified inventory to place rows and create only nonempty
+finding/disposition sections. It emits the footer, frozen decision, predicate
+and metadata inventories, Review context and exact Earlier feedback. It reflows
+the opening to one line without changing its words, and preserves authored
+finding and inline bodies. Any supplied inventory must still match.
 The helper emits a source only after full validation. Check its exit status.
 Never use `--assemble-source` to repair an already frozen source, renderer output
 or fallback; subsequent standalone validation and `--emit-validated` remain read-only.
 
-Build each table as one contiguous block: join its header, separator and all
-data rows with single newlines. Use blank lines only between complete blocks,
-never between table lines. A generic double-newline join of individual report
-chunks must not split a table. If source validation fails, retain the source and
-emit a local diagnostic failure report; do not dispatch a renderer, repair with
-another model, publish or label that source as validated.
+If source validation fails, retain the draft and emit a local diagnostic
+failure report. Do not dispatch a renderer, repair with another model,
+publish, or label that source as validated.
 Retain each validated source bundle and its exact report/inline bytes.
 
 Build the editable projection for every renderer, native or external:
@@ -986,7 +1005,7 @@ If `report_path` is set:
    The helper-only `"severity"` must match the terminal marker severity exactly; the helper aborts before posting when they disagree.
    A present but unrecognized helper severity also aborts; an absent helper field may use the terminal marker during migration.
 
-   For an explicitly reintroduced `author-resolved` finding, place `<!-- review-anvil: prior_feedback=reintroduced -->` immediately after its visible final-report finding row or bullet. Its matching inline item must carry helper-only `"prior_feedback": "reintroduced"`; the posting helper uses it before author-resolved suppression, strips the JSON field before the GitHub REST request, and inserts the hidden prior-feedback marker before the final finding-metadata marker so later history retains the disposition.
+   For an explicitly reintroduced `author-resolved` finding, the source assembler keeps `<!-- review-anvil: prior_feedback=reintroduced -->` inside the report table row, immediately before its terminal `review-anvil-report` marker. Preserve that placement through rendering. Its matching inline item must carry helper-only `"prior_feedback": "reintroduced"`; the posting helper inserts the hidden marker before the final inline finding-metadata marker and strips the JSON field before submission.
 
    Each eligible new `body` puts the same complete finding ID as its report marker, reproduction target, and adversarial target inside the final inline metadata marker, then follows the **inline-comment voice** in `references/report-artifacts.md`. Keep it short and plain: say what goes wrong, what happens, and the smallest source-backed request. Group work by cohesive implementation obligation, not by grammar; do not split values governed by one rule.
 

@@ -344,6 +344,12 @@ class TargetTests(unittest.TestCase):
              patch.object(module, 'read_pull_target', return_value=copy.deepcopy(target)):
             snapshot = module.capture_pull_diff(target, cache_root=self.cache)
             self.assertIn('+new', snapshot['entries'][0]['patch'])
+            incomplete_repo = self.repo.parent / 'incomplete'
+            module._git(self.repo.parent, 'init', '--bare', str(incomplete_repo))
+            module._git(incomplete_repo, 'fetch', str(self.repo), base)
+            recovered = module.capture_pull_diff(target, object_repo=incomplete_repo,
+                                                 cache_root=self.cache)
+            self.assertEqual(recovered, snapshot)
             corrupt = True
             with self.assertRaises(ValueError) as failure:
                 module.capture_pull_diff(target, cache_root=self.cache)

@@ -43,11 +43,13 @@ HUMAN_REPORT_ITEM_RE = re.compile(
     r"line=(?P<line>\d+|-)\s+"
     r"disposition=(?P<disposition>active|deferred|outside)\s*-->\s*$"
 )
+REINTRODUCED_MARKER = "<!-- review-anvil: prior_feedback=reintroduced -->"
 HUMAN_REPORT_TABLE_ROW_RE = re.compile(
     r"^\|\s*(?P<visible_severity>Critical|High|Medium|Low|Nit)\s*\|\s*"
     r"(?P<location>(?:\\\||[^|\n])+?)\s*\|\s*"
     r"(?P<issue>(?:\\\||[^|\n])+?)\s*\|\s*"
     r"(?P<action>(?:\\\||[^|\n])+?)\s+"
+    rf"(?:(?P<reintroduced>{re.escape(REINTRODUCED_MARKER)})\s+)?"
     rf"<!--\s*review-anvil-report:\s*id=(?P<id>{FINDING_ID_PATTERN})\s+"
     r"severity=(?P<severity>critical|high|medium|low|nit)\s+"
     r"area=(?P<area>[A-Za-z0-9][A-Za-z0-9._/-]*)\s+"
@@ -77,6 +79,7 @@ REVIEW_FOOTER = (
     "_Reviewed with [review-anvil]"
     "(https://github.com/mrshu/agent-skills/#review-anvil)._"
 )
+REVIEW_MARKER_PREFIX = re.compile(r"^(?:<!--\s*review-anvil-marker:.*?-->\s*\n)?\n*")
 COMPACT_DETAILS_RE = re.compile(
     r"<details>\n<summary>([^<\n]+)</summary>\n\n"
     r"([\s\S]*?)\n\n?</details>"
@@ -176,7 +179,7 @@ def report_location_text(finding: dict[str, Any]) -> str:
         return "—"
     start = finding.get("report_start_line")
     line_range = (
-        f"{start}-{line}" if isinstance(start, int) else str(line)
+        f"{start}-{line}" if isinstance(start, int) and start != line else str(line)
     )
     return f"`{escape_table_cell(path)}:{line_range}`"
 
@@ -305,12 +308,8 @@ def validate_human_report_envelope(
     ):
         raise InvalidBundle("review footer must be the final nonblank line")
     report_body = stripped_report[: -len(REVIEW_FOOTER)].rstrip()
-    visible_report = re.sub(
-        r"^<!--\s*review-anvil-marker:.*?-->\s*\n",
-        "",
-        report_body,
-        count=1,
-    ).lstrip("\n")
+    # Keep this boundary in sync with initial source assembly.
+    visible_report = REVIEW_MARKER_PREFIX.sub("", report_body, count=1)
     blocks = compact_details_blocks(visible_report)
     summary, separator, _ = visible_report.partition("\n\n<details>\n")
     if (
@@ -497,9 +496,12 @@ def validate_report_items(
             if shape.group("location") != expected_location:
                 raise InvalidBundle(f"{finding_id} report location changed")
         metadata = shape
-        if prior_feedback == "reintroduced":
-            reintroduced = body + "\n<!-- review-anvil: prior_feedback=reintroduced -->"
-            if report.count(reintroduced) != 1:
+        if human_style:
+            marked = prior_feedback == "reintroduced"
+            if bool(shape.group("reintroduced")) != marked or body.count(REINTRODUCED_MARKER) != int(marked):
+                raise InvalidBundle(f"{finding_id} prior-feedback metadata changed")
+        elif prior_feedback == "reintroduced":
+            if report.count(body + "\n" + REINTRODUCED_MARKER) != 1:
                 raise InvalidBundle(f"{finding_id} prior-feedback metadata changed")
         finding = findings[finding_id]
         if metadata.group("severity") != finding.get("severity"):
@@ -782,12 +784,77 @@ def prepare_action_audit_rows(
                             original["rendered_body"], item["rendered_body"], disposition=True))
     return rows
 
+def _assemble_source_layout(canonical: dict[str, Any], source: dict[str, Any]) -> str:
+    """Place authored prose and rows in sections owned by the classified packet."""
+    summary = source.pop("summary")
+    if not isinstance(summary, str):
+        raise InvalidBundle("source summary must be a string")
+    findings = indexed_findings(canonical)
+    source.setdefault("decision", canonical.get("decision"))
+    source.setdefault("predicate_inventory", [
+        {"id": finding_id, "requested_work": finding.get("requested_work")}
+        for finding_id, finding in findings.items()
+    ])
+    sections: dict[str, list[str]] = {
+        "Issues and fixes": [],
+        "Optional suggestions": [],
+        "Set aside": [],
+        "Outside this change": [],
+    }
+    for field in ("report_items", "disposition_items"):
+        items = source.get(field)
+        if not isinstance(items, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("rendered_body"), str)
+            for item in items
+        ):
+            raise InvalidBundle(f"{field} must contain complete report rows")
+    report_items = []
+    for item in source["report_items"]:
+        finding_id = item.get("id")
+        if not isinstance(finding_id, str) or finding_id not in findings:
+            raise InvalidBundle("source row does not belong to the classified findings")
+        finding = findings[finding_id]
+        body = item["rendered_body"]
+        if (finding.get("prior_feedback") == "reintroduced" and REINTRODUCED_MARKER not in body
+                and (row := HUMAN_REPORT_TABLE_ROW_RE.fullmatch(body))):
+            end = row.end("action")
+            body = body[:end] + " " + REINTRODUCED_MARKER + body[end:]
+            item = {**item, "rendered_body": body}
+        report_items.append(item)
+        label = "Issues and fixes" if finding_request_mode(finding) == "required" else "Optional suggestions"
+        sections[label].append(body)
+    source["report_items"] = report_items
+    dispositions = structured_dispositions(canonical)
+    if len(dispositions) != len(source["disposition_items"]):
+        raise InvalidBundle("disposition item inventory changed")
+    for expected, item in zip(dispositions, source["disposition_items"], strict=True):
+        label = "Set aside" if expected["disposition"] == "deferred" else "Outside this change"
+        sections[label].append(item["rendered_body"])
+    blocks = [" ".join(line.strip() for line in summary.splitlines() if line.strip())]
+    for label, rows in sections.items():
+        if not rows:
+            continue
+        if label == "Issues and fixes":
+            rows = [ISSUES_TABLE_HEADER, TABLE_SEPARATOR, *rows]
+        elif label == "Optional suggestions":
+            rows = [SUGGESTIONS_TABLE_HEADER, TABLE_SEPARATOR, *rows]
+        content = "\n".join(rows)
+        blocks.append(f"<details>\n<summary>{label}</summary>\n\n{content}\n\n</details>")
+    return "\n\n".join([*blocks, REVIEW_FOOTER]) + "\n"
+
+
 def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
     """Construct initial frozen context; never repair renderer or fallback output."""
     if canonical.get("report_style") != "human-summary":
         raise InvalidBundle("source assembly requires human-summary")
     source = dict(draft)
+    if "disposition_items" not in source and not structured_dispositions(canonical):
+        source["disposition_items"] = []
     source.setdefault("metadata_inventory", {field: canonical.get(field) for field in METADATA_FIELDS})
+    if "summary" in source:
+        if "report_markdown" in source:
+            raise InvalidBundle("source draft cannot supply both summary and report_markdown")
+        source["report_markdown"] = _assemble_source_layout(canonical, source)
     report = source.get("report_markdown")
     if not isinstance(report, str):
         raise InvalidBundle("report_markdown must be a string")
@@ -806,6 +873,17 @@ def assemble_source(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[st
         elif values or label == "Review context":
             section = f"<details>\n<summary>{label}</summary>\n\n" + "\n\n".join(missing) + "\n\n</details>"
             report = report.replace(REVIEW_FOOTER, section + "\n\n" + REVIEW_FOOTER, 1)
+    # The marker is not visible prose and must be retained byte-for-byte.
+    # Reflow only initial prose; keep frozen sections and renderer output exact.
+    start = REVIEW_MARKER_PREFIX.match(report).end()
+    prefix, separator, sections = report[start:].partition("\n\n<details>\n")
+    lines = [line for line in prefix.splitlines() if line.strip()]
+    if separator and len(lines) > 1 and all(
+        re.match(r" {0,3}[\w\"'“‘(]", line) and not re.match(r"\s*\d+[.)]\s", line)
+        for line in lines
+    ):
+        report = report[:start] + " ".join(line.strip() for line in lines) + separator + sections
+    report = assemble_table_headers(report)
     source["report_markdown"] = report
     validate(canonical, source)
     return source
@@ -851,6 +929,21 @@ def renderer_input(canonical: dict[str, Any], source: dict[str, Any]) -> dict[st
     return projected
 
 
+def assemble_table_headers(report: str) -> str:
+    headers = {"Issues and fixes": ISSUES_TABLE_HEADER,
+               "Optional suggestions": SUGGESTIONS_TABLE_HEADER}
+
+    def replace_header(match: re.Match[str]) -> str:
+        header = headers.get(match.group(1))
+        first, newline, rest = match.group(2).partition("\n")
+        if header is None or not first.startswith("|") or not rest.startswith(TABLE_SEPARATOR + "\n"):
+            return match.group(0)
+        start = match.start(2) - match.start()
+        return match.group(0)[:start] + header + newline + rest + match.group(0)[match.end(2) - match.start():]
+
+    return COMPACT_DETAILS_RE.sub(replace_header, report)
+
+
 def assemble_rendered(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
     """Compose frozen sections around editable prose, then validate the full result."""
     if canonical.get("report_style") != "human-summary":
@@ -873,7 +966,7 @@ def assemble_rendered(canonical: dict[str, Any], draft: dict[str, Any]) -> dict[
             body = "\n\n".join(dict.fromkeys(values))
             frozen_sections.append(f"<details>\n<summary>{label}</summary>\n\n{body}\n\n</details>")
     assembled = dict(draft)
-    assembled["report_markdown"] = report.replace(
+    assembled["report_markdown"] = assemble_table_headers(report).replace(
         REVIEW_FOOTER, "\n\n".join(frozen_sections) + "\n\n" + REVIEW_FOOTER, 1,
     )
     validate(canonical, assembled)

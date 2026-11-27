@@ -17,9 +17,12 @@ from urllib.parse import urlsplit
 class GitHubError(Exception):
     """A locator or GitHub response cannot produce a complete feedback packet."""
 
-    def __init__(self, message, http_status=None):
+    def __init__(self, message, http_status=None, *, exit_code=None, category="unknown", changed_fields=()):
         super().__init__(message)
         self.http_status = http_status
+        self.exit_code = exit_code
+        self.category = category
+        self.changed_fields = changed_fields
 
 
 def _host(value):
@@ -81,19 +84,23 @@ def _run_json(command, cwd=None):
             command, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise GitHubError(f"GitHub CLI could not complete the request: {error}") from error
+    except subprocess.TimeoutExpired as error:
+        raise GitHubError("GitHub CLI request timed out", category="timeout") from error
+    except OSError as error:
+        raise GitHubError("GitHub CLI could not start", category="local_execution") from error
     if result.returncode:
         # CLI stderr can contain private URLs; do not echo it into review output.
         diagnostic = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr
         statuses = set(re.findall(r"(?m)^gh: [^\r\n]* \(HTTP ([1-5][0-9]{2})\)(?:[ \t]*$)", diagnostic or ""))
         statuses.update(re.findall(r"(?m)^gh: HTTP ([1-5][0-9]{2})(?::|[ \t]|$)", diagnostic or ""))
         status = int(next(iter(statuses))) if len(statuses) == 1 else None
-        raise GitHubError(f"GitHub CLI request failed (exit {result.returncode})", http_status=status)
+        category = {401: "authentication", 429: "rate_limit"}.get(status, "unknown")
+        raise GitHubError(f"GitHub CLI request failed (exit {result.returncode})",
+                          http_status=status, exit_code=result.returncode, category=category)
     try:
         return json.loads(result.stdout)
     except (ValueError, UnicodeError) as error:
-        raise GitHubError("GitHub CLI returned invalid JSON") from error
+        raise GitHubError("GitHub CLI returned invalid JSON", category="invalid_response") from error
 
 
 def github_api(host, endpoint, paginate=False):
@@ -251,7 +258,7 @@ def resolve_pull_request(locator, cwd=None):
     return repository, number
 
 
-def collect_feedback(locator, cwd=None):
+def collect_feedback(locator, cwd=None, *, allow_discussion_only=False):
     """Collect all current visible PR feedback, rejecting incomplete revisions."""
     repository, number = resolve_pull_request(locator, cwd=cwd)
     host, name = repository["host"], repository["name"]
@@ -260,15 +267,19 @@ def collect_feedback(locator, cwd=None):
     pr = github_api(host, endpoint)
     head_sha, base_sha = _revision(pr, number)
     files = _array(github_api(host, f"{endpoint}/files?per_page=100", paginate=True), "PR files")
-    if "changed_files" in pr and pr["changed_files"] != len(files):
-        raise GitHubError("GitHub did not return all changed files (REST has a 3000-file limit)")
-    paths = []
-    for item in files:
-        for key in ("filename", "previous_filename"):
-            if key == "filename" or key in item:
-                path = _path(item.get(key))
-                if path not in paths:
-                    paths.append(path)
+    count = pr.get("changed_files", len(files))
+    paths = None
+    if count != len(files):
+        if not (allow_discussion_only and type(count) is int and count >= 0):
+            raise GitHubError("GitHub did not return all changed files (REST has a 3000-file limit)")
+    else:
+        paths = []
+        for item in files:
+            for key in ("filename", "previous_filename"):
+                if key == "filename" or key in item:
+                    path = _path(item.get(key))
+                    if path not in paths:
+                        paths.append(path)
     comments = _array(github_api(host, f"{prefix}/issues/{number}/comments?per_page=100", paginate=True), "issue comments")
     reviews = _array(github_api(host, f"{endpoint}/reviews?per_page=100", paginate=True), "reviews")
     inline = _array(github_api(host, f"{endpoint}/comments?per_page=100", paginate=True), "review comments")
@@ -326,12 +337,17 @@ def read_pull_target(locator, cwd=None):
     closing = _object(github_api(host, endpoint), "closing pull request")
     closing_head = _object(_object(closing.get("head"), "head").get("repo"), "head repository")
     closing_base = _object(_object(closing.get("base"), "base").get("repo"), "base repository")
-    if (_revision(closing, number) != (head, base)
-            or any(closing.get(key) != pr.get(key) for key in ("title", "body", "html_url", "labels", "changed_files"))
-            or any(current.get(key) != original.get(key)
-                   for current, original in ((closing_head, head_repo), (closing_base, base_repo))
-                   for key in ("id", "full_name"))):
-        raise GitHubError("Pull request target moved during file collection")
+    revisions = _revision(closing, number)
+    changed = [key for key, current, original in zip(("head.sha", "base.sha"), revisions, (head, base))
+               if current != original]
+    changed.extend(key for key in ("title", "body", "html_url", "labels", "changed_files")
+                   if closing.get(key) != pr.get(key))
+    changed.extend(f"{side}.repo.{key}"
+                   for side, current, original in (("head", closing_head, head_repo), ("base", closing_base, base_repo))
+                   for key in ("id", "full_name") if current.get(key) != original.get(key))
+    if changed:
+        raise GitHubError("Pull request target moved during file collection (changed: " + ", ".join(changed) + ")",
+                          category="target_moved", changed_fields=changed)
     return {
         "schema_version": 1, "repository": repository,
         "head_repository": {"host": host, "name": head_name, "id": head_repo["id"]},
